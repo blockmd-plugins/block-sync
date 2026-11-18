@@ -17,10 +17,6 @@ import xml.etree.ElementTree as ET
 
 
 VALID_PROTOCOLS = ("local_mirror", "webdav", "git")
-VALID_MIRROR_PRESETS = ("downloads", "documents", "custom")
-VALID_WEBDAV_DIR_PRESETS = ("/BlockNotes", "/Notes", "/Markdown", "custom")
-VALID_GIT_BRANCH_PRESETS = ("main", "master", "custom")
-VALID_SYNC_INTERVALS = ("manual", "5m", "30m")
 VALID_CONFLICT_POLICIES = ("keep_both", "remote_first", "local_first")
 VALID_GIT_AUTHS = ("ssh", "token")
 DELETE_GUARD_THRESHOLD = 5
@@ -28,21 +24,17 @@ MAX_LOG_ENTRIES = 20
 
 DEFAULT_CONFIG = {
     "protocol": "local_mirror",
-    "mirror_preset": "downloads",
     "mirror_dir": "",
     "sync_scope": "all",
     "webdav_url": "",
-    "webdav_dir_preset": "/BlockNotes",
     "webdav_dir": "/BlockNotes",
     "webdav_user": "",
     "webdav_pass": "",
     "git_remote": "",
-    "git_branch_preset": "main",
     "git_branch": "main",
     "git_auth": "ssh",
     "git_token": "",
     "auto_sync": True,
-    "sync_interval": "manual",
     "sync_assets": True,
     "conflict_policy": "keep_both",
     "delete_guard": True,
@@ -164,7 +156,8 @@ class SyncPlugin:
         self.sync_meta = {}
         self.pending_confirm = None
         self._remote_preview_cache = {}
-        self.last_status = "目录镜像 · 已就绪"
+        self.kv_tooltip = False
+        self.last_status = ""
 
     def _notebook_key(self):
         raw = (self.notebook_root or "").strip()
@@ -244,7 +237,7 @@ class SyncPlugin:
 
         self.pending_confirm = None
         self._remote_preview_cache = {}
-        self.last_status = f"{self._protocol_label(self.config['protocol'])} · 已就绪"
+        self.last_status = ""
 
     def _normalize_log(self, entry):
         title = str(entry.get("title") or "同步事件").strip() or "同步事件"
@@ -279,33 +272,23 @@ class SyncPlugin:
         for key in str_fields:
             if key in raw and raw[key] is not None:
                 val = str(raw[key])
-                merged[key] = val if key in ("webdav_pass", "git_token") else val.strip()
+                merged[key] = val if key in ("mirror_dir", "webdav_pass", "git_token") else val.strip()
 
+        # Resolve old presets once. Current controls store the actual paths and branch.
         mirror_preset = raw.get("mirror_preset")
-        if mirror_preset in VALID_MIRROR_PRESETS:
-            merged["mirror_preset"] = mirror_preset
-        elif "mirror_preset" not in raw and merged["mirror_dir"]:
-            merged["mirror_preset"] = "custom"
+        if mirror_preset == "downloads":
+            merged["mirror_dir"] = os.path.join(self._downloads_root(), "Block-Sync")
+        elif mirror_preset == "documents":
+            merged["mirror_dir"] = os.path.expanduser("~/Documents/Block-Sync")
+        elif mirror_preset == "custom" and not merged["mirror_dir"]:
+            merged["mirror_dir"] = os.path.join(self._downloads_root(), "Block-Sync")
 
         webdav_dir_preset = raw.get("webdav_dir_preset")
-        if webdav_dir_preset in VALID_WEBDAV_DIR_PRESETS:
-            merged["webdav_dir_preset"] = webdav_dir_preset
-        elif "webdav_dir_preset" not in raw and merged["webdav_dir"]:
-            merged["webdav_dir_preset"] = (
-                merged["webdav_dir"]
-                if merged["webdav_dir"] in ("/BlockNotes", "/Notes", "/Markdown")
-                else "custom"
-            )
-
+        if webdav_dir_preset in ("/BlockNotes", "/Notes", "/Markdown"):
+            merged["webdav_dir"] = webdav_dir_preset
         git_branch_preset = raw.get("git_branch_preset")
-        if git_branch_preset in VALID_GIT_BRANCH_PRESETS:
-            merged["git_branch_preset"] = git_branch_preset
-        elif "git_branch_preset" not in raw and merged["git_branch"]:
-            merged["git_branch_preset"] = (
-                merged["git_branch"]
-                if merged["git_branch"] in ("main", "master")
-                else "custom"
-            )
+        if git_branch_preset in ("main", "master"):
+            merged["git_branch"] = git_branch_preset
 
         if not merged["sync_scope"]:
             merged["sync_scope"] = "all"
@@ -345,14 +328,11 @@ class SyncPlugin:
             if bool_key in raw:
                 merged[bool_key] = bool(raw[bool_key])
 
-        sync_interval = raw.get("sync_interval", merged["sync_interval"])
-        if sync_interval in VALID_SYNC_INTERVALS:
-            merged["sync_interval"] = sync_interval
-
         policy = raw.get("conflict_policy", merged["conflict_policy"])
         if policy in VALID_CONFLICT_POLICIES:
             merged["conflict_policy"] = policy
 
+        merged["mirror_dir"] = self._resolve_mirror_dir(merged)
         return merged
 
     def _save_config(self, bridge):
@@ -444,14 +424,9 @@ class SyncPlugin:
 
     def _resolve_mirror_dir(self, cfg=None):
         c = cfg or self.config
-        preset = c.get("mirror_preset", "downloads")
-        if preset == "downloads":
-            return os.path.join(self._downloads_root(), "Block-Sync")
-        if preset == "documents":
-            return os.path.join(os.path.normpath(os.path.expanduser("~/Documents")), "Block-Sync")
-        raw = str(c.get("mirror_dir") or "").strip()
+        raw = str(c.get("mirror_dir") or "")
         if not raw:
-            return os.path.join(self._downloads_root(), "Block-Sync")
+            return ""
         expanded = os.path.expanduser(raw)
         if os.path.isabs(expanded):
             return os.path.normpath(expanded)
@@ -459,11 +434,27 @@ class SyncPlugin:
 
     def _resolve_webdav_dir(self, cfg=None):
         c = cfg or self.config
-        preset = c.get("webdav_dir_preset", "/BlockNotes")
-        if preset in ("/BlockNotes", "/Notes", "/Markdown"):
-            return preset
-        raw = str(c.get("webdav_dir") or "").strip()
-        return raw or "/BlockNotes"
+        return str(c.get("webdav_dir") or "").strip() or "/BlockNotes"
+
+    def _target_error(self, cfg):
+        protocol = cfg["protocol"]
+        if protocol == "webdav":
+            if not self._webdav_base_url(cfg):
+                return "请填写有效的 WebDAV 地址"
+        elif protocol == "local_mirror":
+            target = self._resolve_mirror_dir(cfg)
+            if not target:
+                return "请先选择同步文件夹"
+            if self.notebook_root:
+                source = os.path.realpath(self.notebook_root)
+                target = os.path.realpath(target)
+                try:
+                    overlaps = os.path.commonpath((source, target)) in (source, target)
+                except ValueError:
+                    overlaps = False
+                if overlaps:
+                    return "请选择与笔记本分开的文件夹"
+        return ""
 
     def _matches_scope(self, rel_path, scope=None):
         sc = scope if scope is not None else self.config.get("sync_scope", "all")
@@ -479,10 +470,6 @@ class SyncPlugin:
             if is_safe_rel_md(rel_path):
                 paths.append(rel_path)
         return sorted(set(paths))
-
-    def _extract_top_dirs(self, paths):
-        dirs = {p.split("/", 1)[0] for p in paths if "/" in p}
-        return sorted(dirs)
 
     def _read_local_notes(self, bridge, only_path=None, scope=None, paths=None):
         notes = {}
@@ -1095,9 +1082,6 @@ class SyncPlugin:
 
     def _git_branch(self, cfg=None):
         c = cfg or self.config
-        preset = c.get("git_branch_preset", "main")
-        if preset in ("main", "master"):
-            return preset
         return str(c.get("git_branch") or "").strip() or "main"
 
     def _git_env(self):
@@ -1403,13 +1387,17 @@ class SyncPlugin:
             "fingerprint": sha256_text(fp_payload),
         }
 
-    def _assess_dangerous_changes(self, plan, cfg):
+    def _assess_dangerous_changes(self, plan, cfg, saved_path=None):
         if not plan.get("remote_inspected"):
             return []
         reasons = []
         n_pull_new = len(plan["to_pull_new"])
         n_pull_ow = len(plan["to_pull_overwrite"])
-        n_push_ow = len(plan["to_push_overwrite"])
+        overwrites = plan["to_push_overwrite"]
+        n_push_ow = sum(
+            path != saved_path or plan["base_map"].get(path) != sha256_text(plan["remote_notes"][path])
+            for path in overwrites
+        )
         n_conf = len(plan["conflicts"])
         n_rm_miss = len(plan["remote_missing"])
         n_loc_miss = len(plan["local_missing"])
@@ -1621,6 +1609,10 @@ class SyncPlugin:
 
     def _run_sync(self, bridge, only_path=None, confirmed=False, approved_plan=None):
         protocol = self.config.get("protocol", "local_mirror")
+        target_error = self._target_error(self.config)
+        if target_error:
+            self.last_status = target_error
+            return target_error
         if approved_plan is not None:
             plan = approved_plan
             protocol = plan.get("protocol", protocol)
@@ -1644,10 +1636,10 @@ class SyncPlugin:
             raise RuntimeError(msg)
 
         if not confirmed:
-            reasons = self._assess_dangerous_changes(plan, self.config)
+            reasons = self._assess_dangerous_changes(plan, self.config, saved_path=only_path)
             if reasons:
                 if only_path is not None:
-                    msg = f"自动同步暂停（{reasons[0]}），请手动确认"
+                    msg = f"自动同步暂停（{reasons[0]}），请点击立即同步确认"
                     self._append_log(only_path, msg)
                     self._record_result("待确认", msg, protocol=protocol, target=plan["target_display"])
                     self._save_runtime(bridge)
@@ -1689,142 +1681,50 @@ class SyncPlugin:
         self.last_status = msg
         return msg
 
-    def _conflict_policy_label(self, policy):
+    def _confirmation_card(self):
+        pending = self.pending_confirm
+        lines = [f"[风险] {reason}" for reason in pending["reasons"]]
+        samples = pending["sample_lines"]
+        remaining = 9 - len(lines)
+        lines.extend(samples[:remaining])
+        if len(samples) > remaining:
+            lines.append(f"… 其余 {len(samples) - remaining} 项变更")
         return {
-            "keep_both": "保留双份副本",
-            "remote_first": "远端优先",
-            "local_first": "本地优先",
-        }.get(policy, "保留双份副本")
-
-    def _build_preview_items(self, bridge, cfg):
-        if self.pending_confirm and self.pending_confirm.get("nb_key") == self._notebook_key():
-            pc = self.pending_confirm
-            lines = [f"[风险] {r}" for r in pc.get("reasons", [])]
-            samples = pc.get("sample_lines") or []
-            max_samples = max(1, 9 - len(lines))
-            lines.extend(samples[:max_samples])
-            if len(samples) > max_samples:
-                lines.append(f"... 其余 {len(samples) - max_samples} 项变更")
-            return [
+            "id": "preview-card",
+            "title": "确认同步变更",
+            "items": [
                 {
                     "kind": "preview",
                     "preview": {
                         "variant": "plan",
                         "palette": "warm",
-                        "title": f"危险变更确认 · {self._protocol_label(pc.get('protocol'))}",
-                        "badge": pc.get("badge", "需确认"),
-                        "subtitle": f"目标：{pc.get('target_display', '')}",
-                        "body": "\n".join(lines[:10]),
+                        "title": self._protocol_label(pending["protocol"]),
+                        "body": "\n".join(lines),
                     },
                 },
                 {
                     "kind": "actions",
                     "buttons": [
-                        {"id": "confirm_sync", "label": "确认执行同步", "variant": "danger"},
+                        {"id": "confirm_sync", "label": "确认同步", "variant": "danger"},
                         {"id": "cancel_confirm", "label": "取消", "variant": "secondary"},
                     ],
                 },
-            ]
+            ],
+        }
 
-        protocol = cfg.get("protocol", "local_mirror")
-        mode_label = self._protocol_label(protocol)
-        scope = cfg.get("sync_scope", "all")
-        scope_desc = "全部笔记" if scope == "all" else f"仅 {scope}/ 目录"
-        policy_desc = f"冲突策略：{self._conflict_policy_label(cfg.get('conflict_policy'))}"
-
-        plan = self._compute_sync_plan(bridge, cfg, inspect_remote=(protocol == "local_mirror"))
-        prefix_title = "首次同步预览" if plan["is_first_sync"] else "同步计划预览"
-        subtitle = f"目标：{plan['target_display']}"
-
-        if not plan["remote_inspected"]:
-            local_count = len(plan["local_notes"])
-            if plan.get("remote_error"):
-                badge = f"未就绪 · 本地 {local_count} 篇"
-                lines = [f"[提示] {plan['remote_error']}"]
-            else:
-                badge = f"{'首次同步 · ' if plan['is_first_sync'] else ''}待检查远端 · 本地 {local_count} 篇"
-                local_keys = sorted(plan["local_notes"].keys())
-                lines = [f"[待检查] {p}" for p in local_keys[:6]] if local_keys else ["当前范围暂无本地笔记（0 篇）"]
-                if len(local_keys) > 6:
-                    lines.append(f"... 其余 {len(local_keys) - 6} 篇笔记")
-            lines.append(f"同步范围：{scope_desc} | {policy_desc}")
-        else:
-            n_push = len(plan["to_push_new"]) + len(plan["to_push_overwrite"])
-            n_pull = len(plan["to_pull_new"]) + len(plan["to_pull_overwrite"])
-            n_conf = len(plan["conflicts"])
-            badge = f"{'首次 · ' if plan['is_first_sync'] else ''}推送 {n_push} · 拉取 {n_pull}"
-            if n_conf:
-                badge += f" · 冲突 {n_conf}"
-            entries = (
-                [f"[推送] {p}" for p in plan["to_push_new"]]
-                + [f"[覆盖远端] {p}" for p in plan["to_push_overwrite"]]
-                + [f"[拉取] {p}" for p in plan["to_pull_new"]]
-                + [f"[覆盖本地] {p}" for p in plan["to_pull_overwrite"]]
-                + [f"[冲突] {p}" for p, _, _ in plan["conflicts"]]
-                + [f"[已同步] {p}" for p in plan["synced"]]
-            )
-            if not entries:
-                lines = ["当前范围暂无笔记（0 篇），目标已就绪"]
-            else:
-                lines = entries[:6]
-                if len(entries) > 6:
-                    lines.append(f"... 其余 {len(entries) - 6} 篇笔记")
-            dangers = self._assess_dangerous_changes(plan, cfg)
-            if dangers:
-                lines.append(f"[需确认] {dangers[0]}")
-            lines.append(f"同步范围：{scope_desc} | {policy_desc}")
-
-        return [
-            {
-                "kind": "preview",
-                "preview": {
-                    "variant": "plan",
-                    "palette": "ocean",
-                    "title": f"{prefix_title} · {mode_label}",
-                    "badge": badge,
-                    "subtitle": subtitle,
-                    "body": "\n".join(lines[:10]),
-                },
-            },
-            {
-                "kind": "actions",
-                "buttons": [
-                    {"id": "refresh_preview", "label": "刷新预览", "variant": "secondary"},
-                ],
-            },
-        ]
-
-    def build_page(self, bridge, cfg=None):
+    def build_page(self, cfg=None):
         c = cfg or self.config
-        protocol = c.get("protocol", "local_mirror")
-        mode_label = self._protocol_label(protocol)
-        total_synced = int(self.stats.get("total_synced", 0) or 0)
-        last_sync = self.stats.get("last_sync") or "尚未同步"
-        entries = [self._normalize_log(item) for item in self.logs[:MAX_LOG_ENTRIES]]
+        protocol = c["protocol"]
+        notebook = {"label": "当前笔记本", "value": self._notebook_label()}
+        if self.kv_tooltip and self.notebook_root:
+            notebook["tooltip"] = self._notebook_key()
 
-        local_paths = self._list_local_note_paths(bridge)
-        top_dirs = self._extract_top_dirs(local_paths)
-        scope_options = [{"value": "all", "label": "整个笔记本"}] + [
-            {"value": d, "label": f"子目录 · {d}/"} for d in top_dirs
-        ]
-        valid_scopes = {opt["value"] for opt in scope_options}
-        scope_val = c.get("sync_scope", "all")
-        if scope_val not in valid_scopes:
-            scope_val = "all"
-
-        nb_label = self._notebook_label()
-        nb_path_display = self._notebook_key() if self.notebook_root else "未指定笔记本目录"
         target_items = [
-            {
-                "kind": "kv",
-                "rows": [
-                    {"label": "当前笔记本", "value": f"{nb_label} ({nb_path_display})"},
-                ],
-            },
+            {"kind": "kv", "rows": [notebook]},
             {
                 "kind": "segmented",
                 "id": "protocol",
-                "label": "存储协议",
+                "label": "同步方式",
                 "value": protocol,
                 "options": [
                     {"value": "local_mirror", "label": "目录镜像"},
@@ -1833,255 +1733,91 @@ class SyncPlugin:
                 ],
             },
             {
-                "kind": "select",
-                "id": "mirror_preset",
-                "label": "镜像目录预设",
-                "value": c.get("mirror_preset", "downloads"),
-                "options": [
-                    {"value": "downloads", "label": "下载目录 · ~/Downloads/Block-Sync"},
-                    {"value": "documents", "label": "文稿目录 · ~/Documents/Block-Sync"},
-                    {"value": "custom", "label": "自定义文件夹…"},
-                ],
+                "kind": "folder",
+                "id": "mirror_dir",
+                "label": "同步文件夹",
+                "value": self._resolve_mirror_dir(c),
                 "visible_when": {"control_id": "protocol", "equals": "local_mirror"},
             },
         ]
-        if protocol == "local_mirror":
+        for kind, key, label, placeholder in (
+            ("input", "webdav_url", "服务器地址", "https://dav.example.com"),
+            ("input", "webdav_dir", "远端目录", "/BlockNotes"),
+            ("input", "webdav_user", "用户名", ""),
+            ("secret", "webdav_pass", "密码", ""),
+        ):
             target_items.append({
-                "kind": "folder",
-                "id": "mirror_dir",
-                "label": "自定义镜像文件夹",
-                "value": c.get("mirror_dir", ""),
-                "placeholder": "选择本地备份目录",
-                "visible_when": {"control_id": "mirror_preset", "equals": "custom"},
+                "kind": kind, "id": key, "label": label, "value": c[key],
+                "placeholder": placeholder,
+                "visible_when": {"control_id": "protocol", "equals": "webdav"},
             })
 
         target_items.extend([
-            {
-                "kind": "input",
-                "id": "webdav_url",
-                "label": "WebDAV 服务器地址",
-                "value": c.get("webdav_url", ""),
-                "placeholder": "例如 https://dav.example.com/dav",
-                "visible_when": {"control_id": "protocol", "equals": "webdav"},
-            },
-            {
-                "kind": "select",
-                "id": "webdav_dir_preset",
-                "label": "远端目录预设",
-                "value": c.get("webdav_dir_preset", "/BlockNotes"),
-                "options": [
-                    {"value": "/BlockNotes", "label": "/BlockNotes"},
-                    {"value": "/Notes", "label": "/Notes"},
-                    {"value": "/Markdown", "label": "/Markdown"},
-                    {"value": "custom", "label": "自定义路径…"},
-                ],
-                "visible_when": {"control_id": "protocol", "equals": "webdav"},
-            },
-        ])
-        if protocol == "webdav":
-            target_items.append({
-                "kind": "input",
-                "id": "webdav_dir",
-                "label": "自定义远端目录",
-                "value": c.get("webdav_dir", "/BlockNotes"),
-                "placeholder": "/BlockNotes",
-                "visible_when": {"control_id": "webdav_dir_preset", "equals": "custom"},
-            })
-
-        target_items.extend([
-            {
-                "kind": "input",
-                "id": "webdav_user",
-                "label": "账号用户名",
-                "value": c.get("webdav_user", ""),
-                "placeholder": "WebDAV 登录用户名",
-                "visible_when": {"control_id": "protocol", "equals": "webdav"},
-            },
-            {
-                "kind": "secret",
-                "id": "webdav_pass",
-                "label": "应用密码",
-                "value": c.get("webdav_pass", ""),
-                "placeholder": "WebDAV 应用专用密码或访问令牌",
-                "visible_when": {"control_id": "protocol", "equals": "webdav"},
-            },
             {
                 "kind": "input",
                 "id": "git_remote",
-                "label": "Git 远端仓库地址",
-                "value": c.get("git_remote", ""),
-                "placeholder": "例如 git@github.com:user/notes.git 或 https://...",
+                "label": "仓库地址",
+                "value": c["git_remote"],
+                "placeholder": "git@github.com:user/notes.git",
+                "visible_when": {"control_id": "protocol", "equals": "git"},
+            },
+            {
+                "kind": "input",
+                "id": "git_branch",
+                "label": "分支",
+                "value": c["git_branch"],
+                "placeholder": "main",
                 "visible_when": {"control_id": "protocol", "equals": "git"},
             },
             {
                 "kind": "segmented",
-                "id": "git_branch_preset",
-                "label": "分支名称",
-                "value": c.get("git_branch_preset", "main"),
+                "id": "git_auth",
+                "label": "认证方式",
+                "value": c["git_auth"],
                 "options": [
-                    {"value": "main", "label": "main"},
-                    {"value": "master", "label": "master"},
-                    {"value": "custom", "label": "自定义"},
+                    {"value": "ssh", "label": "SSH"},
+                    {"value": "token", "label": "HTTPS 令牌"},
                 ],
                 "visible_when": {"control_id": "protocol", "equals": "git"},
             },
         ])
         if protocol == "git":
             target_items.append({
-                "kind": "input",
-                "id": "git_branch",
-                "label": "自定义分支名称",
-                "value": c.get("git_branch", "main"),
-                "placeholder": "main",
-                "visible_when": {"control_id": "git_branch_preset", "equals": "custom"},
-            })
-
-        target_items.extend([
-            {
-                "kind": "segmented",
-                "id": "git_auth",
-                "label": "Git 认证方式",
-                "value": c.get("git_auth", "ssh"),
-                "options": [
-                    {"value": "ssh", "label": "本机 SSH 密钥"},
-                    {"value": "token", "label": "HTTPS 令牌"},
-                ],
-                "visible_when": {"control_id": "protocol", "equals": "git"},
-            },
-            {
                 "kind": "secret",
                 "id": "git_token",
                 "label": "访问令牌",
-                "value": c.get("git_token", ""),
-                "placeholder": "HTTPS 令牌认证时填写，使用本机 SSH 密钥时可留空",
-                "visible_when": {"control_id": "protocol", "equals": "git"},
+                "value": c["git_token"],
+                "visible_when": {"control_id": "git_auth", "equals": "token"},
+            })
+        target_items.extend([
+            {
+                "kind": "switch",
+                "id": "auto_sync",
+                "label": "保存笔记后自动同步",
+                "value": c["auto_sync"],
+            },
+            {
+                "kind": "actions",
+                "buttons": [{"id": "save_config", "label": "保存", "variant": "primary"}],
             },
         ])
 
-        action_buttons = [
-            {"id": "save_config", "label": "保存配置", "variant": "primary"},
-            {"id": "test_conn", "label": "测试连接", "variant": "secondary"},
-        ]
-        if protocol == "local_mirror":
-            action_buttons.append({"id": "reveal_mirror", "label": "在访达中打开备份目录", "variant": "secondary"})
-        target_items.append({"kind": "actions", "buttons": action_buttons})
+        cards = [{"id": "target-card", "title": "同步设置", "items": target_items}]
+        if self.pending_confirm and self.pending_confirm["nb_key"] == self._notebook_key() and c == self.config:
+            cards.append(self._confirmation_card())
 
-        preview_items = self._build_preview_items(bridge, c)
-        last_res = self._get_last_result() or {}
-        last_attempt_status = last_res.get("status") or "尚未尝试"
-        last_attempt_time = last_res.get("time") or "尚未尝试"
-        last_attempt_target = last_res.get("target") or self._target_display(c)
-        last_attempt_summary = last_res.get("summary") or "暂无最近尝试记录"
-
-        last_ok = last_res.get("last_success") if isinstance(last_res.get("last_success"), dict) else None
-        if not last_ok and last_res.get("status") in ("成功", "无变更"):
-            last_ok = last_res
-        last_success_time = (last_ok or {}).get("time") or (last_sync if last_sync != "尚未同步" else "尚未成功")
-        if last_ok:
-            last_success_detail = f"{last_ok.get('time', '')} · {last_ok.get('summary', '')} ({last_ok.get('target', '')})"
-        else:
-            last_success_detail = "暂无成功同步记录"
-
+        last_result = self._get_last_result() or {}
+        status = self.last_status or last_result.get("summary") or ""
+        configured = not self._target_error(self.config)
+        if not self.last_status and not configured:
+            status = ""
         return {
             "title": "同步",
-            "status": self.last_status or f"{mode_label} · 已就绪",
+            "status": status,
             "header_actions": [
                 {"id": "sync_now", "label": "立即同步", "variant": "primary"},
-            ],
-            "cards": [
-                {
-                    "id": "target-card",
-                    "title": "存储目标（当前笔记本）",
-                    "items": target_items,
-                },
-                {
-                    "id": "preview-card",
-                    "title": "同步计划预览",
-                    "items": preview_items,
-                },
-                {
-                    "id": "policy-card",
-                    "title": "同步范围与安全保护",
-                    "items": [
-                        {
-                            "kind": "select",
-                            "id": "sync_scope",
-                            "label": "同步范围",
-                            "value": scope_val,
-                            "options": scope_options,
-                        },
-                        {
-                            "kind": "switch",
-                            "id": "auto_sync",
-                            "label": "保存笔记后自动同步",
-                            "value": bool(c.get("auto_sync", True)),
-                        },
-                        {
-                            "kind": "segmented",
-                            "id": "sync_interval",
-                            "label": "定时同步周期",
-                            "value": c.get("sync_interval", "manual"),
-                            "options": [
-                                {"value": "manual", "label": "仅手动"},
-                                {"value": "5m", "label": "每 5 分钟"},
-                                {"value": "30m", "label": "每 30 分钟"},
-                            ],
-                        },
-                        {
-                            "kind": "switch",
-                            "id": "sync_assets",
-                            "label": "同步 assets 图片附件",
-                            "value": bool(c.get("sync_assets", True)),
-                        },
-                        {
-                            "kind": "segmented",
-                            "id": "conflict_policy",
-                            "label": "冲突处理策略",
-                            "value": c.get("conflict_policy", "keep_both"),
-                            "options": [
-                                {"value": "keep_both", "label": "保留双份副本"},
-                                {"value": "remote_first", "label": "远端优先"},
-                                {"value": "local_first", "label": "本地优先"},
-                            ],
-                        },
-                        {
-                            "kind": "switch",
-                            "id": "delete_guard",
-                            "label": "远端批量删除保护（超 5 篇暂停）",
-                            "value": bool(c.get("delete_guard", True)),
-                        },
-                    ],
-                },
-                {
-                    "id": "status-card",
-                    "title": "同步概览与最近结果",
-                    "items": [
-                        {
-                            "kind": "metrics",
-                            "metrics": [
-                                {"label": "当前模式", "value": mode_label},
-                                {"label": "累计同步篇数", "value": f"{total_synced} 篇"},
-                                {"label": "最近成功时间", "value": last_success_time},
-                                {"label": "最近尝试结果", "value": last_attempt_status},
-                            ],
-                        },
-                        {
-                            "kind": "kv",
-                            "rows": [
-                                {"label": "最近尝试时间", "value": last_attempt_time},
-                                {"label": "最近尝试目标", "value": last_attempt_target},
-                                {"label": "最近尝试详情", "value": last_attempt_summary},
-                                {"label": "最近成功详情", "value": last_success_detail},
-                            ],
-                        },
-                        {
-                            "kind": "log_list",
-                            "empty_text": "暂无同步记录",
-                            "entries": entries,
-                        },
-                    ],
-                },
-            ],
+            ] if configured and c == self.config else [],
+            "cards": cards,
         }
 
     def handle(self, bridge, method, params):
@@ -2092,6 +1828,7 @@ class SyncPlugin:
             self.downloads_dir = dl or os.path.expanduser("~/Downloads")
             self.notebook_root = str(params.get("notebook_root") or "")
             self.locale = str(params.get("locale") or "zh")
+            self.kv_tooltip = "kv_tooltip" in (params.get("ui_capabilities") or [])
             self._load_state(bridge)
             return {"ready": True}
 
@@ -2101,46 +1838,23 @@ class SyncPlugin:
                 cfg = self._normalize_config(values, base=self.config)
             else:
                 cfg = dict(self.config)
-            return {"page": self.build_page(bridge, cfg=cfg)}
+            return {"page": self.build_page(cfg=cfg)}
 
         if method == "plugin.action":
             values = params.get("values") or {}
             action_id = str(params.get("action_id") or "")
-            if isinstance(values, dict) and values:
+            if action_id == "save_config":
                 next_cfg = self._normalize_config(values)
-                if next_cfg != self.config and action_id not in ("confirm_sync", "cancel_confirm"):
+                status = self._target_error(next_cfg)
+                if status:
+                    return {"status": status}
+                if next_cfg != self.config:
                     self.pending_confirm = None
                     self._remote_preview_cache.clear()
                 self.config = next_cfg
                 self._save_config(bridge)
-
-            extra = {}
-            if action_id == "save_config":
-                self._save_config(bridge)
-                self._append_log("保存配置", f"{self._notebook_label()} · {self._protocol_label(self.config['protocol'])}")
-                self._save_runtime(bridge)
-                self.last_status = "配置已保存"
-                status = "配置已保存"
-            elif action_id == "test_conn":
-                status = self._run_test_conn()
-                self._save_runtime(bridge)
-            elif action_id == "refresh_preview":
-                self.pending_confirm = None
-                plan = self._compute_sync_plan(bridge, self.config, inspect_remote=True, force_refresh=True)
-                if plan.get("remote_error"):
-                    status = plan["remote_error"]
-                else:
-                    n_push = len(plan["to_push_new"]) + len(plan["to_push_overwrite"])
-                    n_pull = len(plan["to_pull_new"]) + len(plan["to_pull_overwrite"])
-                    n_conf = len(plan["conflicts"])
-                    status = f"预览已刷新：推送 {n_push} · 拉取 {n_pull} · 冲突 {n_conf}"
+                status = "已保存"
                 self.last_status = status
-            elif action_id == "reveal_mirror":
-                mirror_dir = self._resolve_mirror_dir()
-                os.makedirs(mirror_dir, exist_ok=True)
-                status = f"已在访达中打开备份目录: {mirror_dir}"
-                self.last_status = status
-                extra["reveal_path"] = mirror_dir
             elif action_id == "sync_now":
                 status = self._run_sync(bridge)
             elif action_id == "confirm_sync":
@@ -2200,20 +1914,18 @@ class SyncPlugin:
 
             res = {
                 "values": dict(self.config),
-                "page": self.build_page(bridge, cfg=self.config),
+                "page": self.build_page(cfg=self.config),
                 "status": status,
             }
-            res.update(extra)
             return res
 
         if method == "plugin.event":
             event_name = str(params.get("event") or "")
             rel_path = str(params.get("path") or "").replace("\\", "/")
-            if event_name == "note.saved" and self.config.get("auto_sync"):
-                only_path = rel_path if is_safe_rel_md(rel_path) else None
-                if only_path and not self._matches_scope(only_path):
-                    return {"handled": True}
-                self._run_sync(bridge, only_path=only_path)
+            if (event_name == "note.saved" and self.config["auto_sync"]
+                    and is_safe_rel_md(rel_path) and self._matches_scope(rel_path)
+                    and not self._target_error(self.config)):
+                self._run_sync(bridge, only_path=rel_path)
             return {"handled": True}
 
         if method == "plugin.shutdown":
