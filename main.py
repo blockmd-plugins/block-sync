@@ -441,6 +441,9 @@ class SyncPlugin:
         if protocol == "webdav":
             if not self._webdav_base_url(cfg):
                 return "请填写有效的 WebDAV 地址"
+        elif protocol == "git":
+            if not str(cfg.get("git_remote") or "").strip():
+                return "请填写 Git 仓库地址"
         elif protocol == "local_mirror":
             target = self._resolve_mirror_dir(cfg)
             if not target:
@@ -724,7 +727,7 @@ class SyncPlugin:
         self.stats["total_synced"] += synced_count
         self.stats["last_sync"] = now_hms()
         if synced_count == 0 and asset_count == 0 and not all_paths:
-            return "当前笔记本暂无笔记，镜像目录已就绪"
+            return "当前笔记本暂无笔记"
         if synced_count == 0 and asset_count == 0:
             return "目录镜像已是最新，无需更新"
         if asset_count > 0:
@@ -1669,14 +1672,24 @@ class SyncPlugin:
         self.last_status = msg
         return msg
 
-    def _run_test_conn(self):
-        protocol = self.config.get("protocol", "local_mirror")
-        if protocol == "webdav":
-            ok, msg = self._test_webdav()
-        elif protocol == "git":
-            ok, msg = self._test_git()
-        else:
-            ok, msg = self._test_local_mirror()
+    def _run_test_conn(self, cfg=None):
+        c = cfg or self.config
+        err = self._target_error(c)
+        if err:
+            self.last_status = err
+            return err
+        prev_cfg = self.config
+        self.config = c
+        try:
+            protocol = c.get("protocol", "local_mirror")
+            if protocol == "webdav":
+                ok, msg = self._test_webdav()
+            elif protocol == "git":
+                ok, msg = self._test_git()
+            else:
+                ok, msg = self._test_local_mirror()
+        finally:
+            self.config = prev_cfg
         self._append_log(f"测试连接 ({self._protocol_label(protocol)})", "通过" if ok else "未连通")
         self.last_status = msg
         return msg
@@ -1798,7 +1811,11 @@ class SyncPlugin:
             },
             {
                 "kind": "actions",
-                "buttons": [{"id": "save_config", "label": "保存", "variant": "primary"}],
+                "visible_when": {"control_id": "protocol", "in": ["webdav", "git"]},
+                "buttons": [
+                    {"id": "test_conn", "label": "测试连接", "variant": "secondary"},
+                    {"id": "save_config", "label": "保存", "variant": "primary"},
+                ],
             },
         ])
 
@@ -1806,17 +1823,21 @@ class SyncPlugin:
         if self.pending_confirm and self.pending_confirm["nb_key"] == self._notebook_key() and c == self.config:
             cards.append(self._confirmation_card())
 
+        configured = not self._target_error(c)
         last_result = self._get_last_result() or {}
-        status = self.last_status or last_result.get("summary") or ""
-        configured = not self._target_error(self.config)
-        if not self.last_status and not configured:
-            status = ""
+        status = self.last_status
+        if not status and configured and c == self.config:
+            last_ok = last_result.get("last_success")
+            if isinstance(last_ok, dict) and last_ok.get("time"):
+                status = f"上次同步 {last_ok['time']}"
+            elif last_result.get("summary"):
+                status = str(last_result["summary"])
         return {
             "title": "同步",
             "status": status,
             "header_actions": [
                 {"id": "sync_now", "label": "立即同步", "variant": "primary"},
-            ] if configured and c == self.config else [],
+            ] if configured else [],
             "cards": cards,
         }
 
@@ -1836,6 +1857,20 @@ class SyncPlugin:
             values = params.get("values")
             if isinstance(values, dict) and values:
                 cfg = self._normalize_config(values, base=self.config)
+                changed_immediate = False
+                if cfg["auto_sync"] != self.config["auto_sync"]:
+                    self.config["auto_sync"] = cfg["auto_sync"]
+                    changed_immediate = True
+                if cfg["protocol"] == "local_mirror" and not self._target_error(cfg):
+                    if self.config["protocol"] != "local_mirror" or self.config["mirror_dir"] != cfg["mirror_dir"]:
+                        self.config["protocol"] = "local_mirror"
+                        self.config["mirror_dir"] = cfg["mirror_dir"]
+                        self.pending_confirm = None
+                        self._remote_preview_cache.clear()
+                        self.last_status = ""
+                        changed_immediate = True
+                if changed_immediate:
+                    self._save_config(bridge)
             else:
                 cfg = dict(self.config)
             return {"page": self.build_page(cfg=cfg)}
@@ -1855,7 +1890,26 @@ class SyncPlugin:
                 self._save_config(bridge)
                 status = "已保存"
                 self.last_status = status
+            elif action_id == "test_conn":
+                next_cfg = self._normalize_config(values)
+                status = self._run_test_conn(cfg=next_cfg)
+                self._save_runtime(bridge)
+                return {
+                    "values": dict(next_cfg),
+                    "page": self.build_page(cfg=next_cfg),
+                    "status": status,
+                }
             elif action_id == "sync_now":
+                if isinstance(values, dict) and values:
+                    next_cfg = self._normalize_config(values)
+                    err = self._target_error(next_cfg)
+                    if err:
+                        return {"status": err}
+                    if next_cfg != self.config:
+                        self.pending_confirm = None
+                        self._remote_preview_cache.clear()
+                        self.config = next_cfg
+                        self._save_config(bridge)
                 status = self._run_sync(bridge)
             elif action_id == "confirm_sync":
                 pc = self.pending_confirm
