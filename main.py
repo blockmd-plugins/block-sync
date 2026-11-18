@@ -367,18 +367,49 @@ class SyncPlugin:
         bridge.call_host("host.storage.set", {"key": "notebook_results", "value": self.notebook_results})
 
     def _record_result(self, status, summary, protocol=None, target="", pushed=0, pulled=0, conflicts=0, assets=0):
+        nb_key = self._notebook_key()
         proto = protocol or self.config.get("protocol", "local_mirror")
-        self.notebook_results[self._notebook_key()] = {
-            "status": str(status or "完成"),
-            "protocol": self._protocol_label(proto),
-            "target": str(target or self._target_display(self.config)),
-            "time": now_hms(),
+        proto_label = self._protocol_label(proto)
+        target_str = str(target or self._target_display(self.config))
+        now_str = now_hms()
+        status_str = str(status or "完成")
+        summary_str = str(summary or "完成")
+
+        prev = self.notebook_results.get(nb_key)
+        prev_success = (
+            dict(prev.get("last_success"))
+            if isinstance(prev, dict) and isinstance(prev.get("last_success"), dict)
+            else None
+        )
+        if status_str in ("成功", "无变更"):
+            last_success = {
+                "status": status_str,
+                "protocol": proto_label,
+                "target": target_str,
+                "time": now_str,
+                "pushed": int(pushed or 0),
+                "pulled": int(pulled or 0),
+                "conflicts": int(conflicts or 0),
+                "assets": int(assets or 0),
+                "summary": summary_str,
+            }
+        else:
+            last_success = prev_success
+
+        entry = {
+            "status": status_str,
+            "protocol": proto_label,
+            "target": target_str,
+            "time": now_str,
             "pushed": int(pushed or 0),
             "pulled": int(pulled or 0),
             "conflicts": int(conflicts or 0),
             "assets": int(assets or 0),
-            "summary": str(summary or "完成"),
+            "summary": summary_str,
         }
+        if last_success is not None:
+            entry["last_success"] = last_success
+        self.notebook_results[nb_key] = entry
 
     def _get_last_result(self):
         return self.notebook_results.get(self._notebook_key())
@@ -1157,7 +1188,7 @@ class SyncPlugin:
                 if url_proc.returncode == 0 and url_proc.stdout.strip() != target:
                     self._run_git(["remote", "set-url", "origin", target], cwd=repo_dir, cfg=cfg)
                 if allow_pull:
-                    pull_proc = self._run_git(["pull", "--rebase", "origin", branch], cwd=repo_dir, timeout=10, cfg=cfg)
+                    pull_proc = self._run_git(["pull", "--rebase", "--autostash", "origin", branch], cwd=repo_dir, timeout=10, cfg=cfg)
                     if pull_proc.returncode != 0:
                         err_lower = (pull_proc.stderr or pull_proc.stdout or "").lower()
                         self._run_git(["rebase", "--abort"], cwd=repo_dir, cfg=cfg)
@@ -1321,6 +1352,13 @@ class SyncPlugin:
             if is_safe_rel_md(p) and self._matches_scope(p, scope) and p in remote_notes and p not in local_notes
         ] if (remote_inspected and only_path is None) else []
 
+        local_hashes = {p: sha256_text(local_notes[p]) for p in sorted(local_notes)}
+        remote_hashes = {p: sha256_text(remote_notes[p]) for p in sorted(remote_notes)}
+        base_hashes = {
+            p: base_map[p]
+            for p in sorted(base_map)
+            if p in local_notes or p in remote_notes
+        }
         fp_payload = json.dumps({
             "nb": self._notebook_key(),
             "protocol": protocol,
@@ -1334,6 +1372,9 @@ class SyncPlugin:
             "conflicts": [c[0] for c in conflicts],
             "remote_missing": remote_missing,
             "local_missing": local_missing,
+            "local_hashes": local_hashes,
+            "remote_hashes": remote_hashes,
+            "base_hashes": base_hashes,
         }, sort_keys=True, ensure_ascii=False)
 
         return {
@@ -1466,12 +1507,21 @@ class SyncPlugin:
             if asset_count > 0:
                 self._append_log("assets 附件同步", f"同步 {asset_count} 个文件")
 
+        did_push = False
         if protocol == "git":
             branch = self._git_branch(cfg)
             status_proc = self._run_git(["status", "--porcelain"], cwd=target_dir, cfg=cfg)
-            if status_proc.returncode == 0 and status_proc.stdout.strip():
-                self._run_git(["add", "-A"], cwd=target_dir, cfg=cfg)
-                self._run_git(
+            if status_proc.returncode != 0:
+                err = sanitize_error_text(status_proc.stderr or status_proc.stdout or "git status 失败")
+                raise RuntimeError(f"Git 状态检查失败: {err}")
+
+            if status_proc.stdout.strip():
+                add_proc = self._run_git(["add", "-A"], cwd=target_dir, cfg=cfg)
+                if add_proc.returncode != 0:
+                    err = sanitize_error_text(add_proc.stderr or add_proc.stdout or "git add 失败")
+                    raise RuntimeError(f"Git 暂存失败: {err}")
+
+                commit_proc = self._run_git(
                     [
                         "-c", "user.name=Block Sync",
                         "-c", "user.email=sync@blockmd.local",
@@ -1480,16 +1530,51 @@ class SyncPlugin:
                     cwd=target_dir,
                     cfg=cfg,
                 )
-                remote_proc = self._run_git(["remote"], cwd=target_dir, cfg=cfg)
-                if remote_proc.returncode == 0 and remote_proc.stdout.strip():
-                    push_proc = self._run_git(["push", "-u", "origin", f"HEAD:{branch}"], cwd=target_dir, timeout=10, cfg=cfg)
-                    if push_proc.returncode != 0:
-                        self.sync_meta[plan["meta_key"]] = base_map
-                        self.stats["total_synced"] += pushed + pulled + conflict_count
-                        self.stats["last_sync"] = now_hms()
-                        err_msg = f"已提交到本地 Git，但远端推送未完成: {sanitize_error_text(push_proc.stderr or 'push 失败')}"
-                        self._record_result("失败", err_msg, protocol=protocol, target=plan["target_display"], pushed=pushed, pulled=pulled, conflicts=conflict_count, assets=asset_count)
-                        return err_msg
+                if commit_proc.returncode != 0:
+                    self._run_git(["reset"], cwd=target_dir, cfg=cfg)
+                    err = sanitize_error_text(commit_proc.stderr or commit_proc.stdout or "git commit 失败")
+                    raise RuntimeError(f"Git 提交失败: {err}")
+
+            remote_proc = self._run_git(["remote"], cwd=target_dir, cfg=cfg)
+            if remote_proc.returncode != 0:
+                err = sanitize_error_text(remote_proc.stderr or remote_proc.stdout or "git remote 失败")
+                raise RuntimeError(f"Git 远端检查失败: {err}")
+
+            remotes = [r.strip() for r in remote_proc.stdout.splitlines() if r.strip()]
+            if remotes:
+                remote_name = "origin" if "origin" in remotes else remotes[0]
+                head_proc = self._run_git(["rev-parse", "--verify", "HEAD"], cwd=target_dir, cfg=cfg)
+                if head_proc.returncode == 0:
+                    needs_push = False
+                    ref_proc = self._run_git(
+                        ["rev-parse", "--verify", f"refs/remotes/{remote_name}/{branch}"],
+                        cwd=target_dir,
+                        cfg=cfg,
+                    )
+                    if ref_proc.returncode != 0:
+                        needs_push = True
+                    else:
+                        ahead_proc = self._run_git(
+                            ["rev-list", "--count", f"refs/remotes/{remote_name}/{branch}..HEAD"],
+                            cwd=target_dir,
+                            cfg=cfg,
+                        )
+                        if ahead_proc.returncode != 0 or int((ahead_proc.stdout or "0").strip() or "0") > 0:
+                            needs_push = True
+
+                    if needs_push:
+                        push_proc = self._run_git(
+                            ["push", "-u", remote_name, f"HEAD:{branch}"],
+                            cwd=target_dir,
+                            timeout=10,
+                            cfg=cfg,
+                        )
+                        if push_proc.returncode != 0:
+                            self.sync_meta[plan["meta_key"]] = base_map
+                            self.stats["total_synced"] += pushed + pulled + conflict_count
+                            err = sanitize_error_text(push_proc.stderr or push_proc.stdout or "push 失败")
+                            raise RuntimeError(f"已提交到本地 Git，但远端推送未完成: {err}")
+                        did_push = True
 
         self._remote_preview_cache.clear()
         self.sync_meta[plan["meta_key"]] = base_map
@@ -1498,6 +1583,10 @@ class SyncPlugin:
         self.stats["last_sync"] = now_hms()
 
         if total_notes == 0 and asset_count == 0:
+            if did_push:
+                summary = "已将本地 Git 待推送提交同步到远端"
+                self._record_result("成功", summary, protocol=protocol, target=plan["target_display"])
+                return summary
             summary = f"{self._protocol_label(protocol)}已是最新状态"
             self._record_result("无变更", summary, protocol=protocol, target=plan["target_display"])
             return summary
@@ -1510,17 +1599,41 @@ class SyncPlugin:
 
     # ---------- Dispatch & UI ----------
 
-    def _run_sync(self, bridge, only_path=None, confirmed=False):
+    def _build_pending_confirm(self, plan, reasons):
+        sample_lines = (
+            [f"[覆盖本地] {p}" for p in plan["to_pull_overwrite"]]
+            + [f"[覆盖远端] {p}" for p in plan["to_push_overwrite"]]
+            + [f"[冲突副本] {p} -> {cr}" for p, cr, _ in plan["conflicts"]]
+            + [f"[拉取] {p}" for p in plan["to_pull_new"]]
+            + [f"[推送] {p}" for p in plan["to_push_new"]]
+            + [f"[远端缺失] {p}" for p in plan["remote_missing"]]
+            + [f"[本地缺失] {p}" for p in plan["local_missing"]]
+        )
+        return {
+            "nb_key": self._notebook_key(),
+            "fingerprint": plan["fingerprint"],
+            "protocol": plan["protocol"],
+            "target_display": plan["target_display"],
+            "reasons": list(reasons),
+            "badge": f"需确认 · {len(reasons)} 项风险",
+            "sample_lines": sample_lines,
+        }
+
+    def _run_sync(self, bridge, only_path=None, confirmed=False, approved_plan=None):
         protocol = self.config.get("protocol", "local_mirror")
-        try:
-            plan = self._compute_sync_plan(bridge, self.config, only_path=only_path, inspect_remote=True, force_refresh=True)
-        except Exception as exc:
-            msg = f"{self._protocol_label(protocol)}同步未完成: {sanitize_error_text(exc)}"
-            self._append_log(f"{self._protocol_label(protocol)}同步", msg)
-            self._record_result("失败", msg, protocol=protocol)
-            self._save_runtime(bridge)
-            self.last_status = msg
-            return msg
+        if approved_plan is not None:
+            plan = approved_plan
+            protocol = plan.get("protocol", protocol)
+        else:
+            try:
+                plan = self._compute_sync_plan(bridge, self.config, only_path=only_path, inspect_remote=True, force_refresh=True)
+            except Exception as exc:
+                msg = f"{self._protocol_label(protocol)}同步未完成: {sanitize_error_text(exc)}"
+                self._append_log(f"{self._protocol_label(protocol)}同步", msg)
+                self._record_result("失败", msg, protocol=protocol)
+                self._save_runtime(bridge)
+                self.last_status = msg
+                raise RuntimeError(msg) from exc
 
         if plan.get("remote_error"):
             msg = plan["remote_error"]
@@ -1528,7 +1641,7 @@ class SyncPlugin:
             self._record_result("失败", msg, protocol=protocol, target=plan["target_display"])
             self._save_runtime(bridge)
             self.last_status = msg
-            return msg
+            raise RuntimeError(msg)
 
         if not confirmed:
             reasons = self._assess_dangerous_changes(plan, self.config)
@@ -1540,23 +1653,7 @@ class SyncPlugin:
                     self._save_runtime(bridge)
                     self.last_status = msg
                     return msg
-                sample_lines = (
-                    [f"[覆盖本地] {p}" for p in plan["to_pull_overwrite"]]
-                    + [f"[覆盖远端] {p}" for p in plan["to_push_overwrite"]]
-                    + [f"[冲突副本] {p} -> {cr}" for p, cr, _ in plan["conflicts"]]
-                    + [f"[拉取] {p}" for p in plan["to_pull_new"]]
-                    + [f"[远端缺失] {p}" for p in plan["remote_missing"]]
-                    + [f"[本地缺失] {p}" for p in plan["local_missing"]]
-                )
-                self.pending_confirm = {
-                    "nb_key": self._notebook_key(),
-                    "fingerprint": plan["fingerprint"],
-                    "protocol": protocol,
-                    "target_display": plan["target_display"],
-                    "reasons": reasons,
-                    "badge": f"需确认 · {len(reasons)} 项风险",
-                    "sample_lines": sample_lines,
-                }
+                self.pending_confirm = self._build_pending_confirm(plan, reasons)
                 msg = "检测到危险变更，请先确认后执行"
                 self._append_log("等待危险变更确认", reasons[0])
                 self._record_result("待确认", reasons[0], protocol=protocol, target=plan["target_display"])
@@ -1567,9 +1664,14 @@ class SyncPlugin:
         try:
             msg = self._execute_sync_plan(bridge, plan, only_path=only_path)
         except Exception as exc:
-            msg = f"{self._protocol_label(protocol)}同步未完成: {sanitize_error_text(exc)}"
+            msg = sanitize_error_text(exc)
+            if not msg.startswith(self._protocol_label(protocol)) and "Git" not in msg:
+                msg = f"{self._protocol_label(protocol)}同步未完成: {msg}"
             self._append_log(f"{self._protocol_label(protocol)}同步", msg)
             self._record_result("失败", msg, protocol=protocol, target=plan["target_display"])
+            self._save_runtime(bridge)
+            self.last_status = msg
+            raise RuntimeError(msg) from exc
 
         self._save_runtime(bridge)
         self.last_status = msg
@@ -1865,11 +1967,20 @@ class SyncPlugin:
         target_items.append({"kind": "actions", "buttons": action_buttons})
 
         preview_items = self._build_preview_items(bridge, c)
-        last_res = self._get_last_result()
-        last_res_status = (last_res or {}).get("status") or "尚未同步"
-        last_res_time = (last_res or {}).get("time") or last_sync
-        last_res_target = (last_res or {}).get("target") or self._target_display(c)
-        last_res_summary = (last_res or {}).get("summary") or "暂无最近同步结果"
+        last_res = self._get_last_result() or {}
+        last_attempt_status = last_res.get("status") or "尚未尝试"
+        last_attempt_time = last_res.get("time") or "尚未尝试"
+        last_attempt_target = last_res.get("target") or self._target_display(c)
+        last_attempt_summary = last_res.get("summary") or "暂无最近尝试记录"
+
+        last_ok = last_res.get("last_success") if isinstance(last_res.get("last_success"), dict) else None
+        if not last_ok and last_res.get("status") in ("成功", "无变更"):
+            last_ok = last_res
+        last_success_time = (last_ok or {}).get("time") or (last_sync if last_sync != "尚未同步" else "尚未成功")
+        if last_ok:
+            last_success_detail = f"{last_ok.get('time', '')} · {last_ok.get('summary', '')} ({last_ok.get('target', '')})"
+        else:
+            last_success_detail = "暂无成功同步记录"
 
         return {
             "title": "同步",
@@ -1950,15 +2061,17 @@ class SyncPlugin:
                             "metrics": [
                                 {"label": "当前模式", "value": mode_label},
                                 {"label": "累计同步篇数", "value": f"{total_synced} 篇"},
-                                {"label": "最近同步时间", "value": last_res_time},
-                                {"label": "最近结果", "value": last_res_status},
+                                {"label": "最近成功时间", "value": last_success_time},
+                                {"label": "最近尝试结果", "value": last_attempt_status},
                             ],
                         },
                         {
                             "kind": "kv",
                             "rows": [
-                                {"label": "最近同步目标", "value": last_res_target},
-                                {"label": "最近结果详情", "value": last_res_summary},
+                                {"label": "最近尝试时间", "value": last_attempt_time},
+                                {"label": "最近尝试目标", "value": last_attempt_target},
+                                {"label": "最近尝试详情", "value": last_attempt_summary},
+                                {"label": "最近成功详情", "value": last_success_detail},
                             ],
                         },
                         {
@@ -2036,23 +2149,44 @@ class SyncPlugin:
                     status = "当前没有待确认的同步计划"
                     self.last_status = status
                 else:
-                    plan = self._compute_sync_plan(bridge, self.config, inspect_remote=True, force_refresh=True)
+                    protocol = self.config.get("protocol", "local_mirror")
+                    try:
+                        plan = self._compute_sync_plan(bridge, self.config, inspect_remote=True, force_refresh=True)
+                    except Exception as exc:
+                        msg = f"{self._protocol_label(protocol)}同步未完成: {sanitize_error_text(exc)}"
+                        self._append_log(f"{self._protocol_label(protocol)}同步", msg)
+                        self._record_result("失败", msg, protocol=protocol)
+                        self._save_runtime(bridge)
+                        self.last_status = msg
+                        raise RuntimeError(msg) from exc
+
                     if plan.get("remote_error"):
-                        status = plan["remote_error"]
-                        self.last_status = status
-                    elif plan["fingerprint"] != pc.get("fingerprint"):
+                        msg = plan["remote_error"]
+                        self._append_log(f"{self._protocol_label(plan['protocol'])}同步", msg)
+                        self._record_result("失败", msg, protocol=plan["protocol"], target=plan["target_display"])
+                        self._save_runtime(bridge)
+                        self.last_status = msg
+                        raise RuntimeError(msg)
+
+                    if plan["fingerprint"] != pc.get("fingerprint"):
                         reasons = self._assess_dangerous_changes(plan, self.config)
                         if reasons:
-                            self.pending_confirm["fingerprint"] = plan["fingerprint"]
-                            self.pending_confirm["reasons"] = reasons
+                            self.pending_confirm = self._build_pending_confirm(plan, reasons)
+                            self._append_log("同步计划已变化", reasons[0])
+                            self._record_result("待确认", "同步计划已变化，请重新确认", protocol=plan["protocol"], target=plan["target_display"])
+                            self._save_runtime(bridge)
                             status = "同步计划已变化，请重新确认"
                             self.last_status = status
                         else:
                             self.pending_confirm = None
-                            status = self._run_sync(bridge, confirmed=True)
+                            self._append_log("同步计划已变化", "原危险变更已消除，请重新同步")
+                            self._record_result("待确认", "同步计划已变化，请重新同步", protocol=plan["protocol"], target=plan["target_display"])
+                            self._save_runtime(bridge)
+                            status = "同步计划已变化，请重新同步"
+                            self.last_status = status
                     else:
                         self.pending_confirm = None
-                        status = self._run_sync(bridge, confirmed=True)
+                        status = self._run_sync(bridge, confirmed=True, approved_plan=plan)
             elif action_id == "cancel_confirm":
                 self.pending_confirm = None
                 self._append_log("取消危险同步", "用户已取消")
@@ -2079,11 +2213,7 @@ class SyncPlugin:
                 only_path = rel_path if is_safe_rel_md(rel_path) else None
                 if only_path and not self._matches_scope(only_path):
                     return {"handled": True}
-                try:
-                    self._run_sync(bridge, only_path=only_path)
-                except Exception as exc:
-                    self._append_log(rel_path or "自动同步", f"异常: {sanitize_error_text(exc)}")
-                    self._save_runtime(bridge)
+                self._run_sync(bridge, only_path=only_path)
             return {"handled": True}
 
         if method == "plugin.shutdown":
