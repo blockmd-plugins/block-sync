@@ -23,6 +23,7 @@ DELETE_GUARD_THRESHOLD = 5
 MAX_LOG_ENTRIES = 20
 
 DEFAULT_CONFIG = {
+    "selected_notebooks": [],
     "protocol": "local_mirror",
     "mirror_dir": "",
     "sync_scope": "all",
@@ -147,6 +148,7 @@ class SyncPlugin:
         self.data_dir = ""
         self.downloads_dir = os.path.expanduser("~/Downloads")
         self.notebook_root = ""
+        self.known_notebooks = []
         self.locale = "zh"
         self.config = dict(DEFAULT_CONFIG)
         self.notebook_configs = {}
@@ -157,27 +159,141 @@ class SyncPlugin:
         self.pending_confirm = None
         self._remote_preview_cache = {}
         self.kv_tooltip = False
+        self.supports_checklist = False
+        self.supports_form_layout = False
+        self.supports_multi_notebook = False
         self.last_status = ""
 
-    def _notebook_key(self):
-        raw = (self.notebook_root or "").strip()
-        if not raw:
-            return "default"
-        return os.path.normpath(os.path.expanduser(raw))
+    def _norm_nb_path(self, raw):
+        text = str(raw or "").strip()
+        if not text:
+            return ""
+        return os.path.normpath(os.path.abspath(os.path.expanduser(text)))
 
-    def _notebook_label(self):
-        key = self._notebook_key()
+    def _display_path(self, raw):
+        path = self._norm_nb_path(raw)
+        if not path:
+            return ""
+        home = os.path.normpath(os.path.expanduser("~"))
+        if path == home:
+            return "~"
+        if path.startswith(home + os.sep):
+            return "~" + path[len(home):]
+        return path
+
+    def _notebook_key(self, nb_root=None):
+        raw = nb_root if nb_root is not None else self.notebook_root
+        norm = self._norm_nb_path(raw)
+        return norm or "default"
+
+    def _notebook_label(self, nb_root=None):
+        key = self._notebook_key(nb_root)
         if key == "default":
             return "默认笔记本"
         return os.path.basename(key) or key
 
-    def _notebook_slug(self):
-        key = self._notebook_key()
+    def _notebook_slug(self, nb_root=None):
+        key = self._notebook_key(nb_root)
         if key == "default":
             return "default"
         base = os.path.basename(key) or "notebook"
         safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in base).strip("-") or "notebook"
         return f"{safe[:24]}-{sha256_text(key)[:8]}"
+
+    def _refresh_known_notebooks(self, bridge):
+        entries = []
+        seen = set()
+
+        def add_entry(path_raw, name_raw="", active=False):
+            norm = self._norm_nb_path(path_raw)
+            if not norm or norm in seen:
+                return
+            seen.add(norm)
+            label = str(name_raw or "").strip() or os.path.basename(norm) or norm
+            entries.append({"path": norm, "name": label, "active": bool(active)})
+
+        active_norm = self._norm_nb_path(self.notebook_root)
+        if self.supports_multi_notebook and bridge is not None:
+            try:
+                res = bridge.call_host("host.notebooks.list", {})
+                for item in res.get("notebooks") or []:
+                    if isinstance(item, dict):
+                        p = item.get("path")
+                        add_entry(
+                            p,
+                            item.get("name"),
+                            bool(item.get("active")) or (active_norm and self._norm_nb_path(p) == active_norm),
+                        )
+            except Exception:
+                pass
+
+        for existing in self.known_notebooks:
+            if isinstance(existing, dict):
+                p = existing.get("path")
+                add_entry(p, existing.get("name"), active_norm and self._norm_nb_path(p) == active_norm)
+            elif isinstance(existing, str):
+                add_entry(existing, "", active_norm and self._norm_nb_path(existing) == active_norm)
+
+        if active_norm:
+            add_entry(active_norm, os.path.basename(active_norm) or active_norm, True)
+
+        self.known_notebooks = entries
+        return entries
+
+    def _selected_notebooks(self, cfg=None):
+        c = cfg if cfg is not None else self.config
+        raw = c.get("selected_notebooks")
+        known_paths = [e["path"] for e in self.known_notebooks]
+        known_set = set(known_paths)
+        out = []
+        seen = set()
+        if isinstance(raw, list):
+            for item in raw:
+                norm = self._norm_nb_path(item)
+                if not norm or norm in seen:
+                    continue
+                if known_set and norm not in known_set:
+                    continue
+                seen.add(norm)
+                out.append(norm)
+        if not self.supports_multi_notebook:
+            active_norm = self._norm_nb_path(self.notebook_root)
+            return [active_norm] if active_norm else []
+        return out
+
+    def _notebook_subdir_map(self, notebooks, protocol, target_base):
+        """Assign stable, collision-free subdirectories per notebook.
+
+        Preserves legacy root layout when only one notebook is selected and it
+        has not been synced under a subdirectory yet.
+        """
+        if not notebooks:
+            return {}
+        clean_names = {}
+        name_counts = {}
+        for nb in notebooks:
+            base = os.path.basename(nb) or "notebook"
+            safe = "".join(ch if ch not in ("/", "\\", "\x00") else "-" for ch in base).strip().strip(".") or "notebook"
+            clean_names[nb] = safe
+            name_counts[safe] = name_counts.get(safe, 0) + 1
+
+        subdirs = {}
+        for nb in notebooks:
+            safe = clean_names[nb]
+            if name_counts[safe] > 1:
+                subdirs[nb] = f"{safe}-{sha256_text(nb)[:4]}"
+            else:
+                subdirs[nb] = safe
+
+        if len(notebooks) == 1:
+            nb = notebooks[0]
+            sub = subdirs[nb]
+            sub_meta = self._meta_key(protocol, f"{target_base}::{sub}", nb_key=nb)
+            if sub_meta in self.sync_meta:
+                return {nb: sub}
+            return {nb: ""}
+
+        return subdirs
 
     def _meta_key(self, protocol, target_id, nb_key=None):
         nb = nb_key or self._notebook_key()
@@ -191,6 +307,7 @@ class SyncPlugin:
         return {}
 
     def _load_state(self, bridge):
+        self._refresh_known_notebooks(bridge)
         nb_key = self._notebook_key()
         nb_cfgs_res = bridge.call_host("host.storage.get", {"key": "notebook_configs"})
         if nb_cfgs_res.get("found") and isinstance(nb_cfgs_res.get("value"), dict):
@@ -201,13 +318,21 @@ class SyncPlugin:
             }
 
         cfg_res = bridge.call_host("host.storage.get", {"key": "config"})
-        if nb_key in self.notebook_configs:
+        raw_cfg = cfg_res.get("value") if (cfg_res.get("found") and isinstance(cfg_res.get("value"), dict)) else None
+        if raw_cfg is not None and "selected_notebooks" in raw_cfg:
+            self.config = self._normalize_config(raw_cfg, base=DEFAULT_CONFIG)
+        elif nb_key in self.notebook_configs:
             self.config = self._normalize_config(self.notebook_configs[nb_key], base=DEFAULT_CONFIG)
-        elif not self.notebook_configs and cfg_res.get("found") and isinstance(cfg_res.get("value"), dict):
-            self.config = self._normalize_config(cfg_res["value"], base=DEFAULT_CONFIG)
-            self.notebook_configs[nb_key] = dict(self.config)
+            if self.notebook_root:
+                self.config["selected_notebooks"] = [self._norm_nb_path(self.notebook_root)]
+        elif raw_cfg is not None:
+            self.config = self._normalize_config(raw_cfg, base=DEFAULT_CONFIG)
+            if self.notebook_root and not self.config["selected_notebooks"]:
+                self.config["selected_notebooks"] = [self._norm_nb_path(self.notebook_root)]
         else:
             self.config = dict(DEFAULT_CONFIG)
+            if self.notebook_root:
+                self.config["selected_notebooks"] = [self._norm_nb_path(self.notebook_root)]
 
         nb_res = bridge.call_host("host.storage.get", {"key": "notebook_results"})
         if nb_res.get("found") and isinstance(nb_res.get("value"), dict):
@@ -241,18 +366,75 @@ class SyncPlugin:
 
     def _normalize_log(self, entry):
         title = str(entry.get("title") or "同步事件").strip() or "同步事件"
-        time_str = str(entry.get("time") or now_hms()).strip() or now_hms()
-        status = str(entry.get("status") or "").strip()
-        item = {"title": title, "time": time_str}
-        if status:
-            item["status"] = status
+        time_str = str(entry.get("time") or "").strip()
+        raw_status = str(entry.get("status") or "").strip()
+        raw_tone = str(entry.get("tone") or "").strip().lower()
+        raw_tooltip = str(entry.get("tooltip") or "").strip()
+
+        status, inferred_tone, extra_tip = self._classify_log_status(raw_status)
+        tone = raw_tone if raw_tone in ("success", "warning", "danger", "info") else inferred_tone
+        tooltip = raw_tooltip or extra_tip
+
+        item = {"title": title, "status": status, "time": time_str, "tone": tone}
+        if tooltip and tooltip != title and tooltip != status:
+            item["tooltip"] = tooltip
         return item
+
+    def _classify_log_status(self, raw_status):
+        s = str(raw_status or "").strip()
+        if not s:
+            return "完成", "info", ""
+        exact = {
+            "成功": ("成功", "success"),
+            "通过": ("通过", "success"),
+            "完成": ("成功", "success"),
+            "无变更": ("无变更", "info"),
+            "待确认": ("待确认", "warning"),
+            "失败": ("失败", "danger"),
+            "未连通": ("未连通", "danger"),
+            "已取消": ("已取消", "info"),
+            "冲突副本": ("冲突副本", "warning"),
+        }
+        if s in exact:
+            st, tn = exact[s]
+            return st, tn, ""
+        if s == "用户已取消" or "已取消" in s:
+            return "已取消", "info", s
+        if "未连通" in s:
+            return "未连通", "danger", s
+        if any(tok in s for tok in ("失败", "未完成", "异常", "错误", "请先填写")):
+            return "失败", "danger", s
+        if any(tok in s for tok in ("删除保护", "暂停", "待确认", "危险变更")):
+            return "待确认", "warning", s
+        if "冲突" in s:
+            return "冲突副本", "warning", s
+        if any(tok in s for tok in ("已是最新", "无变更")):
+            return "无变更", "info", s
+        if any(tok in s for tok in ("已镜像", "已从", "优先", "已推送", "已上传", "已下载", "已拉取", "同步 ", "模式:")):
+            return "成功", "success", s
+        return s, "info", ""
 
     def _normalize_config(self, raw, base=None):
         merged = dict(DEFAULT_CONFIG)
-        merged.update(base if base is not None else self.config)
+        merged["selected_notebooks"] = list(DEFAULT_CONFIG["selected_notebooks"])
+        src_base = base if base is not None else self.config
+        merged.update(src_base)
+        if isinstance(src_base.get("selected_notebooks"), list):
+            merged["selected_notebooks"] = [
+                self._norm_nb_path(p) for p in src_base["selected_notebooks"] if self._norm_nb_path(p)
+            ]
         if not isinstance(raw, dict):
             return merged
+
+        if "selected_notebooks" in raw and isinstance(raw["selected_notebooks"], list):
+            dedup = []
+            seen = set()
+            for item in raw["selected_notebooks"]:
+                norm = self._norm_nb_path(item)
+                if norm and norm not in seen:
+                    seen.add(norm)
+                    dedup.append(norm)
+            merged["selected_notebooks"] = dedup
 
         protocol = raw.get("protocol", merged["protocol"])
         if protocol in VALID_PROTOCOLS:
@@ -346,8 +528,11 @@ class SyncPlugin:
         bridge.call_host("host.storage.set", {"key": "sync_meta", "value": self.sync_meta})
         bridge.call_host("host.storage.set", {"key": "notebook_results", "value": self.notebook_results})
 
+    def _result_key(self):
+        return "__multi__" if self.supports_multi_notebook else self._notebook_key()
+
     def _record_result(self, status, summary, protocol=None, target="", pushed=0, pulled=0, conflicts=0, assets=0):
-        nb_key = self._notebook_key()
+        nb_key = self._result_key()
         proto = protocol or self.config.get("protocol", "local_mirror")
         proto_label = self._protocol_label(proto)
         target_str = str(target or self._target_display(self.config))
@@ -392,7 +577,7 @@ class SyncPlugin:
         self.notebook_results[nb_key] = entry
 
     def _get_last_result(self):
-        return self.notebook_results.get(self._notebook_key())
+        return self.notebook_results.get(self._result_key()) or self.notebook_results.get(self._notebook_key())
 
     def _target_display(self, cfg=None):
         c = cfg or self.config
@@ -406,8 +591,14 @@ class SyncPlugin:
         repo_dir = self._resolve_local_git_dir(c)
         return f"{target} ({branch})" if target else f"{repo_dir} ({branch})"
 
-    def _append_log(self, title, status):
-        entry = {"title": str(title) or "同步任务", "time": now_hms(), "status": str(status) or "完成"}
+    def _append_log(self, title, status, tone="", tooltip=""):
+        entry = self._normalize_log({
+            "title": str(title or "同步任务").strip() or "同步任务",
+            "status": str(status or "成功").strip() or "成功",
+            "time": now_hms(),
+            "tone": tone,
+            "tooltip": tooltip,
+        })
         self.logs.insert(0, entry)
         self.logs = self.logs[:MAX_LOG_ENTRIES]
 
@@ -436,7 +627,10 @@ class SyncPlugin:
         c = cfg or self.config
         return str(c.get("webdav_dir") or "").strip() or "/BlockNotes"
 
-    def _target_error(self, cfg):
+    def _target_error(self, cfg, require_notebooks=True):
+        selected = self._selected_notebooks(cfg)
+        if require_notebooks and self.supports_multi_notebook and not selected:
+            return "请至少选择一个笔记本"
         protocol = cfg["protocol"]
         if protocol == "webdav":
             if not self._webdav_base_url(cfg):
@@ -448,15 +642,18 @@ class SyncPlugin:
             target = self._resolve_mirror_dir(cfg)
             if not target:
                 return "请先选择同步文件夹"
-            if self.notebook_root:
-                source = os.path.realpath(self.notebook_root)
-                target = os.path.realpath(target)
+            target_real = os.path.realpath(target)
+            roots_to_check = selected if selected else ([self.notebook_root] if self.notebook_root else [])
+            for nb in roots_to_check:
+                if not nb:
+                    continue
+                source = os.path.realpath(nb)
                 try:
-                    overlaps = os.path.commonpath((source, target)) in (source, target)
+                    overlaps = os.path.commonpath((source, target_real)) in (source, target_real)
                 except ValueError:
                     overlaps = False
                 if overlaps:
-                    return "请选择与笔记本分开的文件夹"
+                    return f"同步文件夹不能与笔记本「{self._notebook_label(nb)}」重叠"
         return ""
 
     def _matches_scope(self, rel_path, scope=None):
@@ -465,8 +662,11 @@ class SyncPlugin:
             return True
         return rel_path.startswith(f"{sc}/")
 
-    def _list_local_note_paths(self, bridge):
-        listed = bridge.call_host("host.notes.list", {}).get("notes") or []
+    def _list_local_note_paths(self, bridge, nb_root=None):
+        params = {}
+        if nb_root and self.supports_multi_notebook:
+            params["notebook_root"] = nb_root
+        listed = bridge.call_host("host.notes.list", params).get("notes") or []
         paths = []
         for item in listed:
             rel_path = str(item.get("path") or "").replace("\\", "/")
@@ -474,9 +674,9 @@ class SyncPlugin:
                 paths.append(rel_path)
         return sorted(set(paths))
 
-    def _read_local_notes(self, bridge, only_path=None, scope=None, paths=None):
+    def _read_local_notes(self, bridge, only_path=None, scope=None, paths=None, nb_root=None):
         notes = {}
-        all_paths = paths if paths is not None else self._list_local_note_paths(bridge)
+        all_paths = paths if paths is not None else self._list_local_note_paths(bridge, nb_root=nb_root)
         for rel_path in all_paths:
             if not is_safe_rel_md(rel_path):
                 continue
@@ -484,15 +684,25 @@ class SyncPlugin:
                 continue
             if not only_path and not self._matches_scope(rel_path, scope):
                 continue
-            res = bridge.call_host("host.notes.read", {"path": rel_path})
+            params = {"path": rel_path}
+            if nb_root and self.supports_multi_notebook:
+                params["notebook_root"] = nb_root
+            res = bridge.call_host("host.notes.read", params)
             notes[rel_path] = str(res.get("content") or "")
         return notes
 
-    def _read_local_assets(self):
+    def _write_local_note(self, bridge, rel_path, content, nb_root=None):
+        params = {"path": rel_path, "content": content}
+        if nb_root and self.supports_multi_notebook:
+            params["notebook_root"] = nb_root
+        bridge.call_host("host.notes.write", params)
+
+    def _read_local_assets(self, nb_root=None):
         assets = {}
-        if not self.notebook_root:
+        root_dir = nb_root or self.notebook_root
+        if not root_dir:
             return assets
-        root_real = os.path.realpath(self.notebook_root)
+        root_real = os.path.realpath(root_dir)
         assets_dir = os.path.join(root_real, "assets")
         if not os.path.isdir(assets_dir):
             return assets
@@ -512,10 +722,11 @@ class SyncPlugin:
                     assets[rel] = fh.read()
         return assets
 
-    def _write_local_asset(self, rel_asset_path, data):
-        if not self.notebook_root or not is_safe_rel_asset(rel_asset_path):
+    def _write_local_asset(self, rel_asset_path, data, nb_root=None):
+        root_dir = nb_root or self.notebook_root
+        if not root_dir or not is_safe_rel_asset(rel_asset_path):
             return False
-        root_real = os.path.realpath(self.notebook_root)
+        root_real = os.path.realpath(root_dir)
         dest = os.path.normpath(os.path.join(root_real, *rel_asset_path.split("/")))
         if not dest.startswith(root_real + os.sep):
             return False
@@ -569,10 +780,11 @@ class SyncPlugin:
         conflict_rel = make_conflict_path(rel_path, conflict_stamp())
         return "keep_both", local_text, (conflict_rel, remote_text), local_hash
 
-    def _sync_local_dir_assets(self, remote_dir):
-        if not self.config.get("sync_assets", True) or not self.notebook_root:
+    def _sync_local_dir_assets(self, remote_dir, nb_root=None):
+        root_dir = nb_root or self.notebook_root
+        if not self.config.get("sync_assets", True) or not root_dir:
             return 0
-        local_assets = self._read_local_assets()
+        local_assets = self._read_local_assets(nb_root=root_dir)
         remote_assets = {}
         assets_dir = os.path.join(remote_dir, "assets")
         if os.path.isdir(assets_dir):
@@ -596,11 +808,11 @@ class SyncPlugin:
                 self._write_mirror_bytes(remote_dir, rel, local_assets[rel])
                 synced += 1
             elif in_remote and not in_local:
-                if self._write_local_asset(rel, remote_assets[rel]):
+                if self._write_local_asset(rel, remote_assets[rel], nb_root=root_dir):
                     synced += 1
             elif sha256_bytes(local_assets[rel]) != sha256_bytes(remote_assets[rel]):
                 if policy == "remote_first":
-                    if self._write_local_asset(rel, remote_assets[rel]):
+                    if self._write_local_asset(rel, remote_assets[rel], nb_root=root_dir):
                         synced += 1
                 else:
                     self._write_mirror_bytes(remote_dir, rel, local_assets[rel])
@@ -673,7 +885,7 @@ class SyncPlugin:
 
         guard_msg = self._check_delete_guard(base_map, local_notes, remote_notes, only_path=only_path)
         if guard_msg:
-            self._append_log("删除保护暂停", guard_msg)
+            self._append_log("删除保护暂停", "待确认", tone="warning", tooltip=guard_msg)
             return guard_msg
 
         synced_count = 0
@@ -686,13 +898,13 @@ class SyncPlugin:
                 self._write_mirror_file(mirror_dir, rel_path, text)
                 base_map[rel_path] = sha256_text(text)
                 synced_count += 1
-                self._append_log(rel_path, "已镜像到本地目录")
+                self._append_log(f"推送 {rel_path}", "成功", tone="success", tooltip="已镜像到本地目录")
             elif in_remote and not in_local:
                 text = remote_notes[rel_path]
                 bridge.call_host("host.notes.write", {"path": rel_path, "content": text})
                 base_map[rel_path] = sha256_text(text)
                 synced_count += 1
-                self._append_log(rel_path, "已从镜像恢复")
+                self._append_log(f"拉取 {rel_path}", "成功", tone="success", tooltip="已从镜像恢复")
             else:
                 action, chosen_text, conflict_extra, new_hash = self._resolve_conflict_pair(
                     rel_path, local_notes[rel_path], remote_notes[rel_path], base_map.get(rel_path)
@@ -703,12 +915,12 @@ class SyncPlugin:
                     self._write_mirror_file(mirror_dir, rel_path, chosen_text)
                     base_map[rel_path] = new_hash
                     synced_count += 1
-                    self._append_log(rel_path, "本地优先覆盖镜像")
+                    self._append_log(f"本地覆盖 {rel_path}", "成功", tone="success", tooltip="本地优先覆盖镜像")
                 elif action == "pull":
                     bridge.call_host("host.notes.write", {"path": rel_path, "content": chosen_text})
                     base_map[rel_path] = new_hash
                     synced_count += 1
-                    self._append_log(rel_path, "镜像优先更新本地")
+                    self._append_log(f"远端覆盖 {rel_path}", "成功", tone="success", tooltip="镜像优先更新本地")
                 elif action == "keep_both":
                     conflict_rel, conflict_text = conflict_extra
                     bridge.call_host("host.notes.write", {"path": conflict_rel, "content": conflict_text})
@@ -717,11 +929,11 @@ class SyncPlugin:
                     base_map[rel_path] = new_hash
                     base_map[conflict_rel] = sha256_text(conflict_text)
                     synced_count += 1
-                    self._append_log(rel_path, f"冲突已保留副本 {conflict_rel}")
+                    self._append_log(f"冲突保留 {rel_path}", "冲突副本", tone="warning", tooltip=f"已保留副本 {conflict_rel}")
 
         asset_count = self._sync_local_dir_assets(mirror_dir)
         if asset_count > 0:
-            self._append_log("assets 附件同步", f"同步 {asset_count} 个文件")
+            self._append_log(f"同步 {asset_count} 个附件", "成功", tone="success")
 
         self.sync_meta[meta_key] = base_map
         self.stats["total_synced"] += synced_count
@@ -770,14 +982,14 @@ class SyncPlugin:
             return ""
         return url.rstrip("/") + "/"
 
-    def _webdav_base_url(self, cfg=None):
+    def _webdav_base_url(self, cfg=None, subdir=""):
         root = self._webdav_root_url(cfg)
         if not root:
             return ""
         sub = self._resolve_webdav_dir(cfg).strip().strip("/")
-        if not sub:
-            return root
-        parts = [urllib.parse.quote(p) for p in sub.split("/") if p and p not in (".", "..")]
+        parts = [urllib.parse.quote(p) for p in sub.split("/") if p and p not in (".", "..")] if sub else []
+        if subdir:
+            parts.extend(urllib.parse.quote(p) for p in subdir.strip("/").split("/") if p and p not in (".", ".."))
         if not parts:
             return root
         return root + "/".join(parts) + "/"
@@ -939,10 +1151,11 @@ class SyncPlugin:
             extra_headers={"Content-Type": "application/octet-stream"},
         )
 
-    def _sync_webdav_assets(self, base_url):
-        if not self.config.get("sync_assets", True) or not self.notebook_root:
+    def _sync_webdav_assets(self, base_url, nb_root=None):
+        root_dir = nb_root or self.notebook_root
+        if not self.config.get("sync_assets", True) or not root_dir:
             return 0
-        local_assets = self._read_local_assets()
+        local_assets = self._read_local_assets(nb_root=root_dir)
         assets_url = base_url + "assets/"
         remote_asset_names = self._webdav_list_files(assets_url, lambda p: is_safe_rel_path(p) and not p.endswith("/"))
         remote_assets = {}
@@ -964,11 +1177,11 @@ class SyncPlugin:
                 self._webdav_put_bytes(base_url, rel, local_assets[rel])
                 synced += 1
             elif in_remote and not in_local:
-                if self._write_local_asset(rel, remote_assets[rel]):
+                if self._write_local_asset(rel, remote_assets[rel], nb_root=root_dir):
                     synced += 1
             elif sha256_bytes(local_assets[rel]) != sha256_bytes(remote_assets[rel]):
                 if policy == "remote_first":
-                    if self._write_local_asset(rel, remote_assets[rel]):
+                    if self._write_local_asset(rel, remote_assets[rel], nb_root=root_dir):
                         synced += 1
                 else:
                     self._webdav_put_bytes(base_url, rel, local_assets[rel])
@@ -980,7 +1193,7 @@ class SyncPlugin:
         base_url = self._webdav_base_url()
         if not root_url or not base_url:
             msg = "请先填写有效的 WebDAV http(s) 地址"
-            self._append_log("WebDAV 同步", msg)
+            self._append_log("WebDAV 同步", "失败", tone="danger", tooltip=msg)
             return msg
 
         try:
@@ -1008,7 +1221,7 @@ class SyncPlugin:
 
             guard_msg = self._check_delete_guard(base_map, local_notes, remote_notes, only_path=only_path)
             if guard_msg:
-                self._append_log("删除保护暂停", guard_msg)
+                self._append_log("删除保护暂停", "待确认", tone="warning", tooltip=guard_msg)
                 return guard_msg
 
             synced_count = 0
@@ -1021,13 +1234,13 @@ class SyncPlugin:
                     self._webdav_put_text(base_url, rel_path, text)
                     base_map[rel_path] = sha256_text(text)
                     synced_count += 1
-                    self._append_log(rel_path, "已上传到 WebDAV")
+                    self._append_log(f"推送 {rel_path}", "成功", tone="success", tooltip="已上传到 WebDAV")
                 elif in_remote and not in_local:
                     text = remote_notes[rel_path]
                     bridge.call_host("host.notes.write", {"path": rel_path, "content": text})
                     base_map[rel_path] = sha256_text(text)
                     synced_count += 1
-                    self._append_log(rel_path, "已从 WebDAV 下载")
+                    self._append_log(f"拉取 {rel_path}", "成功", tone="success", tooltip="已从 WebDAV 下载")
                 else:
                     action, chosen_text, conflict_extra, new_hash = self._resolve_conflict_pair(
                         rel_path, local_notes[rel_path], remote_notes[rel_path], base_map.get(rel_path)
@@ -1038,12 +1251,12 @@ class SyncPlugin:
                         self._webdav_put_text(base_url, rel_path, chosen_text)
                         base_map[rel_path] = new_hash
                         synced_count += 1
-                        self._append_log(rel_path, "本地优先上传 WebDAV")
+                        self._append_log(f"本地覆盖 {rel_path}", "成功", tone="success", tooltip="本地优先上传 WebDAV")
                     elif action == "pull":
                         bridge.call_host("host.notes.write", {"path": rel_path, "content": chosen_text})
                         base_map[rel_path] = new_hash
                         synced_count += 1
-                        self._append_log(rel_path, "远端优先更新本地")
+                        self._append_log(f"远端覆盖 {rel_path}", "成功", tone="success", tooltip="远端优先更新本地")
                     elif action == "keep_both":
                         conflict_rel, conflict_text = conflict_extra
                         bridge.call_host("host.notes.write", {"path": conflict_rel, "content": conflict_text})
@@ -1052,11 +1265,11 @@ class SyncPlugin:
                         base_map[rel_path] = new_hash
                         base_map[conflict_rel] = sha256_text(conflict_text)
                         synced_count += 1
-                        self._append_log(rel_path, f"WebDAV 冲突已保留副本 {conflict_rel}")
+                        self._append_log(f"冲突保留 {rel_path}", "冲突副本", tone="warning", tooltip=f"WebDAV 冲突已保留副本 {conflict_rel}")
 
             asset_count = 0 if only_path else self._sync_webdav_assets(base_url)
             if asset_count > 0:
-                self._append_log("assets 附件同步", f"同步 {asset_count} 个文件")
+                self._append_log(f"同步 {asset_count} 个附件", "成功", tone="success")
 
             self.sync_meta[meta_key] = base_map
             self.stats["total_synced"] += synced_count
@@ -1068,7 +1281,7 @@ class SyncPlugin:
             return f"已完成 WebDAV 同步，处理 {synced_count} 篇笔记"
         except Exception as exc:
             msg = f"WebDAV 同步未完成: {sanitize_error_text(exc)}"
-            self._append_log("WebDAV 同步", msg)
+            self._append_log("WebDAV 同步", "失败", tone="danger", tooltip=msg)
             return msg
 
     # ---------- Git Mode ----------
@@ -1120,7 +1333,15 @@ class SyncPlugin:
                 return os.path.normpath(expanded)
             base = self.data_dir or os.getcwd()
             return os.path.normpath(os.path.join(base, expanded))
-        return os.path.join(self.data_dir or os.getcwd(), "git-repos", self._notebook_slug())
+        selected = self._selected_notebooks(c)
+        base_repos = os.path.join(self.data_dir or os.getcwd(), "git-repos")
+        if len(selected) == 1:
+            legacy = os.path.join(base_repos, self._notebook_slug(selected[0]))
+            if os.path.isdir(os.path.join(legacy, ".git")):
+                return legacy
+        if target:
+            return os.path.join(base_repos, f"repo-{sha256_text(target)[:12]}")
+        return os.path.join(base_repos, self._notebook_slug())
 
     def _test_git(self):
         if not shutil.which("git"):
@@ -1199,9 +1420,9 @@ class SyncPlugin:
 
         return True, repo_dir
 
-    def _fetch_webdav_notes(self, cfg, only_path=None, scope="all", timeout=6, force_refresh=False):
+    def _fetch_webdav_notes(self, cfg, only_path=None, scope="all", timeout=6, force_refresh=False, subdir=""):
         root_url = self._webdav_root_url(cfg)
-        base_url = self._webdav_base_url(cfg)
+        base_url = self._webdav_base_url(cfg, subdir=subdir)
         if not root_url or not base_url:
             return False, {}, "请先填写有效的 WebDAV http(s) 地址"
 
@@ -1234,34 +1455,56 @@ class SyncPlugin:
         except Exception as exc:
             return False, {}, f"WebDAV 连接不可达: {sanitize_error_text(exc)}"
 
-    def _compute_sync_plan(self, bridge, cfg, only_path=None, inspect_remote=True, force_refresh=False):
+    def _compute_sync_plan(
+        self,
+        bridge,
+        cfg,
+        only_path=None,
+        inspect_remote=True,
+        force_refresh=False,
+        nb_root=None,
+        subdir="",
+        prepared_repo_dir=None,
+    ):
+        nb_key = self._notebook_key(nb_root)
+        nb_label = self._notebook_label(nb_root)
         protocol = cfg.get("protocol", "local_mirror")
         scope = cfg.get("sync_scope", "all")
         policy = cfg.get("conflict_policy", "keep_both")
-        local_notes = self._read_local_notes(bridge, only_path=only_path, scope=scope)
+        local_notes = self._read_local_notes(bridge, only_path=only_path, scope=scope, nb_root=nb_root)
         target_display = self._target_display(cfg)
 
         remote_notes = {}
         remote_inspected = True
         remote_error = None
         target_dir = ""
+        repo_root = ""
         base_url = ""
 
         if protocol == "local_mirror":
-            target_dir = self._resolve_mirror_dir(cfg)
-            meta_key = self._meta_key("local_mirror", target_dir)
-            legacy_key = f"local_mirror:{target_dir}"
+            base_dir = self._resolve_mirror_dir(cfg)
+            target_dir = os.path.join(base_dir, subdir) if subdir else base_dir
+            meta_target = f"{base_dir}::{subdir}" if subdir else base_dir
+            meta_key = self._meta_key("local_mirror", meta_target, nb_key=nb_key)
+            legacy_key = f"local_mirror:{base_dir}" if not subdir else None
             remote_notes = self._scan_mirror_files(target_dir, only_path=only_path, scope=scope)
         elif protocol == "webdav":
-            base_url = self._webdav_base_url(cfg)
-            meta_key = self._meta_key("webdav", base_url or "unconfigured")
-            legacy_key = f"webdav:{base_url}" if base_url else None
+            root_base_url = self._webdav_base_url(cfg)
+            base_url = self._webdav_base_url(cfg, subdir=subdir)
+            meta_target = f"{root_base_url}::{subdir}" if (root_base_url and subdir) else (root_base_url or "unconfigured")
+            meta_key = self._meta_key("webdav", meta_target, nb_key=nb_key)
+            legacy_key = f"webdav:{root_base_url}" if (root_base_url and not subdir) else None
             if not base_url:
                 remote_inspected = False
                 remote_error = "请先填写有效的 WebDAV http(s) 地址"
             elif inspect_remote or force_refresh:
                 ok, fetched, err = self._fetch_webdav_notes(
-                    cfg, only_path=only_path, scope=scope, timeout=6 if inspect_remote else 4, force_refresh=force_refresh
+                    cfg,
+                    only_path=only_path,
+                    scope=scope,
+                    timeout=6 if inspect_remote else 4,
+                    force_refresh=force_refresh,
+                    subdir=subdir,
                 )
                 if ok:
                     remote_notes = fetched
@@ -1277,19 +1520,25 @@ class SyncPlugin:
                     remote_inspected = False
         else:
             branch = self._git_branch(cfg)
-            repo_dir = self._resolve_local_git_dir(cfg)
-            target_dir = repo_dir
-            meta_key = self._meta_key("git", f"{repo_dir}:{branch}")
-            legacy_key = f"git:{repo_dir}:{branch}"
-            if inspect_remote:
+            repo_dir = prepared_repo_dir or self._resolve_local_git_dir(cfg)
+            repo_root = repo_dir
+            target_dir = os.path.join(repo_dir, subdir) if subdir else repo_dir
+            meta_target = f"{repo_dir}:{branch}::{subdir}" if subdir else f"{repo_dir}:{branch}"
+            meta_key = self._meta_key("git", meta_target, nb_key=nb_key)
+            legacy_key = f"git:{repo_dir}:{branch}" if not subdir else None
+            if prepared_repo_dir:
+                remote_notes = self._scan_mirror_files(target_dir, only_path=only_path, scope=scope)
+            elif inspect_remote:
                 ok, res = self._prepare_git_repo(cfg, allow_init_or_clone=True, allow_pull=True)
                 if ok:
-                    remote_notes = self._scan_mirror_files(res, only_path=only_path, scope=scope)
+                    repo_root = res
+                    target_dir = os.path.join(res, subdir) if subdir else res
+                    remote_notes = self._scan_mirror_files(target_dir, only_path=only_path, scope=scope)
                 else:
                     remote_inspected = False
                     remote_error = res
             elif os.path.isdir(os.path.join(repo_dir, ".git")):
-                remote_notes = self._scan_mirror_files(repo_dir, only_path=only_path, scope=scope)
+                remote_notes = self._scan_mirror_files(target_dir, only_path=only_path, scope=scope)
             else:
                 remote_inspected = False
 
@@ -1347,7 +1596,8 @@ class SyncPlugin:
             if p in local_notes or p in remote_notes
         }
         fp_payload = json.dumps({
-            "nb": self._notebook_key(),
+            "nb": nb_key,
+            "subdir": subdir,
             "protocol": protocol,
             "target": target_display,
             "scope": scope,
@@ -1366,9 +1616,14 @@ class SyncPlugin:
 
         return {
             "cfg": dict(cfg),
+            "nb_root": nb_root or self.notebook_root,
+            "nb_key": nb_key,
+            "nb_label": nb_label,
+            "subdir": subdir,
             "protocol": protocol,
             "target_display": target_display,
             "target_dir": target_dir,
+            "repo_root": repo_root,
             "base_url": base_url,
             "meta_key": meta_key,
             "base_map": base_map,
@@ -1423,9 +1678,78 @@ class SyncPlugin:
             reasons.append(f"将向本地批量写入 {n_pull_new + n_pull_ow} 篇笔记（超 {DELETE_GUARD_THRESHOLD} 篇）")
         return reasons
 
-    def _execute_sync_plan(self, bridge, plan, only_path=None):
+    def _commit_and_push_git(self, repo_root, cfg):
+        branch = self._git_branch(cfg)
+        status_proc = self._run_git(["status", "--porcelain"], cwd=repo_root, cfg=cfg)
+        if status_proc.returncode != 0:
+            err = sanitize_error_text(status_proc.stderr or status_proc.stdout or "git status 失败")
+            raise RuntimeError(f"Git 状态检查失败: {err}")
+
+        if status_proc.stdout.strip():
+            add_proc = self._run_git(["add", "-A"], cwd=repo_root, cfg=cfg)
+            if add_proc.returncode != 0:
+                err = sanitize_error_text(add_proc.stderr or add_proc.stdout or "git add 失败")
+                raise RuntimeError(f"Git 暂存失败: {err}")
+
+            commit_proc = self._run_git(
+                [
+                    "-c", "user.name=Block Sync",
+                    "-c", "user.email=sync@blockmd.local",
+                    "commit", "-m", "sync: update markdown notes",
+                ],
+                cwd=repo_root,
+                cfg=cfg,
+            )
+            if commit_proc.returncode != 0:
+                self._run_git(["reset"], cwd=repo_root, cfg=cfg)
+                err = sanitize_error_text(commit_proc.stderr or commit_proc.stdout or "git commit 失败")
+                raise RuntimeError(f"Git 提交失败: {err}")
+
+        remote_proc = self._run_git(["remote"], cwd=repo_root, cfg=cfg)
+        if remote_proc.returncode != 0:
+            err = sanitize_error_text(remote_proc.stderr or remote_proc.stdout or "git remote 失败")
+            raise RuntimeError(f"Git 远端检查失败: {err}")
+
+        remotes = [r.strip() for r in remote_proc.stdout.splitlines() if r.strip()]
+        if remotes:
+            remote_name = "origin" if "origin" in remotes else remotes[0]
+            head_proc = self._run_git(["rev-parse", "--verify", "HEAD"], cwd=repo_root, cfg=cfg)
+            if head_proc.returncode == 0:
+                needs_push = False
+                ref_proc = self._run_git(
+                    ["rev-parse", "--verify", f"refs/remotes/{remote_name}/{branch}"],
+                    cwd=repo_root,
+                    cfg=cfg,
+                )
+                if ref_proc.returncode != 0:
+                    needs_push = True
+                else:
+                    ahead_proc = self._run_git(
+                        ["rev-list", "--count", f"refs/remotes/{remote_name}/{branch}..HEAD"],
+                        cwd=repo_root,
+                        cfg=cfg,
+                    )
+                    if ahead_proc.returncode != 0 or int((ahead_proc.stdout or "0").strip() or "0") > 0:
+                        needs_push = True
+
+                if needs_push:
+                    push_proc = self._run_git(
+                        ["push", "-u", remote_name, f"HEAD:{branch}"],
+                        cwd=repo_root,
+                        timeout=12,
+                        cfg=cfg,
+                    )
+                    if push_proc.returncode != 0:
+                        err = sanitize_error_text(push_proc.stderr or push_proc.stdout or "push 失败")
+                        raise RuntimeError(f"已提交到本地 Git，但远端推送未完成: {err}")
+                    return True
+        return False
+
+    def _apply_notebook_plan(self, bridge, plan, only_path=None):
         protocol = plan["protocol"]
         cfg = plan["cfg"]
+        nb_root = plan.get("nb_root") or self.notebook_root
+        subdir = plan.get("subdir") or ""
         base_map = dict(plan["base_map"])
         local_notes = plan["local_notes"]
         remote_notes = plan["remote_notes"]
@@ -1438,15 +1762,18 @@ class SyncPlugin:
         elif protocol == "webdav":
             root_url = self._webdav_root_url(cfg)
             sub_dir = self._resolve_webdav_dir(cfg).strip().strip("/")
-            if sub_dir:
-                self._webdav_ensure_dir(root_url, sub_dir)
+            full_sub = "/".join(p for p in (sub_dir, subdir.strip("/")) if p)
+            if full_sub:
+                self._webdav_ensure_dir(root_url, full_sub)
             write_remote = lambda rel, text: self._webdav_put_text(base_url, rel, text)
         else:
+            os.makedirs(target_dir, exist_ok=True)
             write_remote = lambda rel, text: self._write_mirror_file(target_dir, rel, text)
 
         pushed = 0
         pulled = 0
         conflict_count = 0
+        prefix = f"{plan.get('nb_label')}/" if subdir else ""
 
         for rel_path in plan["synced"]:
             base_map[rel_path] = sha256_text(local_notes[rel_path])
@@ -1456,214 +1783,277 @@ class SyncPlugin:
             write_remote(rel_path, text)
             base_map[rel_path] = sha256_text(text)
             pushed += 1
-            self._append_log(rel_path, f"已推送到{self._protocol_label(protocol)}")
+            self._append_log(f"推送 {prefix}{rel_path}", "成功", tone="success", tooltip=f"已推送到{self._protocol_label(protocol)}")
 
         for rel_path in plan["to_push_overwrite"]:
             text = local_notes[rel_path]
             write_remote(rel_path, text)
             base_map[rel_path] = sha256_text(text)
             pushed += 1
-            self._append_log(rel_path, f"本地优先覆盖{self._protocol_label(protocol)}")
+            self._append_log(f"本地覆盖 {prefix}{rel_path}", "成功", tone="success", tooltip=f"本地优先覆盖{self._protocol_label(protocol)}")
 
         for rel_path in plan["to_pull_new"]:
             text = remote_notes[rel_path]
-            bridge.call_host("host.notes.write", {"path": rel_path, "content": text})
+            self._write_local_note(bridge, rel_path, text, nb_root=nb_root)
             base_map[rel_path] = sha256_text(text)
             pulled += 1
-            self._append_log(rel_path, f"已从{self._protocol_label(protocol)}拉取")
+            self._append_log(f"拉取 {prefix}{rel_path}", "成功", tone="success", tooltip=f"已从{self._protocol_label(protocol)}拉取")
 
         for rel_path in plan["to_pull_overwrite"]:
             text = remote_notes[rel_path]
-            bridge.call_host("host.notes.write", {"path": rel_path, "content": text})
+            self._write_local_note(bridge, rel_path, text, nb_root=nb_root)
             base_map[rel_path] = sha256_text(text)
             pulled += 1
-            self._append_log(rel_path, f"{self._protocol_label(protocol)}优先更新本地")
+            self._append_log(f"远端覆盖 {prefix}{rel_path}", "成功", tone="success", tooltip=f"{self._protocol_label(protocol)}优先更新本地")
 
         for rel_path, conflict_rel, remote_text in plan["conflicts"]:
             local_text = local_notes[rel_path]
-            bridge.call_host("host.notes.write", {"path": conflict_rel, "content": remote_text})
+            self._write_local_note(bridge, conflict_rel, remote_text, nb_root=nb_root)
             write_remote(conflict_rel, remote_text)
             write_remote(rel_path, local_text)
             base_map[rel_path] = sha256_text(local_text)
             base_map[conflict_rel] = sha256_text(remote_text)
             conflict_count += 1
-            self._append_log(rel_path, f"冲突已保留副本 {conflict_rel}")
+            self._append_log(f"冲突保留 {prefix}{rel_path}", "冲突副本", tone="warning", tooltip=f"已保留副本 {conflict_rel}")
 
         asset_count = 0
         if only_path is None:
             if protocol == "webdav":
-                asset_count = self._sync_webdav_assets(base_url)
+                asset_count = self._sync_webdav_assets(base_url, nb_root=nb_root)
             else:
-                asset_count = self._sync_local_dir_assets(target_dir)
+                asset_count = self._sync_local_dir_assets(target_dir, nb_root=nb_root)
             if asset_count > 0:
-                self._append_log("assets 附件同步", f"同步 {asset_count} 个文件")
+                self._append_log(f"{prefix}同步 {asset_count} 个附件", "成功", tone="success")
+
+        self.sync_meta[plan["meta_key"]] = base_map
+        return pushed, pulled, conflict_count, asset_count
+
+    def _compute_batch_plan(self, bridge, cfg, notebooks, only_path=None, inspect_remote=True, force_refresh=False):
+        protocol = cfg.get("protocol", "local_mirror")
+        target_display = self._target_display(cfg)
+        if protocol == "local_mirror":
+            target_base = self._resolve_mirror_dir(cfg)
+        elif protocol == "webdav":
+            target_base = self._webdav_base_url(cfg) or "unconfigured"
+        else:
+            target_base = f"{self._resolve_local_git_dir(cfg)}:{self._git_branch(cfg)}"
+
+        all_selected = self._selected_notebooks(cfg)
+        subdir_map = self._notebook_subdir_map(all_selected or notebooks, protocol, target_base)
+
+        prepared_repo_dir = None
+        if protocol == "git" and inspect_remote:
+            ok, res = self._prepare_git_repo(cfg, allow_init_or_clone=True, allow_pull=True)
+            if not ok:
+                return {
+                    "cfg": dict(cfg),
+                    "protocol": protocol,
+                    "target_display": target_display,
+                    "repo_root": "",
+                    "plans": [],
+                    "remote_error": res,
+                    "fingerprint": "",
+                }
+            prepared_repo_dir = res
+
+        plans = []
+        for nb in notebooks:
+            sub = subdir_map.get(nb, "")
+            plan = self._compute_sync_plan(
+                bridge,
+                cfg,
+                only_path=only_path,
+                inspect_remote=inspect_remote,
+                force_refresh=force_refresh,
+                nb_root=nb,
+                subdir=sub,
+                prepared_repo_dir=prepared_repo_dir,
+            )
+            if plan.get("remote_error"):
+                return {
+                    "cfg": dict(cfg),
+                    "protocol": protocol,
+                    "target_display": target_display,
+                    "repo_root": prepared_repo_dir or "",
+                    "plans": plans,
+                    "remote_error": plan["remote_error"],
+                    "fingerprint": "",
+                }
+            plans.append(plan)
+
+        fp = sha256_text(json.dumps([p["fingerprint"] for p in plans], ensure_ascii=False))
+        return {
+            "cfg": dict(cfg),
+            "protocol": protocol,
+            "target_display": target_display,
+            "repo_root": prepared_repo_dir or (plans[0]["repo_root"] if plans else ""),
+            "plans": plans,
+            "remote_error": None,
+            "fingerprint": fp,
+        }
+
+    def _execute_batch_plan(self, bridge, batch, only_path=None):
+        protocol = batch["protocol"]
+        cfg = batch["cfg"]
+        total_pushed = 0
+        total_pulled = 0
+        total_conflicts = 0
+        total_assets = 0
+
+        for plan in batch["plans"]:
+            pushed, pulled, conflicts, assets = self._apply_notebook_plan(bridge, plan, only_path=only_path)
+            total_pushed += pushed
+            total_pulled += pulled
+            total_conflicts += conflicts
+            total_assets += assets
 
         did_push = False
-        if protocol == "git":
-            branch = self._git_branch(cfg)
-            status_proc = self._run_git(["status", "--porcelain"], cwd=target_dir, cfg=cfg)
-            if status_proc.returncode != 0:
-                err = sanitize_error_text(status_proc.stderr or status_proc.stdout or "git status 失败")
-                raise RuntimeError(f"Git 状态检查失败: {err}")
-
-            if status_proc.stdout.strip():
-                add_proc = self._run_git(["add", "-A"], cwd=target_dir, cfg=cfg)
-                if add_proc.returncode != 0:
-                    err = sanitize_error_text(add_proc.stderr or add_proc.stdout or "git add 失败")
-                    raise RuntimeError(f"Git 暂存失败: {err}")
-
-                commit_proc = self._run_git(
-                    [
-                        "-c", "user.name=Block Sync",
-                        "-c", "user.email=sync@blockmd.local",
-                        "commit", "-m", "sync: update markdown notes",
-                    ],
-                    cwd=target_dir,
-                    cfg=cfg,
-                )
-                if commit_proc.returncode != 0:
-                    self._run_git(["reset"], cwd=target_dir, cfg=cfg)
-                    err = sanitize_error_text(commit_proc.stderr or commit_proc.stdout or "git commit 失败")
-                    raise RuntimeError(f"Git 提交失败: {err}")
-
-            remote_proc = self._run_git(["remote"], cwd=target_dir, cfg=cfg)
-            if remote_proc.returncode != 0:
-                err = sanitize_error_text(remote_proc.stderr or remote_proc.stdout or "git remote 失败")
-                raise RuntimeError(f"Git 远端检查失败: {err}")
-
-            remotes = [r.strip() for r in remote_proc.stdout.splitlines() if r.strip()]
-            if remotes:
-                remote_name = "origin" if "origin" in remotes else remotes[0]
-                head_proc = self._run_git(["rev-parse", "--verify", "HEAD"], cwd=target_dir, cfg=cfg)
-                if head_proc.returncode == 0:
-                    needs_push = False
-                    ref_proc = self._run_git(
-                        ["rev-parse", "--verify", f"refs/remotes/{remote_name}/{branch}"],
-                        cwd=target_dir,
-                        cfg=cfg,
-                    )
-                    if ref_proc.returncode != 0:
-                        needs_push = True
-                    else:
-                        ahead_proc = self._run_git(
-                            ["rev-list", "--count", f"refs/remotes/{remote_name}/{branch}..HEAD"],
-                            cwd=target_dir,
-                            cfg=cfg,
-                        )
-                        if ahead_proc.returncode != 0 or int((ahead_proc.stdout or "0").strip() or "0") > 0:
-                            needs_push = True
-
-                    if needs_push:
-                        push_proc = self._run_git(
-                            ["push", "-u", remote_name, f"HEAD:{branch}"],
-                            cwd=target_dir,
-                            timeout=10,
-                            cfg=cfg,
-                        )
-                        if push_proc.returncode != 0:
-                            self.sync_meta[plan["meta_key"]] = base_map
-                            self.stats["total_synced"] += pushed + pulled + conflict_count
-                            err = sanitize_error_text(push_proc.stderr or push_proc.stdout or "push 失败")
-                            raise RuntimeError(f"已提交到本地 Git，但远端推送未完成: {err}")
-                        did_push = True
+        if protocol == "git" and batch.get("repo_root"):
+            did_push = self._commit_and_push_git(batch["repo_root"], cfg)
 
         self._remote_preview_cache.clear()
-        self.sync_meta[plan["meta_key"]] = base_map
-        total_notes = pushed + pulled + conflict_count
+        total_notes = total_pushed + total_pulled + total_conflicts
         self.stats["total_synced"] += total_notes
         self.stats["last_sync"] = now_hms()
 
-        if total_notes == 0 and asset_count == 0:
+        nb_count = len(batch["plans"])
+        nb_prefix = f"{nb_count} 个笔记本 · " if nb_count > 1 else ""
+
+        if total_notes == 0 and total_assets == 0:
             if did_push:
                 summary = "已将本地 Git 待推送提交同步到远端"
-                self._record_result("成功", summary, protocol=protocol, target=plan["target_display"])
+                self._append_log(f"推送 {self._protocol_label(protocol)} 提交", "成功", tone="success", tooltip=summary)
+                self._record_result("成功", summary, protocol=protocol, target=batch["target_display"])
                 return summary
-            summary = f"{self._protocol_label(protocol)}已是最新状态"
-            self._record_result("无变更", summary, protocol=protocol, target=plan["target_display"])
+            summary = f"{nb_prefix}{self._protocol_label(protocol)}已是最新状态"
+            if only_path is None:
+                self._append_log(f"{self._protocol_label(protocol)}同步", "无变更", tone="info", tooltip=summary)
+            self._record_result("无变更", summary, protocol=protocol, target=batch["target_display"])
             return summary
 
-        summary = f"推送 {pushed} 篇 · 拉取 {pulled} 篇 · 冲突 {conflict_count} 篇"
-        if asset_count > 0:
-            summary += f" · 附件 {asset_count} 个"
-        self._record_result("成功", summary, protocol=protocol, target=plan["target_display"], pushed=pushed, pulled=pulled, conflicts=conflict_count, assets=asset_count)
+        summary = f"{nb_prefix}推送 {total_pushed} 篇 · 拉取 {total_pulled} 篇 · 冲突 {total_conflicts} 篇"
+        if total_assets > 0:
+            summary += f" · 附件 {total_assets} 个"
+        self._record_result(
+            "成功",
+            summary,
+            protocol=protocol,
+            target=batch["target_display"],
+            pushed=total_pushed,
+            pulled=total_pulled,
+            conflicts=total_conflicts,
+            assets=total_assets,
+        )
         return f"已完成{self._protocol_label(protocol)}同步：{summary}"
 
     # ---------- Dispatch & UI ----------
 
-    def _build_pending_confirm(self, plan, reasons):
-        sample_lines = (
-            [f"[覆盖本地] {p}" for p in plan["to_pull_overwrite"]]
-            + [f"[覆盖远端] {p}" for p in plan["to_push_overwrite"]]
-            + [f"[冲突副本] {p} -> {cr}" for p, cr, _ in plan["conflicts"]]
-            + [f"[拉取] {p}" for p in plan["to_pull_new"]]
-            + [f"[推送] {p}" for p in plan["to_push_new"]]
-            + [f"[远端缺失] {p}" for p in plan["remote_missing"]]
-            + [f"[本地缺失] {p}" for p in plan["local_missing"]]
-        )
+    def _build_pending_confirm(self, batch, reasons):
+        sample_lines = []
+        multi = len(batch["plans"]) > 1
+        for plan in batch["plans"]:
+            prefix = f"{plan['nb_label']}/" if multi else ""
+            sample_lines.extend(
+                [f"[覆盖本地] {prefix}{p}" for p in plan["to_pull_overwrite"]]
+                + [f"[覆盖远端] {prefix}{p}" for p in plan["to_push_overwrite"]]
+                + [f"[冲突副本] {prefix}{p} -> {cr}" for p, cr, _ in plan["conflicts"]]
+                + [f"[拉取] {prefix}{p}" for p in plan["to_pull_new"]]
+                + [f"[推送] {prefix}{p}" for p in plan["to_push_new"]]
+                + [f"[远端缺失] {prefix}{p}" for p in plan["remote_missing"]]
+                + [f"[本地缺失] {prefix}{p}" for p in plan["local_missing"]]
+            )
         return {
-            "nb_key": self._notebook_key(),
-            "fingerprint": plan["fingerprint"],
-            "protocol": plan["protocol"],
-            "target_display": plan["target_display"],
+            "scope_key": self._result_key(),
+            "fingerprint": batch["fingerprint"],
+            "protocol": batch["protocol"],
+            "target_display": batch["target_display"],
             "reasons": list(reasons),
             "badge": f"需确认 · {len(reasons)} 项风险",
             "sample_lines": sample_lines,
         }
 
-    def _run_sync(self, bridge, only_path=None, confirmed=False, approved_plan=None):
+    def _assess_batch_dangerous_changes(self, batch, cfg, saved_path=None):
+        reasons = []
+        multi = len(batch["plans"]) > 1
+        for plan in batch["plans"]:
+            nb_reasons = self._assess_dangerous_changes(plan, cfg, saved_path=saved_path)
+            for r in nb_reasons:
+                reasons.append(f"{plan['nb_label']}: {r}" if multi else r)
+        return reasons
+
+    def _run_sync(self, bridge, only_path=None, only_nb_root=None, confirmed=False, approved_batch=None):
+        self._refresh_known_notebooks(bridge)
         protocol = self.config.get("protocol", "local_mirror")
         target_error = self._target_error(self.config)
         if target_error:
             self.last_status = target_error
             return target_error
-        if approved_plan is not None:
-            plan = approved_plan
-            protocol = plan.get("protocol", protocol)
+
+        if approved_batch is not None:
+            batch = approved_batch
+            protocol = batch.get("protocol", protocol)
         else:
+            notebooks = self._selected_notebooks(self.config)
+            if only_nb_root:
+                norm_only = self._norm_nb_path(only_nb_root)
+                if norm_only not in notebooks:
+                    return ""
+                notebooks = [norm_only]
+            if not notebooks:
+                msg = "请至少选择一个笔记本"
+                self.last_status = msg
+                return msg
             try:
-                plan = self._compute_sync_plan(bridge, self.config, only_path=only_path, inspect_remote=True, force_refresh=True)
+                batch = self._compute_batch_plan(
+                    bridge,
+                    self.config,
+                    notebooks,
+                    only_path=only_path,
+                    inspect_remote=True,
+                    force_refresh=True,
+                )
             except Exception as exc:
                 msg = f"{self._protocol_label(protocol)}同步未完成: {sanitize_error_text(exc)}"
-                self._append_log(f"{self._protocol_label(protocol)}同步", msg)
+                self._append_log(f"{self._protocol_label(protocol)}同步", "失败", tone="danger", tooltip=msg)
                 self._record_result("失败", msg, protocol=protocol)
                 self._save_runtime(bridge)
                 self.last_status = msg
                 raise RuntimeError(msg) from exc
 
-        if plan.get("remote_error"):
-            msg = plan["remote_error"]
-            self._append_log(f"{self._protocol_label(protocol)}同步", msg)
-            self._record_result("失败", msg, protocol=protocol, target=plan["target_display"])
+        if batch.get("remote_error"):
+            msg = batch["remote_error"]
+            self._append_log(f"{self._protocol_label(protocol)}同步", "失败", tone="danger", tooltip=msg)
+            self._record_result("失败", msg, protocol=protocol, target=batch["target_display"])
             self._save_runtime(bridge)
             self.last_status = msg
             raise RuntimeError(msg)
 
         if not confirmed:
-            reasons = self._assess_dangerous_changes(plan, self.config, saved_path=only_path)
+            reasons = self._assess_batch_dangerous_changes(batch, self.config, saved_path=only_path)
             if reasons:
                 if only_path is not None:
                     msg = f"自动同步暂停（{reasons[0]}），请点击立即同步确认"
-                    self._append_log(only_path, msg)
-                    self._record_result("待确认", msg, protocol=protocol, target=plan["target_display"])
+                    self._append_log(f"自动同步暂停 ({only_path})", "待确认", tone="warning", tooltip=msg)
+                    self._record_result("待确认", msg, protocol=protocol, target=batch["target_display"])
                     self._save_runtime(bridge)
                     self.last_status = msg
                     return msg
-                self.pending_confirm = self._build_pending_confirm(plan, reasons)
+                self.pending_confirm = self._build_pending_confirm(batch, reasons)
                 msg = "检测到危险变更，请先确认后执行"
-                self._append_log("等待危险变更确认", reasons[0])
-                self._record_result("待确认", reasons[0], protocol=protocol, target=plan["target_display"])
+                self._append_log(reasons[0], "待确认", tone="warning", tooltip=msg)
+                self._record_result("待确认", reasons[0], protocol=protocol, target=batch["target_display"])
                 self._save_runtime(bridge)
                 self.last_status = msg
                 return msg
 
         try:
-            msg = self._execute_sync_plan(bridge, plan, only_path=only_path)
+            msg = self._execute_batch_plan(bridge, batch, only_path=only_path)
         except Exception as exc:
             msg = sanitize_error_text(exc)
             if not msg.startswith(self._protocol_label(protocol)) and "Git" not in msg:
                 msg = f"{self._protocol_label(protocol)}同步未完成: {msg}"
-            self._append_log(f"{self._protocol_label(protocol)}同步", msg)
-            self._record_result("失败", msg, protocol=protocol, target=plan["target_display"])
+            self._append_log(f"{self._protocol_label(protocol)}同步", "失败", tone="danger", tooltip=msg)
+            self._record_result("失败", msg, protocol=protocol, target=batch["target_display"])
             self._save_runtime(bridge)
             self.last_status = msg
             raise RuntimeError(msg) from exc
@@ -1674,7 +2064,7 @@ class SyncPlugin:
 
     def _run_test_conn(self, cfg=None):
         c = cfg or self.config
-        err = self._target_error(c)
+        err = self._target_error(c, require_notebooks=False)
         if err:
             self.last_status = err
             return err
@@ -1690,7 +2080,12 @@ class SyncPlugin:
                 ok, msg = self._test_local_mirror()
         finally:
             self.config = prev_cfg
-        self._append_log(f"测试连接 ({self._protocol_label(protocol)})", "通过" if ok else "未连通")
+        self._append_log(
+            f"测试连接 ({self._protocol_label(protocol)})",
+            "通过" if ok else "未连通",
+            tone="success" if ok else "danger",
+            tooltip=msg,
+        )
         self.last_status = msg
         return msg
 
@@ -1725,15 +2120,23 @@ class SyncPlugin:
             ],
         }
 
-    def build_page(self, cfg=None):
-        c = cfg or self.config
+    def _conflict_policy_item(self, c):
+        return {
+            "kind": "segmented",
+            "id": "conflict_policy",
+            "label": "双端冲突处理",
+            "value": c["conflict_policy"],
+            "options": [
+                {"value": "keep_both", "label": "生成冲突副本"},
+                {"value": "local_first", "label": "优先本地"},
+                {"value": "remote_first", "label": "优先远端"},
+            ],
+        }
+
+    def _build_legacy_page(self, c):
         protocol = c["protocol"]
-        notebook = {"label": "当前笔记本", "value": self._notebook_label()}
-        if self.kv_tooltip and self.notebook_root:
-            notebook["tooltip"] = self._notebook_key()
 
         target_items = [
-            {"kind": "kv", "rows": [notebook]},
             {
                 "kind": "segmented",
                 "id": "protocol",
@@ -1803,6 +2206,7 @@ class SyncPlugin:
                 "visible_when": {"control_id": "git_auth", "equals": "token"},
             })
         target_items.extend([
+            self._conflict_policy_item(c),
             {
                 "kind": "switch",
                 "id": "auto_sync",
@@ -1818,16 +2222,211 @@ class SyncPlugin:
                 ],
             },
         ])
+        return [{"id": "target-card", "title": "同步设置", "items": target_items}]
 
-        cards = [{"id": "target-card", "title": "同步设置", "items": target_items}]
-        if self.pending_confirm and self.pending_confirm["nb_key"] == self._notebook_key() and c == self.config:
+    def build_page(self, cfg=None):
+        c = cfg or self.config
+        protocol = c["protocol"]
+
+        if self.supports_checklist and self.supports_form_layout:
+            selected = self._selected_notebooks(c)
+            nb_options = []
+            for entry in self.known_notebooks:
+                path = entry["path"]
+                opt = {
+                    "value": path,
+                    "label": entry["name"],
+                    "detail": self._display_path(path),
+                    "tooltip": path,
+                }
+                if entry.get("active"):
+                    opt["badge"] = "当前"
+                nb_options.append(opt)
+
+            nb_meta = f"已选 {len(selected)} / {len(nb_options)}" if nb_options else ""
+            notebooks_card = {
+                "id": "notebooks-card",
+                "title": "同步笔记本",
+                "meta": nb_meta,
+                "items": [
+                    {
+                        "kind": "checklist",
+                        "id": "selected_notebooks",
+                        "value": selected,
+                        "options": nb_options,
+                        "empty_text": "暂无已打开的笔记本",
+                    }
+                ],
+            }
+
+            target_items = [
+                {
+                    "kind": "segmented",
+                    "id": "protocol",
+                    "layout": "full",
+                    "value": protocol,
+                    "options": [
+                        {"value": "local_mirror", "label": "目录镜像"},
+                        {"value": "webdav", "label": "WebDAV"},
+                        {"value": "git", "label": "Git 仓库"},
+                    ],
+                },
+                {
+                    "kind": "folder",
+                    "id": "mirror_dir",
+                    "label": "目标文件夹",
+                    "layout": "stacked",
+                    "value": self._resolve_mirror_dir(c),
+                    "visible_when": {"control_id": "protocol", "equals": "local_mirror"},
+                },
+                {
+                    "kind": "input",
+                    "id": "webdav_url",
+                    "label": "服务器地址",
+                    "layout": "stacked",
+                    "value": c["webdav_url"],
+                    "placeholder": "https://dav.example.com",
+                    "visible_when": {"control_id": "protocol", "equals": "webdav"},
+                },
+                {
+                    "kind": "input",
+                    "id": "webdav_dir",
+                    "label": "远端目录",
+                    "layout": "stacked",
+                    "value": c["webdav_dir"],
+                    "placeholder": "/BlockNotes",
+                    "visible_when": {"control_id": "protocol", "equals": "webdav"},
+                },
+                {
+                    "kind": "group",
+                    "visible_when": {"control_id": "protocol", "equals": "webdav"},
+                    "fields": [
+                        {
+                            "kind": "input",
+                            "id": "webdav_user",
+                            "label": "用户名",
+                            "layout": "stacked",
+                            "value": c["webdav_user"],
+                            "placeholder": "账号",
+                        },
+                        {
+                            "kind": "secret",
+                            "id": "webdav_pass",
+                            "label": "密码",
+                            "layout": "stacked",
+                            "value": c["webdav_pass"],
+                            "placeholder": "应用密码或口令",
+                        },
+                    ],
+                },
+                {
+                    "kind": "input",
+                    "id": "git_remote",
+                    "label": "仓库地址",
+                    "layout": "stacked",
+                    "value": c["git_remote"],
+                    "placeholder": "git@github.com:user/notes.git",
+                    "visible_when": {"control_id": "protocol", "equals": "git"},
+                },
+                {
+                    "kind": "input",
+                    "id": "git_branch",
+                    "label": "分支",
+                    "layout": "stacked",
+                    "value": c["git_branch"],
+                    "placeholder": "main",
+                    "visible_when": {"control_id": "protocol", "equals": "git"},
+                },
+                {
+                    "kind": "group",
+                    "visible_when": {"control_id": "protocol", "equals": "git"},
+                    "fields": [
+                        {
+                            "kind": "segmented",
+                            "id": "git_auth",
+                            "label": "认证方式",
+                            "layout": "stacked",
+                            "value": c["git_auth"],
+                            "options": [
+                                {"value": "ssh", "label": "SSH"},
+                                {"value": "token", "label": "HTTPS 令牌"},
+                            ],
+                        },
+                        {
+                            "kind": "secret",
+                            "id": "git_token",
+                            "label": "访问令牌",
+                            "layout": "stacked",
+                            "value": c["git_token"],
+                            "placeholder": "ghp_...",
+                            "visible_when": {"control_id": "git_auth", "equals": "token"},
+                        },
+                    ],
+                },
+                {
+                    "kind": "actions",
+                    "visible_when": {"control_id": "protocol", "in": ["webdav", "git"]},
+                    "buttons": [
+                        {"id": "test_conn", "label": "测试连接", "variant": "secondary"},
+                        {"id": "save_config", "label": "保存", "variant": "primary"},
+                    ],
+                },
+            ]
+
+            target_card = {
+                "id": "target-card",
+                "title": "同步目标",
+                "items": target_items,
+            }
+            options_card = {
+                "id": "options-card",
+                "title": "同步选项",
+                "items": [
+                    self._conflict_policy_item(c),
+                    {
+                        "kind": "switch",
+                        "id": "auto_sync",
+                        "label": "保存笔记后自动同步",
+                        "value": c["auto_sync"],
+                    },
+                ],
+            }
+            cards = [notebooks_card, target_card, options_card]
+        else:
+            cards = self._build_legacy_page(c)
+
+        if self.pending_confirm and self.pending_confirm.get("scope_key") == self._result_key() and c == self.config:
             cards.append(self._confirmation_card())
 
         configured = not self._target_error(c)
         last_result = self._get_last_result() or {}
+        last_ok = last_result.get("last_success")
+        history_meta = (
+            f"上次成功 {last_ok['time']}"
+            if isinstance(last_ok, dict) and last_ok.get("time")
+            else ""
+        )
+        history_entries = [
+            self._normalize_log(entry)
+            for entry in self.logs[:6]
+            if isinstance(entry, dict)
+        ]
+        cards.append({
+            "id": "history-card",
+            "title": "最近同步记录",
+            "meta": history_meta,
+            "items": [
+                {
+                    "kind": "log_list",
+                    "id": "sync_logs",
+                    "empty_text": "暂无同步记录",
+                    "entries": history_entries,
+                }
+            ],
+        })
+
         status = self.last_status
         if not status and configured and c == self.config:
-            last_ok = last_result.get("last_success")
             if isinstance(last_ok, dict) and last_ok.get("time"):
                 status = f"上次同步 {last_ok['time']}"
             elif last_result.get("summary"):
@@ -1849,19 +2448,39 @@ class SyncPlugin:
             self.downloads_dir = dl or os.path.expanduser("~/Downloads")
             self.notebook_root = str(params.get("notebook_root") or "")
             self.locale = str(params.get("locale") or "zh")
-            self.kv_tooltip = "kv_tooltip" in (params.get("ui_capabilities") or [])
+            caps = set(params.get("ui_capabilities") or [])
+            self.kv_tooltip = "kv_tooltip" in caps
+            self.supports_checklist = "checklist" in caps
+            self.supports_form_layout = "form_layout" in caps
+            self.supports_multi_notebook = "multi_notebook" in caps
+            raw_nbs = params.get("notebooks")
+            if isinstance(raw_nbs, list):
+                self.known_notebooks = [str(p) for p in raw_nbs if str(p or "").strip()]
             self._load_state(bridge)
             return {"ready": True}
 
         if method == "plugin.render":
+            self._refresh_known_notebooks(bridge)
             values = params.get("values")
             if isinstance(values, dict) and values:
                 cfg = self._normalize_config(values, base=self.config)
                 changed_immediate = False
+                if "selected_notebooks" in values and cfg["selected_notebooks"] != self.config["selected_notebooks"]:
+                    self.config["selected_notebooks"] = list(cfg["selected_notebooks"])
+                    self.pending_confirm = None
+                    self._remote_preview_cache.clear()
+                    self.last_status = ""
+                    changed_immediate = True
                 if cfg["auto_sync"] != self.config["auto_sync"]:
                     self.config["auto_sync"] = cfg["auto_sync"]
                     changed_immediate = True
-                if cfg["protocol"] == "local_mirror" and not self._target_error(cfg):
+                if cfg["conflict_policy"] != self.config["conflict_policy"]:
+                    self.config["conflict_policy"] = cfg["conflict_policy"]
+                    self.pending_confirm = None
+                    self._remote_preview_cache.clear()
+                    self.last_status = ""
+                    changed_immediate = True
+                if cfg["protocol"] == "local_mirror" and not self._target_error(cfg, require_notebooks=False):
                     if self.config["protocol"] != "local_mirror" or self.config["mirror_dir"] != cfg["mirror_dir"]:
                         self.config["protocol"] = "local_mirror"
                         self.config["mirror_dir"] = cfg["mirror_dir"]
@@ -1873,14 +2492,16 @@ class SyncPlugin:
                     self._save_config(bridge)
             else:
                 cfg = dict(self.config)
+                cfg["selected_notebooks"] = list(self.config.get("selected_notebooks") or [])
             return {"page": self.build_page(cfg=cfg)}
 
         if method == "plugin.action":
+            self._refresh_known_notebooks(bridge)
             values = params.get("values") or {}
             action_id = str(params.get("action_id") or "")
             if action_id == "save_config":
                 next_cfg = self._normalize_config(values)
-                status = self._target_error(next_cfg)
+                status = self._target_error(next_cfg, require_notebooks=False)
                 if status:
                     return {"status": status}
                 if next_cfg != self.config:
@@ -1913,51 +2534,52 @@ class SyncPlugin:
                 status = self._run_sync(bridge)
             elif action_id == "confirm_sync":
                 pc = self.pending_confirm
-                if not pc or pc.get("nb_key") != self._notebook_key():
+                if not pc or pc.get("scope_key") != self._result_key():
                     status = "当前没有待确认的同步计划"
                     self.last_status = status
                 else:
                     protocol = self.config.get("protocol", "local_mirror")
+                    notebooks = self._selected_notebooks(self.config)
                     try:
-                        plan = self._compute_sync_plan(bridge, self.config, inspect_remote=True, force_refresh=True)
+                        batch = self._compute_batch_plan(bridge, self.config, notebooks, inspect_remote=True, force_refresh=True)
                     except Exception as exc:
                         msg = f"{self._protocol_label(protocol)}同步未完成: {sanitize_error_text(exc)}"
-                        self._append_log(f"{self._protocol_label(protocol)}同步", msg)
+                        self._append_log(f"{self._protocol_label(protocol)}同步", "失败", tone="danger", tooltip=msg)
                         self._record_result("失败", msg, protocol=protocol)
                         self._save_runtime(bridge)
                         self.last_status = msg
                         raise RuntimeError(msg) from exc
 
-                    if plan.get("remote_error"):
-                        msg = plan["remote_error"]
-                        self._append_log(f"{self._protocol_label(plan['protocol'])}同步", msg)
-                        self._record_result("失败", msg, protocol=plan["protocol"], target=plan["target_display"])
+                    if batch.get("remote_error"):
+                        msg = batch["remote_error"]
+                        self._append_log(f"{self._protocol_label(batch['protocol'])}同步", "失败", tone="danger", tooltip=msg)
+                        self._record_result("失败", msg, protocol=batch["protocol"], target=batch["target_display"])
                         self._save_runtime(bridge)
                         self.last_status = msg
                         raise RuntimeError(msg)
 
-                    if plan["fingerprint"] != pc.get("fingerprint"):
-                        reasons = self._assess_dangerous_changes(plan, self.config)
+                    if batch["fingerprint"] != pc.get("fingerprint"):
+                        reasons = self._assess_batch_dangerous_changes(batch, self.config)
                         if reasons:
-                            self.pending_confirm = self._build_pending_confirm(plan, reasons)
-                            self._append_log("同步计划已变化", reasons[0])
-                            self._record_result("待确认", "同步计划已变化，请重新确认", protocol=plan["protocol"], target=plan["target_display"])
+                            self.pending_confirm = self._build_pending_confirm(batch, reasons)
+                            self._append_log(reasons[0], "待确认", tone="warning", tooltip="同步计划已变化，请重新确认")
+                            self._record_result("待确认", "同步计划已变化，请重新确认", protocol=batch["protocol"], target=batch["target_display"])
                             self._save_runtime(bridge)
                             status = "同步计划已变化，请重新确认"
                             self.last_status = status
                         else:
                             self.pending_confirm = None
-                            self._append_log("同步计划已变化", "原危险变更已消除，请重新同步")
-                            self._record_result("待确认", "同步计划已变化，请重新同步", protocol=plan["protocol"], target=plan["target_display"])
+                            self._append_log("同步计划已变化", "待确认", tone="warning", tooltip="原危险变更已消除，请重新同步")
+                            self._record_result("待确认", "同步计划已变化，请重新同步", protocol=batch["protocol"], target=batch["target_display"])
                             self._save_runtime(bridge)
                             status = "同步计划已变化，请重新同步"
                             self.last_status = status
                     else:
                         self.pending_confirm = None
-                        status = self._run_sync(bridge, confirmed=True, approved_plan=plan)
+                        status = self._run_sync(bridge, confirmed=True, approved_batch=batch)
             elif action_id == "cancel_confirm":
                 self.pending_confirm = None
-                self._append_log("取消危险同步", "用户已取消")
+                self._append_log("危险变更同步", "已取消", tone="info", tooltip="用户已取消本次同步")
                 self._record_result("已取消", "用户已取消危险变更")
                 self._save_runtime(bridge)
                 status = "已取消本次同步"
@@ -1976,10 +2598,14 @@ class SyncPlugin:
         if method == "plugin.event":
             event_name = str(params.get("event") or "")
             rel_path = str(params.get("path") or "").replace("\\", "/")
+            event_nb = self._norm_nb_path(params.get("notebook_root") or self.notebook_root)
             if (event_name == "note.saved" and self.config["auto_sync"]
                     and is_safe_rel_md(rel_path) and self._matches_scope(rel_path)
                     and not self._target_error(self.config)):
-                self._run_sync(bridge, only_path=rel_path)
+                self._refresh_known_notebooks(bridge)
+                selected = self._selected_notebooks(self.config)
+                if not self.supports_multi_notebook or (event_nb and event_nb in selected):
+                    self._run_sync(bridge, only_path=rel_path, only_nb_root=event_nb or None)
             return {"handled": True}
 
         if method == "plugin.shutdown":
