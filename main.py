@@ -26,6 +26,18 @@ VALID_CONFLICT_POLICIES = ("keep_both", "remote_first", "local_first")
 VALID_GIT_AUTHS = ("ssh", "token")
 DELETE_GUARD_THRESHOLD = 5
 MAX_LOG_ENTRIES = 20
+CHINESE_TEXT = re.compile(r"[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]")
+LOG_STATUS_EN = {
+    "完成": "Complete",
+    "成功": "Success",
+    "通过": "Passed",
+    "无变更": "No Changes",
+    "待确认": "Confirmation Required",
+    "失败": "Failed",
+    "未连通": "Connection Failed",
+    "已取消": "Canceled",
+    "冲突副本": "Conflict Copy",
+}
 LAYOUTS_META_KEY = "notebook_layouts"
 
 DEFAULT_CONFIG = {
@@ -75,7 +87,7 @@ class HostBridge:
                     raise RuntimeError(msg["error"].get("message", "host error"))
                 return msg.get("result", {})
 
-    def serve(self, handler):
+    def serve(self, handler, localize_error):
         while True:
             line = sys.stdin.readline()
             if not line:
@@ -95,7 +107,7 @@ class HostBridge:
                 self.send({
                     "jsonrpc": "2.0",
                     "id": req_id,
-                    "error": {"code": -32000, "message": str(exc)},
+                    "error": {"code": -32000, "message": localize_error(str(exc))},
                 })
 
 
@@ -220,6 +232,20 @@ class SyncPlugin:
         self.supports_multi_notebook = False
         self.last_status = ""
 
+    def _is_en(self):
+        return self.locale.lower().startswith("en")
+
+    def _tr(self, zh, en):
+        return en if self._is_en() else zh
+
+    def _localize_error(self, detail):
+        if self._is_en() and CHINESE_TEXT.search(detail):
+            return "The underlying error is unavailable in English"
+        return detail
+
+    def _error_detail(self, exc):
+        return self._localize_error(sanitize_error_text(exc))
+
     def _norm_nb_path(self, raw):
         text = str(raw or "").strip()
         if not text:
@@ -245,7 +271,7 @@ class SyncPlugin:
     def _notebook_label(self, nb_root=None):
         key = self._notebook_key(nb_root)
         if key == "default":
-            return "默认笔记本"
+            return self._tr("默认笔记本", "Default notebook")
         return os.path.basename(key) or key
 
     def _notebook_slug(self, nb_root=None):
@@ -331,7 +357,10 @@ class SyncPlugin:
             return candidates[0]
         if not candidates and len(self.known_notebooks) == 1:
             return self.known_notebooks[0]["path"]
-        raise RuntimeError("旧同步根目录缺少唯一的笔记本归属，无法安全继续同步")
+        raise RuntimeError(self._tr(
+            "旧同步根目录缺少唯一的笔记本归属，无法安全继续同步",
+            "The legacy sync root cannot be attributed to one notebook. Sync cannot safely continue.",
+        ))
 
     def _valid_sync_subdir(self, subdir):
         return is_safe_rel_path(subdir) and "/" not in subdir and "\\" not in subdir
@@ -343,7 +372,7 @@ class SyncPlugin:
         bindings = dict(stored) if isinstance(stored, dict) else {}
         for subdir in bindings.values():
             if not isinstance(subdir, str) or (subdir and not self._valid_sync_subdir(subdir)):
-                raise RuntimeError("保存的笔记本同步目录无效")
+                raise RuntimeError(self._tr("保存的笔记本同步目录无效", "The saved notebook sync folder is invalid"))
         historical = {}
         legacy_root = False
         marker = f"|{protocol}:"
@@ -380,7 +409,10 @@ class SyncPlugin:
             for subdir in dirs:
                 folded = sync_dir_key(subdir)
                 if folded in owners and owners[folded] != nb:
-                    raise RuntimeError("同步目标的旧路径被多个笔记本共用，无法安全继续同步")
+                    raise RuntimeError(self._tr(
+                        "同步目标的旧路径被多个笔记本共用，无法安全继续同步",
+                        "Multiple notebooks share the legacy sync path. Sync cannot safely continue.",
+                    ))
                 owners[folded] = nb
             if nb not in bindings:
                 if "" in dirs:
@@ -388,7 +420,10 @@ class SyncPlugin:
                 elif len(dirs) == 1:
                     bindings[nb] = next(iter(dirs))
                 elif nb in notebooks:
-                    raise RuntimeError(f"笔记本「{self._notebook_label(nb)}」有多个旧同步目录，无法安全选择")
+                    raise RuntimeError(self._tr(
+                        f"笔记本「{self._notebook_label(nb)}」有多个旧同步目录，无法安全选择",
+                        f"Notebook {self._notebook_label(nb)} has multiple legacy sync folders. A folder cannot be chosen safely.",
+                    ))
 
         if not owners and len(notebooks) == 1:
             bindings[notebooks[0]] = ""
@@ -504,6 +539,25 @@ class SyncPlugin:
         item = {"title": title, "status": status, "time": time_str, "tone": tone}
         if tooltip and tooltip != title and tooltip != status:
             item["tooltip"] = tooltip
+        if entry.get("locale") == "en":
+            item["locale"] = "en"
+        return item
+
+    def _log_for_page(self, entry):
+        item = self._normalize_log(entry)
+        recorded_in_english = item.pop("locale", None) == "en"
+        if not self._is_en():
+            return item
+
+        status = item["status"]
+        status = LOG_STATUS_EN.get(status, status)
+        item["status"] = "Complete" if CHINESE_TEXT.search(status) else status
+        # Older entries store free-form Chinese messages without translation keys.
+        if not recorded_in_english:
+            if CHINESE_TEXT.search(item["title"]):
+                item["title"] = "Sync event"
+            if CHINESE_TEXT.search(item.get("tooltip", "")):
+                item.pop("tooltip")
         return item
 
     def _classify_log_status(self, raw_status):
@@ -698,6 +752,8 @@ class SyncPlugin:
             "assets": int(assets or 0),
             "summary": summary_str,
         }
+        if self._is_en():
+            entry["locale"] = "en"
         if last_success is not None:
             entry["last_success"] = last_success
         self.notebook_results[nb_key] = entry
@@ -711,7 +767,7 @@ class SyncPlugin:
         if protocol == "local_mirror":
             return self._resolve_mirror_dir(c)
         if protocol == "webdav":
-            return self._webdav_base_url(c) or "未配置 WebDAV 地址"
+            return self._webdav_base_url(c) or self._tr("未配置 WebDAV 地址", "WebDAV address is missing")
         target = str(c.get("git_remote") or "").strip()
         branch = self._git_branch(c)
         repo_dir = self._resolve_local_git_dir(c)
@@ -719,21 +775,23 @@ class SyncPlugin:
 
     def _append_log(self, title, status, tone="", tooltip=""):
         entry = self._normalize_log({
-            "title": str(title or "同步任务").strip() or "同步任务",
+            "title": str(title or self._tr("同步任务", "Sync task")).strip() or self._tr("同步任务", "Sync task"),
             "status": str(status or "成功").strip() or "成功",
             "time": now_hms(),
             "tone": tone,
             "tooltip": tooltip,
         })
+        if self._is_en():
+            entry["locale"] = "en"
         self.logs.insert(0, entry)
         self.logs = self.logs[:MAX_LOG_ENTRIES]
 
     def _protocol_label(self, protocol):
         return {
-            "local_mirror": "目录镜像",
+            "local_mirror": self._tr("目录镜像", "Local mirror"),
             "webdav": "WebDAV",
-            "git": "Git 仓库",
-        }.get(protocol, "目录镜像")
+            "git": self._tr("Git 仓库", "Git repository"),
+        }.get(protocol, self._tr("目录镜像", "Local mirror"))
 
     def _downloads_root(self):
         raw = (self.downloads_dir or "").strip() or "~/Downloads"
@@ -756,18 +814,18 @@ class SyncPlugin:
     def _target_error(self, cfg, require_notebooks=True):
         selected = self._selected_notebooks(cfg)
         if require_notebooks and self.supports_multi_notebook and not selected:
-            return "请至少选择一个笔记本"
+            return self._tr("请至少选择一个笔记本", "Select at least one notebook")
         protocol = cfg["protocol"]
         if protocol == "webdav":
             if not self._webdav_base_url(cfg):
-                return "请填写有效的 WebDAV 地址"
+                return self._tr("请填写有效的 WebDAV 地址", "Enter a valid WebDAV address")
         elif protocol == "git":
             if not str(cfg.get("git_remote") or "").strip():
-                return "请填写 Git 仓库地址"
+                return self._tr("请填写 Git 仓库地址", "Enter a Git repository address")
         elif protocol == "local_mirror":
             target = self._resolve_mirror_dir(cfg)
             if not target:
-                return "请先选择同步文件夹"
+                return self._tr("请先选择同步文件夹", "Select a sync folder first")
             target_real = os.path.realpath(target)
             roots_to_check = selected if selected else ([self.notebook_root] if self.notebook_root else [])
             for nb in roots_to_check:
@@ -779,7 +837,10 @@ class SyncPlugin:
                 except ValueError:
                     overlaps = False
                 if overlaps:
-                    return f"同步文件夹不能与笔记本「{self._notebook_label(nb)}」重叠"
+                    return self._tr(
+                        f"同步文件夹不能与笔记本「{self._notebook_label(nb)}」重叠",
+                        f"The sync folder cannot overlap with notebook {self._notebook_label(nb)}",
+                    )
         return ""
 
     def _matches_scope(self, rel_path, scope=None):
@@ -825,11 +886,11 @@ class SyncPlugin:
 
     def _asset_file(self, root_dir, rel_path):
         if not is_safe_rel_asset(rel_path):
-            raise ValueError(f"无效的附件路径：{rel_path}")
+            raise ValueError(self._tr(f"无效的附件路径：{rel_path}", f"Invalid attachment path: {rel_path}"))
         root_real = os.path.realpath(root_dir)
         path = os.path.join(root_real, *rel_path.split("/"))
         if not os.path.realpath(path).startswith(root_real + os.sep):
-            raise ValueError(f"附件路径超出同步目录：{rel_path}")
+            raise ValueError(self._tr(f"附件路径超出同步目录：{rel_path}", f"Attachment path is outside the sync folder: {rel_path}"))
         return path
 
     def _read_asset_file(self, root_dir, rel_path):
@@ -889,7 +950,7 @@ class SyncPlugin:
         local_paths = self._list_dir_assets(root_dir) if paths is None else paths
         for rel in local_paths:
             if in_sync_subdir(rel, excluded_subdirs):
-                raise RuntimeError(f"附件路径与其他笔记本的同步目录重叠：{rel}")
+                raise RuntimeError(self._tr(f"附件路径与其他笔记本的同步目录重叠：{rel}", f"Attachment path overlaps with another notebook's sync folder: {rel}"))
         return local_paths
 
     def _check_delete_guard(self, base_map, local_notes, remote_notes, only_path=None):
@@ -901,8 +962,11 @@ class SyncPlugin:
         ]
         if len(remote_missing) > DELETE_GUARD_THRESHOLD:
             return (
-                f"已触发删除保护：远端缺失 {len(remote_missing)} 篇已同步笔记"
-                f"（超过 {DELETE_GUARD_THRESHOLD} 篇），已暂停同步"
+                self._tr(
+                    f"已触发删除保护：远端缺失 {len(remote_missing)} 篇已同步笔记",
+                    f"Deletion protection paused sync: {len(remote_missing)} synced notes are missing remotely",
+                )
+                + self._tr(f"（超过 {DELETE_GUARD_THRESHOLD} 篇），已暂停同步", f" (limit: {DELETE_GUARD_THRESHOLD})")
             )
         local_missing = [
             p for p in base_map
@@ -910,8 +974,11 @@ class SyncPlugin:
         ]
         if len(local_missing) > DELETE_GUARD_THRESHOLD:
             return (
-                f"已触发删除保护：本地缺失 {len(local_missing)} 篇已同步笔记"
-                f"（超过 {DELETE_GUARD_THRESHOLD} 篇），已暂停同步"
+                self._tr(
+                    f"已触发删除保护：本地缺失 {len(local_missing)} 篇已同步笔记",
+                    f"Deletion protection paused sync: {len(local_missing)} synced notes are missing locally",
+                )
+                + self._tr(f"（超过 {DELETE_GUARD_THRESHOLD} 篇），已暂停同步", f" (limit: {DELETE_GUARD_THRESHOLD})")
             )
         return None
 
@@ -961,9 +1028,9 @@ class SyncPlugin:
             with open(probe_file, "w", encoding="utf-8") as fh:
                 fh.write("ok")
             os.remove(probe_file)
-            return True, f"目录镜像可用: {mirror_dir}"
+            return True, self._tr(f"目录镜像可用: {mirror_dir}", f"Local mirror is available: {mirror_dir}")
         except Exception as exc:
-            return False, f"目录镜像不可写: {sanitize_error_text(exc)}"
+            return False, self._tr(f"目录镜像不可写: {self._error_detail(exc)}", f"Local mirror is not writable: {self._error_detail(exc)}")
 
     def _scan_mirror_files(self, mirror_dir, only_path=None, scope=None, excluded_subdirs=()):
         remote_files = {}
@@ -1027,7 +1094,7 @@ class SyncPlugin:
 
         guard_msg = self._check_delete_guard(base_map, local_notes, remote_notes, only_path=only_path)
         if guard_msg:
-            self._append_log("删除保护暂停", "待确认", tone="warning", tooltip=guard_msg)
+            self._append_log(self._tr("删除保护暂停", "Paused by deletion protection"), "待确认", tone="warning", tooltip=guard_msg)
             return guard_msg
 
         synced_count = 0
@@ -1040,13 +1107,19 @@ class SyncPlugin:
                 self._write_mirror_file(mirror_dir, rel_path, text)
                 base_map[rel_path] = sha256_text(text)
                 synced_count += 1
-                self._append_log(f"推送 {rel_path}", "成功", tone="success", tooltip="已镜像到本地目录")
+                self._append_log(self._tr(f"推送 {rel_path}", f"Push {rel_path}"), "成功", tone="success", tooltip=self._tr(
+                    "已镜像到本地目录",
+                    "Copied to the local mirror",
+                ))
             elif in_remote and not in_local:
                 text = remote_notes[rel_path]
                 bridge.call_host("host.notes.write", {"path": rel_path, "content": text})
                 base_map[rel_path] = sha256_text(text)
                 synced_count += 1
-                self._append_log(f"拉取 {rel_path}", "成功", tone="success", tooltip="已从镜像恢复")
+                self._append_log(self._tr(f"拉取 {rel_path}", f"Pull {rel_path}"), "成功", tone="success", tooltip=self._tr(
+                    "已从镜像恢复",
+                    "Restored from the local mirror",
+                ))
             else:
                 action, chosen_text, conflict_extra, new_hash = self._resolve_conflict_pair(
                     rel_path, local_notes[rel_path], remote_notes[rel_path], base_map.get(rel_path)
@@ -1057,12 +1130,18 @@ class SyncPlugin:
                     self._write_mirror_file(mirror_dir, rel_path, chosen_text)
                     base_map[rel_path] = new_hash
                     synced_count += 1
-                    self._append_log(f"本地覆盖 {rel_path}", "成功", tone="success", tooltip="本地优先覆盖镜像")
+                    self._append_log(self._tr(f"本地覆盖 {rel_path}", f"Overwrite remote: {rel_path}"), "成功", tone="success", tooltip=self._tr(
+                        "本地优先覆盖镜像",
+                        "Local version replaced the mirrored copy",
+                    ))
                 elif action == "pull":
                     bridge.call_host("host.notes.write", {"path": rel_path, "content": chosen_text})
                     base_map[rel_path] = new_hash
                     synced_count += 1
-                    self._append_log(f"远端覆盖 {rel_path}", "成功", tone="success", tooltip="镜像优先更新本地")
+                    self._append_log(self._tr(f"远端覆盖 {rel_path}", f"Overwrite local: {rel_path}"), "成功", tone="success", tooltip=self._tr(
+                        "镜像优先更新本地",
+                        "Mirrored version replaced the local copy",
+                    ))
                 elif action == "keep_both":
                     conflict_rel, conflict_text = conflict_extra
                     bridge.call_host("host.notes.write", {"path": conflict_rel, "content": conflict_text})
@@ -1071,22 +1150,28 @@ class SyncPlugin:
                     base_map[rel_path] = new_hash
                     base_map[conflict_rel] = sha256_text(conflict_text)
                     synced_count += 1
-                    self._append_log(f"冲突保留 {rel_path}", "冲突副本", tone="warning", tooltip=f"已保留副本 {conflict_rel}")
+                    self._append_log(self._tr(f"冲突保留 {rel_path}", f"Keep conflict copy: {rel_path}"), "冲突副本", tone="warning", tooltip=self._tr(
+                        f"已保留副本 {conflict_rel}",
+                        f"Saved a copy at {conflict_rel}",
+                    ))
 
         asset_count = self._sync_local_dir_assets(mirror_dir)
         if asset_count > 0:
-            self._append_log(f"同步 {asset_count} 个附件", "成功", tone="success")
+            self._append_log(self._tr(f"同步 {asset_count} 个附件", f"Synced attachments: {asset_count}"), "成功", tone="success")
 
         self.sync_meta[meta_key] = base_map
         self.stats["total_synced"] += synced_count
         self.stats["last_sync"] = now_hms()
         if synced_count == 0 and asset_count == 0 and not all_paths:
-            return "当前笔记本暂无笔记"
+            return self._tr("当前笔记本暂无笔记", "This notebook has no notes")
         if synced_count == 0 and asset_count == 0:
-            return "目录镜像已是最新，无需更新"
+            return self._tr("目录镜像已是最新，无需更新", "The local mirror is up to date")
         if asset_count > 0:
-            return f"已完成目录镜像同步，处理 {synced_count} 篇笔记、{asset_count} 个附件"
-        return f"已完成目录镜像同步，处理 {synced_count} 篇笔记"
+            return self._tr(
+                f"已完成目录镜像同步，处理 {synced_count} 篇笔记、{asset_count} 个附件",
+                f"Local mirror sync complete. Notes: {synced_count}. Attachments: {asset_count}.",
+            )
+        return self._tr(f"已完成目录镜像同步，处理 {synced_count} 篇笔记", f"Local mirror sync complete. Notes: {synced_count}.")
 
     # ---------- WebDAV Mode ----------
 
@@ -1161,25 +1246,25 @@ class SyncPlugin:
         root_url = self._webdav_root_url()
         base_url = self._webdav_base_url()
         if not root_url or not base_url:
-            return False, "请填写有效的 WebDAV http(s) 地址"
+            return False, self._tr("请填写有效的 WebDAV http(s) 地址", "Enter a valid HTTP or HTTPS WebDAV address")
         try:
             status, _ = self._webdav_request("PROPFIND", base_url, extra_headers={"Depth": "0"})
             if status in (200, 204, 207):
-                return True, f"WebDAV 连接正常 (HTTP {status})"
-            return False, f"WebDAV 响应异常 (HTTP {status})"
+                return True, self._tr(f"WebDAV 连接正常 (HTTP {status})", f"WebDAV connection successful (HTTP {status})")
+            return False, self._tr(f"WebDAV 响应异常 (HTTP {status})", f"Unexpected WebDAV response (HTTP {status})")
         except urllib.error.HTTPError as exc:
             if exc.code == 404 and base_url != root_url:
                 try:
                     status, _ = self._webdav_request("PROPFIND", root_url, extra_headers={"Depth": "0"})
                     if status in (200, 204, 207):
-                        return True, "WebDAV 连通正常（远端目录将在同步时创建）"
+                        return True, self._tr("WebDAV 连通正常（远端目录将在同步时创建）", "WebDAV connection successful. The remote folder will be created during sync.")
                 except Exception:
                     pass
             if exc.code in (401, 403):
-                return False, f"WebDAV 认证失败 (HTTP {exc.code})"
-            return False, f"WebDAV 请求失败 (HTTP {exc.code})"
+                return False, self._tr(f"WebDAV 认证失败 (HTTP {exc.code})", f"WebDAV authentication failed (HTTP {exc.code})")
+            return False, self._tr(f"WebDAV 请求失败 (HTTP {exc.code})", f"WebDAV request failed (HTTP {exc.code})")
         except Exception as exc:
-            return False, f"WebDAV 连接不可达: {sanitize_error_text(exc)}"
+            return False, self._tr(f"WebDAV 连接不可达: {self._error_detail(exc)}", f"WebDAV server is unreachable: {self._error_detail(exc)}")
 
     def _webdav_list_files(self, base_url, filter_fn, cfg=None, timeout=6, excluded_subdirs=(), skip_assets=False):
         root_parsed = urllib.parse.urlparse(base_url)
@@ -1326,8 +1411,8 @@ class SyncPlugin:
         root_url = self._webdav_root_url()
         base_url = self._webdav_base_url()
         if not root_url or not base_url:
-            msg = "请先填写有效的 WebDAV http(s) 地址"
-            self._append_log("WebDAV 同步", "失败", tone="danger", tooltip=msg)
+            msg = self._tr("请先填写有效的 WebDAV http(s) 地址", "Enter a valid HTTP or HTTPS WebDAV address first")
+            self._append_log(self._tr("WebDAV 同步", "WebDAV sync"), "失败", tone="danger", tooltip=msg)
             return msg
 
         try:
@@ -1355,7 +1440,7 @@ class SyncPlugin:
 
             guard_msg = self._check_delete_guard(base_map, local_notes, remote_notes, only_path=only_path)
             if guard_msg:
-                self._append_log("删除保护暂停", "待确认", tone="warning", tooltip=guard_msg)
+                self._append_log(self._tr("删除保护暂停", "Paused by deletion protection"), "待确认", tone="warning", tooltip=guard_msg)
                 return guard_msg
 
             synced_count = 0
@@ -1368,13 +1453,19 @@ class SyncPlugin:
                     self._webdav_put_text(base_url, rel_path, text)
                     base_map[rel_path] = sha256_text(text)
                     synced_count += 1
-                    self._append_log(f"推送 {rel_path}", "成功", tone="success", tooltip="已上传到 WebDAV")
+                    self._append_log(self._tr(f"推送 {rel_path}", f"Push {rel_path}"), "成功", tone="success", tooltip=self._tr(
+                        "已上传到 WebDAV",
+                        "Uploaded to WebDAV",
+                    ))
                 elif in_remote and not in_local:
                     text = remote_notes[rel_path]
                     bridge.call_host("host.notes.write", {"path": rel_path, "content": text})
                     base_map[rel_path] = sha256_text(text)
                     synced_count += 1
-                    self._append_log(f"拉取 {rel_path}", "成功", tone="success", tooltip="已从 WebDAV 下载")
+                    self._append_log(self._tr(f"拉取 {rel_path}", f"Pull {rel_path}"), "成功", tone="success", tooltip=self._tr(
+                        "已从 WebDAV 下载",
+                        "Downloaded from WebDAV",
+                    ))
                 else:
                     action, chosen_text, conflict_extra, new_hash = self._resolve_conflict_pair(
                         rel_path, local_notes[rel_path], remote_notes[rel_path], base_map.get(rel_path)
@@ -1385,12 +1476,18 @@ class SyncPlugin:
                         self._webdav_put_text(base_url, rel_path, chosen_text)
                         base_map[rel_path] = new_hash
                         synced_count += 1
-                        self._append_log(f"本地覆盖 {rel_path}", "成功", tone="success", tooltip="本地优先上传 WebDAV")
+                        self._append_log(self._tr(f"本地覆盖 {rel_path}", f"Overwrite remote: {rel_path}"), "成功", tone="success", tooltip=self._tr(
+                            "本地优先上传 WebDAV",
+                            "Local version replaced the WebDAV copy",
+                        ))
                     elif action == "pull":
                         bridge.call_host("host.notes.write", {"path": rel_path, "content": chosen_text})
                         base_map[rel_path] = new_hash
                         synced_count += 1
-                        self._append_log(f"远端覆盖 {rel_path}", "成功", tone="success", tooltip="远端优先更新本地")
+                        self._append_log(self._tr(f"远端覆盖 {rel_path}", f"Overwrite local: {rel_path}"), "成功", tone="success", tooltip=self._tr(
+                            "远端优先更新本地",
+                            "Remote version replaced the local copy",
+                        ))
                     elif action == "keep_both":
                         conflict_rel, conflict_text = conflict_extra
                         bridge.call_host("host.notes.write", {"path": conflict_rel, "content": conflict_text})
@@ -1399,23 +1496,29 @@ class SyncPlugin:
                         base_map[rel_path] = new_hash
                         base_map[conflict_rel] = sha256_text(conflict_text)
                         synced_count += 1
-                        self._append_log(f"冲突保留 {rel_path}", "冲突副本", tone="warning", tooltip=f"WebDAV 冲突已保留副本 {conflict_rel}")
+                        self._append_log(self._tr(f"冲突保留 {rel_path}", f"Keep conflict copy: {rel_path}"), "冲突副本", tone="warning", tooltip=self._tr(
+                            f"WebDAV 冲突已保留副本 {conflict_rel}",
+                            f"Saved a WebDAV conflict copy at {conflict_rel}",
+                        ))
 
             asset_count = 0 if only_path else self._sync_webdav_assets(base_url)
             if asset_count > 0:
-                self._append_log(f"同步 {asset_count} 个附件", "成功", tone="success")
+                self._append_log(self._tr(f"同步 {asset_count} 个附件", f"Synced attachments: {asset_count}"), "成功", tone="success")
 
             self.sync_meta[meta_key] = base_map
             self.stats["total_synced"] += synced_count
             self.stats["last_sync"] = now_hms()
             if synced_count == 0 and asset_count == 0:
-                return "WebDAV 已是最新状态"
+                return self._tr("WebDAV 已是最新状态", "WebDAV is up to date")
             if asset_count > 0:
-                return f"已完成 WebDAV 同步，处理 {synced_count} 篇笔记、{asset_count} 个附件"
-            return f"已完成 WebDAV 同步，处理 {synced_count} 篇笔记"
+                return self._tr(
+                    f"已完成 WebDAV 同步，处理 {synced_count} 篇笔记、{asset_count} 个附件",
+                    f"WebDAV sync complete. Notes: {synced_count}. Attachments: {asset_count}.",
+                )
+            return self._tr(f"已完成 WebDAV 同步，处理 {synced_count} 篇笔记", f"WebDAV sync complete. Notes: {synced_count}.")
         except Exception as exc:
-            msg = f"WebDAV 同步未完成: {sanitize_error_text(exc)}"
-            self._append_log("WebDAV 同步", "失败", tone="danger", tooltip=msg)
+            msg = self._tr(f"WebDAV 同步未完成: {self._error_detail(exc)}", f"WebDAV sync failed: {self._error_detail(exc)}")
+            self._append_log(self._tr("WebDAV 同步", "WebDAV sync"), "失败", tone="danger", tooltip=msg)
             return msg
 
     # ---------- Git Mode ----------
@@ -1437,6 +1540,8 @@ class SyncPlugin:
     def _git_env(self):
         env = dict(os.environ)
         env["GIT_TERMINAL_PROMPT"] = "0"
+        if self._is_en():
+            env["LC_ALL"] = "C"
         return env
 
     def _run_git(self, args, cwd=None, timeout=8, cfg=None):
@@ -1497,37 +1602,37 @@ class SyncPlugin:
 
     def _test_git(self):
         if not shutil.which("git"):
-            return False, "当前环境未安装 git 命令"
+            return False, self._tr("当前环境未安装 git 命令", "Git is not installed")
         target = self.config.get("git_remote", "").strip()
         branch = self._git_branch()
         try:
             if target and self._is_remote_git_url(target):
                 proc = self._run_git(["ls-remote", "--heads", target, branch])
                 if proc.returncode == 0:
-                    return True, f"Git 远端仓库连接正常（分支 {branch}）"
-                err = sanitize_error_text(proc.stderr or proc.stdout or "连接失败")
-                return False, f"Git 远端不可达: {err}"
+                    return True, self._tr(f"Git 远端仓库连接正常（分支 {branch}）", f"Git remote connection successful (branch: {branch})")
+                err = self._error_detail(proc.stderr or proc.stdout or self._tr("连接失败", "Connection failed"))
+                return False, self._tr(f"Git 远端不可达: {err}", f"Git remote is unreachable: {err}")
 
             repo_dir = self._resolve_local_git_dir()
             if not os.path.isdir(repo_dir):
-                return False, f"本地 Git 仓库目录不存在: {repo_dir}"
+                return False, self._tr(f"本地 Git 仓库目录不存在: {repo_dir}", f"Local Git repository folder does not exist: {repo_dir}")
             proc = self._run_git(["rev-parse", "--is-inside-work-tree"], cwd=repo_dir)
             if proc.returncode != 0 or proc.stdout.strip() != "true":
-                return False, f"目录不是有效的 Git 仓库: {repo_dir}"
+                return False, self._tr(f"目录不是有效的 Git 仓库: {repo_dir}", f"Folder is not a valid Git repository: {repo_dir}")
             remote_proc = self._run_git(["remote"], cwd=repo_dir)
             remotes = [r.strip() for r in remote_proc.stdout.splitlines() if r.strip()]
             if remotes:
                 ls_proc = self._run_git(["ls-remote", "--heads", remotes[0], branch], cwd=repo_dir)
                 if ls_proc.returncode == 0:
-                    return True, f"Git 仓库及远端 {remotes[0]} 正常"
-                return True, f"本地 Git 仓库可用（远端 {remotes[0]} 当前离线）"
-            return True, f"本地 Git 仓库可用: {repo_dir}"
+                    return True, self._tr(f"Git 仓库及远端 {remotes[0]} 正常", f"Git repository and remote {remotes[0]} are available")
+                return True, self._tr(f"本地 Git 仓库可用（远端 {remotes[0]} 当前离线）", f"Local Git repository is available (remote {remotes[0]} is offline)")
+            return True, self._tr(f"本地 Git 仓库可用: {repo_dir}", f"Local Git repository is available: {repo_dir}")
         except Exception as exc:
-            return False, f"Git 检测异常: {sanitize_error_text(exc)}"
+            return False, self._tr(f"Git 检测异常: {self._error_detail(exc)}", f"Git connection test failed: {self._error_detail(exc)}")
 
     def _prepare_git_repo(self, cfg, allow_init_or_clone=True, allow_pull=True, repo_dir=None):
         if not shutil.which("git"):
-            return False, "当前环境未安装 git 命令"
+            return False, self._tr("当前环境未安装 git 命令", "Git is not installed")
         target = str(cfg.get("git_remote") or "").strip()
         branch = self._git_branch(cfg)
         repo_dir = repo_dir or self._resolve_local_git_dir(cfg)
@@ -1541,8 +1646,8 @@ class SyncPlugin:
                 if clone_proc.returncode != 0:
                     clone_proc = self._run_git(["clone", target, repo_dir], timeout=12, cfg=cfg)
                 if clone_proc.returncode != 0:
-                    err = sanitize_error_text(clone_proc.stderr or clone_proc.stdout or "clone 失败")
-                    return False, f"Git 远端不可达: {err}"
+                    err = self._error_detail(clone_proc.stderr or clone_proc.stdout or self._tr("clone 失败", "Clone failed"))
+                    return False, self._tr(f"Git 远端不可达: {err}", f"Git remote is unreachable: {err}")
             else:
                 url_proc = self._run_git(["remote", "get-url", "origin"], cwd=repo_dir, cfg=cfg)
                 if url_proc.returncode == 0 and url_proc.stdout.strip() != target:
@@ -1557,8 +1662,8 @@ class SyncPlugin:
                             and "does not have any commits" not in err_lower
                             and "no such ref" not in err_lower
                         ):
-                            err = sanitize_error_text(pull_proc.stderr or pull_proc.stdout or "pull 失败")
-                            return False, f"Git 拉取失败: {err}"
+                            err = self._error_detail(pull_proc.stderr or pull_proc.stdout or self._tr("pull 失败", "Pull failed"))
+                            return False, self._tr(f"Git 拉取失败: {err}", f"Git pull failed: {err}")
         else:
             if not os.path.isdir(os.path.join(repo_dir, ".git")):
                 if not allow_init_or_clone:
@@ -1568,7 +1673,7 @@ class SyncPlugin:
                 if init_proc.returncode != 0:
                     init_proc = self._run_git(["init"], cwd=repo_dir, cfg=cfg)
                 if init_proc.returncode != 0:
-                    return False, "Git 仓库初始化失败"
+                    return False, self._tr("Git 仓库初始化失败", "Could not initialize the Git repository")
 
         return True, repo_dir
 
@@ -1576,7 +1681,7 @@ class SyncPlugin:
         root_url = self._webdav_root_url(cfg)
         base_url = self._webdav_base_url(cfg, subdir=subdir)
         if not root_url or not base_url:
-            return False, {}, "请先填写有效的 WebDAV http(s) 地址"
+            return False, {}, self._tr("请先填写有效的 WebDAV http(s) 地址", "Enter a valid HTTP or HTTPS WebDAV address first")
 
         cache_key = (base_url, scope, only_path or "", frozenset(excluded_subdirs))
         if not force_refresh and only_path is None and cache_key in self._remote_preview_cache:
@@ -1608,7 +1713,7 @@ class SyncPlugin:
                 self._remote_preview_cache[cache_key] = (time.time(), dict(remote_notes))
             return True, remote_notes, None
         except Exception as exc:
-            return False, {}, f"WebDAV 连接不可达: {sanitize_error_text(exc)}"
+            return False, {}, self._tr(f"WebDAV 连接不可达: {self._error_detail(exc)}", f"WebDAV server is unreachable: {self._error_detail(exc)}")
 
     def _compute_sync_plan(
         self,
@@ -1631,7 +1736,7 @@ class SyncPlugin:
         local_notes = self._read_local_notes(bridge, only_path=only_path, scope=scope, nb_root=nb_root)
         for rel_path in local_notes:
             if in_sync_subdir(rel_path, excluded_subdirs):
-                raise RuntimeError(f"笔记路径与其他笔记本的同步目录重叠：{rel_path}")
+                raise RuntimeError(self._tr(f"笔记路径与其他笔记本的同步目录重叠：{rel_path}", f"Note path overlaps with another notebook's sync folder: {rel_path}"))
         target_display = self._target_display(cfg)
 
         remote_notes = {}
@@ -1656,7 +1761,7 @@ class SyncPlugin:
             legacy_key = f"webdav:{root_base_url}" if (root_base_url and not subdir) else None
             if not base_url:
                 remote_inspected = False
-                remote_error = "请先填写有效的 WebDAV http(s) 地址"
+                remote_error = self._tr("请先填写有效的 WebDAV http(s) 地址", "Enter a valid HTTP or HTTPS WebDAV address first")
             elif inspect_remote or force_refresh:
                 ok, fetched, err = self._fetch_webdav_notes(
                     cfg,
@@ -1830,34 +1935,43 @@ class SyncPlugin:
 
         if plan["is_first_sync"] and (n_pull_new > 0 or n_pull_ow > 0 or n_push_ow > 0 or n_conf > 0):
             reasons.append(
-                f"首次同步且远端已有内容（拉取 {n_pull_new} · 覆盖本地 {n_pull_ow} · 覆盖远端 {n_push_ow} · 冲突 {n_conf}）"
+                self._tr(
+                    f"首次同步且远端已有内容（拉取 {n_pull_new} · 覆盖本地 {n_pull_ow} · 覆盖远端 {n_push_ow} · 冲突 {n_conf}）",
+                    f"The remote already contains notes on first sync (pull: {n_pull_new}, overwrite local: {n_pull_ow}, overwrite remote: {n_push_ow}, conflicts: {n_conf})",
+                )
             )
         if n_pull_ow > 0:
-            reasons.append(f"远端内容将覆盖本地 {n_pull_ow} 篇笔记")
+            reasons.append(self._tr(f"远端内容将覆盖本地 {n_pull_ow} 篇笔记", f"Remote content will overwrite local notes: {n_pull_ow}"))
         if n_push_ow > 0:
-            reasons.append(f"本地内容将覆盖远端 {n_push_ow} 篇笔记")
+            reasons.append(self._tr(f"本地内容将覆盖远端 {n_push_ow} 篇笔记", f"Local content will overwrite remote notes: {n_push_ow}"))
         if n_conf > 0:
-            reasons.append(f"存在 {n_conf} 篇双向冲突（将生成 .conflict 副本）")
+            reasons.append(self._tr(f"存在 {n_conf} 篇双向冲突（将生成 .conflict 副本）", f"Conflicting notes: {n_conf} (.conflict copies will be created)"))
         if cfg.get("delete_guard", True) and (n_rm_miss > DELETE_GUARD_THRESHOLD or n_loc_miss > DELETE_GUARD_THRESHOLD):
             reasons.append(
-                f"触发批量缺失保护（远端缺失 {n_rm_miss} 篇 / 本地缺失 {n_loc_miss} 篇，阈值 {DELETE_GUARD_THRESHOLD}）"
+                self._tr(
+                    f"触发批量缺失保护（远端缺失 {n_rm_miss} 篇 / 本地缺失 {n_loc_miss} 篇，阈值 {DELETE_GUARD_THRESHOLD}）",
+                    f"Deletion protection triggered (missing remotely: {n_rm_miss}, missing locally: {n_loc_miss}, limit: {DELETE_GUARD_THRESHOLD})",
+                )
             )
         elif n_pull_new + n_pull_ow > DELETE_GUARD_THRESHOLD:
-            reasons.append(f"将向本地批量写入 {n_pull_new + n_pull_ow} 篇笔记（超 {DELETE_GUARD_THRESHOLD} 篇）")
+            reasons.append(self._tr(
+                f"将向本地批量写入 {n_pull_new + n_pull_ow} 篇笔记（超 {DELETE_GUARD_THRESHOLD} 篇）",
+                f"Bulk write to local notes: {n_pull_new + n_pull_ow} (limit: {DELETE_GUARD_THRESHOLD})",
+            ))
         return reasons
 
     def _commit_and_push_git(self, repo_root, cfg):
         branch = self._git_branch(cfg)
         status_proc = self._run_git(["status", "--porcelain"], cwd=repo_root, cfg=cfg)
         if status_proc.returncode != 0:
-            err = sanitize_error_text(status_proc.stderr or status_proc.stdout or "git status 失败")
-            raise RuntimeError(f"Git 状态检查失败: {err}")
+            err = self._error_detail(status_proc.stderr or status_proc.stdout or self._tr("git status 失败", "git status failed"))
+            raise RuntimeError(self._tr(f"Git 状态检查失败: {err}", f"Git status check failed: {err}"))
 
         if status_proc.stdout.strip():
             add_proc = self._run_git(["add", "-A"], cwd=repo_root, cfg=cfg)
             if add_proc.returncode != 0:
-                err = sanitize_error_text(add_proc.stderr or add_proc.stdout or "git add 失败")
-                raise RuntimeError(f"Git 暂存失败: {err}")
+                err = self._error_detail(add_proc.stderr or add_proc.stdout or self._tr("git add 失败", "git add failed"))
+                raise RuntimeError(self._tr(f"Git 暂存失败: {err}", f"Git staging failed: {err}"))
 
             commit_proc = self._run_git(
                 [
@@ -1870,13 +1984,13 @@ class SyncPlugin:
             )
             if commit_proc.returncode != 0:
                 self._run_git(["reset"], cwd=repo_root, cfg=cfg)
-                err = sanitize_error_text(commit_proc.stderr or commit_proc.stdout or "git commit 失败")
-                raise RuntimeError(f"Git 提交失败: {err}")
+                err = self._error_detail(commit_proc.stderr or commit_proc.stdout or self._tr("git commit 失败", "git commit failed"))
+                raise RuntimeError(self._tr(f"Git 提交失败: {err}", f"Git commit failed: {err}"))
 
         remote_proc = self._run_git(["remote"], cwd=repo_root, cfg=cfg)
         if remote_proc.returncode != 0:
-            err = sanitize_error_text(remote_proc.stderr or remote_proc.stdout or "git remote 失败")
-            raise RuntimeError(f"Git 远端检查失败: {err}")
+            err = self._error_detail(remote_proc.stderr or remote_proc.stdout or self._tr("git remote 失败", "git remote failed"))
+            raise RuntimeError(self._tr(f"Git 远端检查失败: {err}", f"Git remote check failed: {err}"))
 
         remotes = [r.strip() for r in remote_proc.stdout.splitlines() if r.strip()]
         if remotes:
@@ -1908,8 +2022,8 @@ class SyncPlugin:
                         cfg=cfg,
                     )
                     if push_proc.returncode != 0:
-                        err = sanitize_error_text(push_proc.stderr or push_proc.stdout or "push 失败")
-                        raise RuntimeError(f"已提交到本地 Git，但远端推送未完成: {err}")
+                        err = self._error_detail(push_proc.stderr or push_proc.stdout or self._tr("push 失败", "Push failed"))
+                        raise RuntimeError(self._tr(f"已提交到本地 Git，但远端推送未完成: {err}", f"Committed locally. Git push failed: {err}"))
                     return True
         return False
 
@@ -1961,7 +2075,7 @@ class SyncPlugin:
                     target_dir, nb_root=nb_root, paths=paths, excluded_subdirs=excluded_subdirs, cfg=cfg,
                 )
             if asset_count > 0:
-                self._append_log(f"{prefix}同步 {asset_count} 个附件", "成功", tone="success")
+                self._append_log(self._tr(f"{prefix}同步 {asset_count} 个附件", f"{prefix}Synced attachments: {asset_count}"), "成功", tone="success")
 
         for rel_path in plan["synced"]:
             base_map[rel_path] = sha256_text(local_notes[rel_path])
@@ -1971,21 +2085,30 @@ class SyncPlugin:
             write_remote(rel_path, text)
             base_map[rel_path] = sha256_text(text)
             pushed += 1
-            self._append_log(f"推送 {prefix}{rel_path}", "成功", tone="success", tooltip=f"已推送到{self._protocol_label(protocol)}")
+            self._append_log(self._tr(f"推送 {prefix}{rel_path}", f"Push {prefix}{rel_path}"), "成功", tone="success", tooltip=self._tr(
+                f"已推送到{self._protocol_label(protocol)}",
+                f"Pushed to {self._protocol_label(protocol)}",
+            ))
 
         for rel_path in plan["to_push_overwrite"]:
             text = local_notes[rel_path]
             write_remote(rel_path, text)
             base_map[rel_path] = sha256_text(text)
             pushed += 1
-            self._append_log(f"本地覆盖 {prefix}{rel_path}", "成功", tone="success", tooltip=f"本地优先覆盖{self._protocol_label(protocol)}")
+            self._append_log(self._tr(f"本地覆盖 {prefix}{rel_path}", f"Overwrite remote: {prefix}{rel_path}"), "成功", tone="success", tooltip=self._tr(
+                f"本地优先覆盖{self._protocol_label(protocol)}",
+                f"Local version took precedence on {self._protocol_label(protocol)}",
+            ))
 
         for rel_path in plan["to_pull_new"]:
             text = remote_notes[rel_path]
             self._write_local_note(bridge, rel_path, text, nb_root=nb_root)
             base_map[rel_path] = sha256_text(text)
             pulled += 1
-            self._append_log(f"拉取 {prefix}{rel_path}", "成功", tone="success", tooltip=f"已从{self._protocol_label(protocol)}拉取")
+            self._append_log(self._tr(f"拉取 {prefix}{rel_path}", f"Pull {prefix}{rel_path}"), "成功", tone="success", tooltip=self._tr(
+                f"已从{self._protocol_label(protocol)}拉取",
+                f"Pulled from {self._protocol_label(protocol)}",
+            ))
 
         for rel_path in plan["to_pull_overwrite"]:
             text = remote_notes[rel_path]
@@ -1994,7 +2117,10 @@ class SyncPlugin:
             )
             base_map[rel_path] = sha256_text(text)
             pulled += 1
-            self._append_log(f"远端覆盖 {prefix}{rel_path}", "成功", tone="success", tooltip=f"{self._protocol_label(protocol)}优先更新本地")
+            self._append_log(self._tr(f"远端覆盖 {prefix}{rel_path}", f"Overwrite local: {prefix}{rel_path}"), "成功", tone="success", tooltip=self._tr(
+                f"{self._protocol_label(protocol)}优先更新本地",
+                f"Version from {self._protocol_label(protocol)} replaced the local copy",
+            ))
 
         for rel_path, conflict_rel, remote_text in plan["conflicts"]:
             local_text = local_notes[rel_path]
@@ -2004,7 +2130,10 @@ class SyncPlugin:
             base_map[rel_path] = sha256_text(local_text)
             base_map[conflict_rel] = sha256_text(remote_text)
             conflict_count += 1
-            self._append_log(f"冲突保留 {prefix}{rel_path}", "冲突副本", tone="warning", tooltip=f"已保留副本 {conflict_rel}")
+            self._append_log(self._tr(f"冲突保留 {prefix}{rel_path}", f"Keep conflict copy: {prefix}{rel_path}"), "冲突副本", tone="warning", tooltip=self._tr(
+                f"已保留副本 {conflict_rel}",
+                f"Saved a copy at {conflict_rel}",
+            ))
 
         self.sync_meta[plan["meta_key"]] = base_map
         return pushed, pulled, conflict_count, asset_count
@@ -2112,23 +2241,32 @@ class SyncPlugin:
         self.stats["last_sync"] = now_hms()
 
         nb_count = len(batch["plans"])
-        nb_prefix = f"{nb_count} 个笔记本 · " if nb_count > 1 else ""
+        nb_prefix = self._tr(f"{nb_count} 个笔记本 · ", f"Notebooks: {nb_count} · ") if nb_count > 1 else ""
 
         if total_notes == 0 and total_assets == 0:
             if did_push:
-                summary = "已将本地 Git 待推送提交同步到远端"
-                self._append_log(f"推送 {self._protocol_label(protocol)} 提交", "成功", tone="success", tooltip=summary)
+                summary = self._tr("已将本地 Git 待推送提交同步到远端", "Pushed pending Git commits to the remote")
+                self._append_log(self._tr(
+                    f"推送 {self._protocol_label(protocol)} 提交",
+                    f"Push commits to {self._protocol_label(protocol)}",
+                ), "成功", tone="success", tooltip=summary)
                 self._record_result("成功", summary, protocol=protocol, target=batch["target_display"])
                 return summary
-            summary = f"{nb_prefix}{self._protocol_label(protocol)}已是最新状态"
+            summary = self._tr(f"{nb_prefix}{self._protocol_label(protocol)}已是最新状态", f"{nb_prefix}{self._protocol_label(protocol)} is up to date")
             if only_path is None:
-                self._append_log(f"{self._protocol_label(protocol)}同步", "无变更", tone="info", tooltip=summary)
+                self._append_log(self._tr(
+                    f"{self._protocol_label(protocol)}同步",
+                    f"{self._protocol_label(protocol)} sync",
+                ), "无变更", tone="info", tooltip=summary)
             self._record_result("无变更", summary, protocol=protocol, target=batch["target_display"])
             return summary
 
-        summary = f"{nb_prefix}推送 {total_pushed} 篇 · 拉取 {total_pulled} 篇 · 冲突 {total_conflicts} 篇"
+        summary = self._tr(
+            f"{nb_prefix}推送 {total_pushed} 篇 · 拉取 {total_pulled} 篇 · 冲突 {total_conflicts} 篇",
+            f"{nb_prefix}Pushed: {total_pushed} · Pulled: {total_pulled} · Conflicts: {total_conflicts}",
+        )
         if total_assets > 0:
-            summary += f" · 附件 {total_assets} 个"
+            summary += self._tr(f" · 附件 {total_assets} 个", f" · Attachments: {total_assets}")
         self._record_result(
             "成功",
             summary,
@@ -2139,7 +2277,7 @@ class SyncPlugin:
             conflicts=total_conflicts,
             assets=total_assets,
         )
-        return f"已完成{self._protocol_label(protocol)}同步：{summary}"
+        return self._tr(f"已完成{self._protocol_label(protocol)}同步：{summary}", f"{self._protocol_label(protocol)} sync complete: {summary}")
 
     # ---------- Dispatch & UI ----------
 
@@ -2149,13 +2287,13 @@ class SyncPlugin:
         for plan in batch["plans"]:
             prefix = f"{plan['nb_label']}/" if multi else ""
             sample_lines.extend(
-                [f"[覆盖本地] {prefix}{p}" for p in plan["to_pull_overwrite"]]
-                + [f"[覆盖远端] {prefix}{p}" for p in plan["to_push_overwrite"]]
-                + [f"[冲突副本] {prefix}{p} -> {cr}" for p, cr, _ in plan["conflicts"]]
-                + [f"[拉取] {prefix}{p}" for p in plan["to_pull_new"]]
-                + [f"[推送] {prefix}{p}" for p in plan["to_push_new"]]
-                + [f"[远端缺失] {prefix}{p}" for p in plan["remote_missing"]]
-                + [f"[本地缺失] {prefix}{p}" for p in plan["local_missing"]]
+                [self._tr(f"[覆盖本地] {prefix}{p}", f"[Overwrite local] {prefix}{p}") for p in plan["to_pull_overwrite"]]
+                + [self._tr(f"[覆盖远端] {prefix}{p}", f"[Overwrite remote] {prefix}{p}") for p in plan["to_push_overwrite"]]
+                + [self._tr(f"[冲突副本] {prefix}{p} -> {cr}", f"[Conflict copy] {prefix}{p} -> {cr}") for p, cr, _ in plan["conflicts"]]
+                + [self._tr(f"[拉取] {prefix}{p}", f"[Pull] {prefix}{p}") for p in plan["to_pull_new"]]
+                + [self._tr(f"[推送] {prefix}{p}", f"[Push] {prefix}{p}") for p in plan["to_push_new"]]
+                + [self._tr(f"[远端缺失] {prefix}{p}", f"[Missing remotely] {prefix}{p}") for p in plan["remote_missing"]]
+                + [self._tr(f"[本地缺失] {prefix}{p}", f"[Missing locally] {prefix}{p}") for p in plan["local_missing"]]
             )
         return {
             "scope_key": self._result_key(),
@@ -2163,7 +2301,7 @@ class SyncPlugin:
             "protocol": batch["protocol"],
             "target_display": batch["target_display"],
             "reasons": list(reasons),
-            "badge": f"需确认 · {len(reasons)} 项风险",
+            "badge": self._tr(f"需确认 · {len(reasons)} 项风险", f"Confirmation required · Risks: {len(reasons)}"),
             "sample_lines": sample_lines,
         }
 
@@ -2195,7 +2333,7 @@ class SyncPlugin:
                     return ""
                 notebooks = [norm_only]
             if not notebooks:
-                msg = "请至少选择一个笔记本"
+                msg = self._tr("请至少选择一个笔记本", "Select at least one notebook")
                 self.last_status = msg
                 return msg
             try:
@@ -2208,8 +2346,14 @@ class SyncPlugin:
                     force_refresh=True,
                 )
             except Exception as exc:
-                msg = f"{self._protocol_label(protocol)}同步未完成: {sanitize_error_text(exc)}"
-                self._append_log(f"{self._protocol_label(protocol)}同步", "失败", tone="danger", tooltip=msg)
+                msg = self._tr(
+                    f"{self._protocol_label(protocol)}同步未完成: {self._error_detail(exc)}",
+                    f"{self._protocol_label(protocol)} sync failed: {self._error_detail(exc)}",
+                )
+                self._append_log(self._tr(
+                    f"{self._protocol_label(protocol)}同步",
+                    f"{self._protocol_label(protocol)} sync",
+                ), "失败", tone="danger", tooltip=msg)
                 self._record_result("失败", msg, protocol=protocol)
                 self._save_runtime(bridge)
                 self.last_status = msg
@@ -2217,7 +2361,7 @@ class SyncPlugin:
 
         if batch.get("remote_error"):
             msg = batch["remote_error"]
-            self._append_log(f"{self._protocol_label(protocol)}同步", "失败", tone="danger", tooltip=msg)
+            self._append_log(self._tr(f"{self._protocol_label(protocol)}同步", f"{self._protocol_label(protocol)} sync"), "失败", tone="danger", tooltip=msg)
             self._record_result("失败", msg, protocol=protocol, target=batch["target_display"])
             self._save_runtime(bridge)
             self.last_status = msg
@@ -2227,14 +2371,14 @@ class SyncPlugin:
             reasons = self._assess_batch_dangerous_changes(batch, self.config, saved_path=only_path)
             if reasons:
                 if only_path is not None:
-                    msg = f"自动同步暂停（{reasons[0]}），请点击立即同步确认"
-                    self._append_log(f"自动同步暂停 ({only_path})", "待确认", tone="warning", tooltip=msg)
+                    msg = self._tr(f"自动同步暂停（{reasons[0]}），请点击立即同步确认", f"Auto-sync paused ({reasons[0]}). Click Sync Now to confirm.")
+                    self._append_log(self._tr(f"自动同步暂停 ({only_path})", f"Auto-sync paused ({only_path})"), "待确认", tone="warning", tooltip=msg)
                     self._record_result("待确认", msg, protocol=protocol, target=batch["target_display"])
                     self._save_runtime(bridge)
                     self.last_status = msg
                     return msg
                 self.pending_confirm = self._build_pending_confirm(batch, reasons)
-                msg = "检测到危险变更，请先确认后执行"
+                msg = self._tr("检测到危险变更，请先确认后执行", "Risky changes detected. Confirm to continue.")
                 self._append_log(reasons[0], "待确认", tone="warning", tooltip=msg)
                 self._record_result("待确认", reasons[0], protocol=protocol, target=batch["target_display"])
                 self._save_runtime(bridge)
@@ -2244,10 +2388,10 @@ class SyncPlugin:
         try:
             msg = self._execute_batch_plan(bridge, batch, only_path=only_path)
         except Exception as exc:
-            msg = sanitize_error_text(exc)
+            msg = self._error_detail(exc)
             if not msg.startswith(self._protocol_label(protocol)) and "Git" not in msg:
-                msg = f"{self._protocol_label(protocol)}同步未完成: {msg}"
-            self._append_log(f"{self._protocol_label(protocol)}同步", "失败", tone="danger", tooltip=msg)
+                msg = self._tr(f"{self._protocol_label(protocol)}同步未完成: {msg}", f"{self._protocol_label(protocol)} sync failed: {msg}")
+            self._append_log(self._tr(f"{self._protocol_label(protocol)}同步", f"{self._protocol_label(protocol)} sync"), "失败", tone="danger", tooltip=msg)
             self._record_result("失败", msg, protocol=protocol, target=batch["target_display"])
             self._save_runtime(bridge)
             self.last_status = msg
@@ -2276,7 +2420,7 @@ class SyncPlugin:
         finally:
             self.config = prev_cfg
         self._append_log(
-            f"测试连接 ({self._protocol_label(protocol)})",
+            self._tr(f"测试连接 ({self._protocol_label(protocol)})", f"Test connection ({self._protocol_label(protocol)})"),
             "通过" if ok else "未连通",
             tone="success" if ok else "danger",
             tooltip=msg,
@@ -2286,15 +2430,15 @@ class SyncPlugin:
 
     def _confirmation_card(self):
         pending = self.pending_confirm
-        lines = [f"[风险] {reason}" for reason in pending["reasons"]]
+        lines = [self._tr(f"[风险] {reason}", f"[Risk] {reason}") for reason in pending["reasons"]]
         samples = pending["sample_lines"]
         remaining = 9 - len(lines)
         lines.extend(samples[:remaining])
         if len(samples) > remaining:
-            lines.append(f"… 其余 {len(samples) - remaining} 项变更")
+            lines.append(self._tr(f"… 其余 {len(samples) - remaining} 项变更", f"… {len(samples) - remaining} more changes"))
         return {
             "id": "preview-card",
-            "title": "确认同步变更",
+            "title": self._tr("确认同步变更", "Review Sync Changes"),
             "items": [
                 {
                     "kind": "preview",
@@ -2308,8 +2452,8 @@ class SyncPlugin:
                 {
                     "kind": "actions",
                     "buttons": [
-                        {"id": "confirm_sync", "label": "确认同步", "variant": "danger"},
-                        {"id": "cancel_confirm", "label": "取消", "variant": "secondary"},
+                        {"id": "confirm_sync", "label": self._tr("确认同步", "Confirm Sync"), "variant": "danger"},
+                        {"id": "cancel_confirm", "label": self._tr("取消", "Cancel"), "variant": "secondary"},
                     ],
                 },
             ],
@@ -2319,12 +2463,12 @@ class SyncPlugin:
         return {
             "kind": "segmented",
             "id": "conflict_policy",
-            "label": "双端冲突处理",
+            "label": self._tr("双端冲突处理", "Conflict Resolution"),
             "value": c["conflict_policy"],
             "options": [
-                {"value": "keep_both", "label": "生成冲突副本"},
-                {"value": "local_first", "label": "优先本地"},
-                {"value": "remote_first", "label": "优先远端"},
+                {"value": "keep_both", "label": self._tr("生成冲突副本", "Keep Both Copies")},
+                {"value": "local_first", "label": self._tr("优先本地", "Prefer Local")},
+                {"value": "remote_first", "label": self._tr("优先远端", "Prefer Remote")},
             ],
         }
 
@@ -2335,27 +2479,27 @@ class SyncPlugin:
             {
                 "kind": "segmented",
                 "id": "protocol",
-                "label": "同步方式",
+                "label": self._tr("同步方式", "Sync Method"),
                 "value": protocol,
                 "options": [
-                    {"value": "local_mirror", "label": "目录镜像"},
+                    {"value": "local_mirror", "label": self._tr("目录镜像", "Local mirror")},
                     {"value": "webdav", "label": "WebDAV"},
-                    {"value": "git", "label": "Git 仓库"},
+                    {"value": "git", "label": self._tr("Git 仓库", "Git repository")},
                 ],
             },
             {
                 "kind": "folder",
                 "id": "mirror_dir",
-                "label": "同步文件夹",
+                "label": self._tr("同步文件夹", "Sync Folder"),
                 "value": self._resolve_mirror_dir(c),
                 "visible_when": {"control_id": "protocol", "equals": "local_mirror"},
             },
         ]
         for kind, key, label, placeholder in (
-            ("input", "webdav_url", "服务器地址", "https://dav.example.com"),
-            ("input", "webdav_dir", "远端目录", "/BlockNotes"),
-            ("input", "webdav_user", "用户名", ""),
-            ("secret", "webdav_pass", "密码", ""),
+            ("input", "webdav_url", self._tr("服务器地址", "Server Address"), "https://dav.example.com"),
+            ("input", "webdav_dir", self._tr("远端目录", "Remote Folder"), "/BlockNotes"),
+            ("input", "webdav_user", self._tr("用户名", "Username"), ""),
+            ("secret", "webdav_pass", self._tr("密码", "Password"), ""),
         ):
             target_items.append({
                 "kind": kind, "id": key, "label": label, "value": c[key],
@@ -2367,7 +2511,7 @@ class SyncPlugin:
             {
                 "kind": "input",
                 "id": "git_remote",
-                "label": "仓库地址",
+                "label": self._tr("仓库地址", "Repository Address"),
                 "value": c["git_remote"],
                 "placeholder": "git@github.com:user/notes.git",
                 "visible_when": {"control_id": "protocol", "equals": "git"},
@@ -2375,7 +2519,7 @@ class SyncPlugin:
             {
                 "kind": "input",
                 "id": "git_branch",
-                "label": "分支",
+                "label": self._tr("分支", "Branch"),
                 "value": c["git_branch"],
                 "placeholder": "main",
                 "visible_when": {"control_id": "protocol", "equals": "git"},
@@ -2383,11 +2527,11 @@ class SyncPlugin:
             {
                 "kind": "segmented",
                 "id": "git_auth",
-                "label": "认证方式",
+                "label": self._tr("认证方式", "Authentication"),
                 "value": c["git_auth"],
                 "options": [
                     {"value": "ssh", "label": "SSH"},
-                    {"value": "token", "label": "HTTPS 令牌"},
+                    {"value": "token", "label": self._tr("HTTPS 令牌", "HTTPS Token")},
                 ],
                 "visible_when": {"control_id": "protocol", "equals": "git"},
             },
@@ -2396,7 +2540,7 @@ class SyncPlugin:
             target_items.append({
                 "kind": "secret",
                 "id": "git_token",
-                "label": "访问令牌",
+                "label": self._tr("访问令牌", "Access Token"),
                 "value": c["git_token"],
                 "visible_when": {"control_id": "git_auth", "equals": "token"},
             })
@@ -2405,19 +2549,19 @@ class SyncPlugin:
             {
                 "kind": "switch",
                 "id": "auto_sync",
-                "label": "保存笔记后自动同步",
+                "label": self._tr("保存笔记后自动同步", "Sync Automatically on Save"),
                 "value": c["auto_sync"],
             },
             {
                 "kind": "actions",
                 "visible_when": {"control_id": "protocol", "in": ["webdav", "git"]},
                 "buttons": [
-                    {"id": "test_conn", "label": "测试连接", "variant": "secondary"},
-                    {"id": "save_config", "label": "保存", "variant": "primary"},
+                    {"id": "test_conn", "label": self._tr("测试连接", "Test Connection"), "variant": "secondary"},
+                    {"id": "save_config", "label": self._tr("保存", "Save"), "variant": "primary"},
                 ],
             },
         ])
-        return [{"id": "target-card", "title": "同步设置", "items": target_items}]
+        return [{"id": "target-card", "title": self._tr("同步设置", "Sync Settings"), "items": target_items}]
 
     def build_page(self, cfg=None):
         c = cfg or self.config
@@ -2435,13 +2579,13 @@ class SyncPlugin:
                     "tooltip": path,
                 }
                 if entry.get("active"):
-                    opt["badge"] = "当前"
+                    opt["badge"] = self._tr("当前", "Current")
                 nb_options.append(opt)
 
-            nb_meta = f"已选 {len(selected)} / {len(nb_options)}" if nb_options else ""
+            nb_meta = self._tr(f"已选 {len(selected)} / {len(nb_options)}", f"Selected: {len(selected)} / {len(nb_options)}") if nb_options else ""
             notebooks_card = {
                 "id": "notebooks-card",
-                "title": "同步笔记本",
+                "title": self._tr("同步笔记本", "Notebooks to Sync"),
                 "meta": nb_meta,
                 "items": [
                     {
@@ -2449,7 +2593,7 @@ class SyncPlugin:
                         "id": "selected_notebooks",
                         "value": selected,
                         "options": nb_options,
-                        "empty_text": "暂无已打开的笔记本",
+                        "empty_text": self._tr("暂无已打开的笔记本", "No open notebooks"),
                     }
                 ],
             }
@@ -2461,15 +2605,15 @@ class SyncPlugin:
                     "layout": "full",
                     "value": protocol,
                     "options": [
-                        {"value": "local_mirror", "label": "目录镜像"},
+                        {"value": "local_mirror", "label": self._tr("目录镜像", "Local mirror")},
                         {"value": "webdav", "label": "WebDAV"},
-                        {"value": "git", "label": "Git 仓库"},
+                        {"value": "git", "label": self._tr("Git 仓库", "Git repository")},
                     ],
                 },
                 {
                     "kind": "folder",
                     "id": "mirror_dir",
-                    "label": "目标文件夹",
+                    "label": self._tr("目标文件夹", "Destination Folder"),
                     "layout": "stacked",
                     "value": self._resolve_mirror_dir(c),
                     "visible_when": {"control_id": "protocol", "equals": "local_mirror"},
@@ -2477,7 +2621,7 @@ class SyncPlugin:
                 {
                     "kind": "input",
                     "id": "webdav_url",
-                    "label": "服务器地址",
+                    "label": self._tr("服务器地址", "Server Address"),
                     "layout": "stacked",
                     "value": c["webdav_url"],
                     "placeholder": "https://dav.example.com",
@@ -2486,7 +2630,7 @@ class SyncPlugin:
                 {
                     "kind": "input",
                     "id": "webdav_dir",
-                    "label": "远端目录",
+                    "label": self._tr("远端目录", "Remote Folder"),
                     "layout": "stacked",
                     "value": c["webdav_dir"],
                     "placeholder": "/BlockNotes",
@@ -2499,25 +2643,25 @@ class SyncPlugin:
                         {
                             "kind": "input",
                             "id": "webdav_user",
-                            "label": "用户名",
+                            "label": self._tr("用户名", "Username"),
                             "layout": "stacked",
                             "value": c["webdav_user"],
-                            "placeholder": "账号",
+                            "placeholder": self._tr("账号", "Account"),
                         },
                         {
                             "kind": "secret",
                             "id": "webdav_pass",
-                            "label": "密码",
+                            "label": self._tr("密码", "Password"),
                             "layout": "stacked",
                             "value": c["webdav_pass"],
-                            "placeholder": "应用密码或口令",
+                            "placeholder": self._tr("应用密码或口令", "App password or passphrase"),
                         },
                     ],
                 },
                 {
                     "kind": "input",
                     "id": "git_remote",
-                    "label": "仓库地址",
+                    "label": self._tr("仓库地址", "Repository Address"),
                     "layout": "stacked",
                     "value": c["git_remote"],
                     "placeholder": "git@github.com:user/notes.git",
@@ -2526,7 +2670,7 @@ class SyncPlugin:
                 {
                     "kind": "input",
                     "id": "git_branch",
-                    "label": "分支",
+                    "label": self._tr("分支", "Branch"),
                     "layout": "stacked",
                     "value": c["git_branch"],
                     "placeholder": "main",
@@ -2539,18 +2683,18 @@ class SyncPlugin:
                         {
                             "kind": "segmented",
                             "id": "git_auth",
-                            "label": "认证方式",
+                            "label": self._tr("认证方式", "Authentication"),
                             "layout": "stacked",
                             "value": c["git_auth"],
                             "options": [
                                 {"value": "ssh", "label": "SSH"},
-                                {"value": "token", "label": "HTTPS 令牌"},
+                                {"value": "token", "label": self._tr("HTTPS 令牌", "HTTPS Token")},
                             ],
                         },
                         {
                             "kind": "secret",
                             "id": "git_token",
-                            "label": "访问令牌",
+                            "label": self._tr("访问令牌", "Access Token"),
                             "layout": "stacked",
                             "value": c["git_token"],
                             "placeholder": "ghp_...",
@@ -2562,26 +2706,26 @@ class SyncPlugin:
                     "kind": "actions",
                     "visible_when": {"control_id": "protocol", "in": ["webdav", "git"]},
                     "buttons": [
-                        {"id": "test_conn", "label": "测试连接", "variant": "secondary"},
-                        {"id": "save_config", "label": "保存", "variant": "primary"},
+                        {"id": "test_conn", "label": self._tr("测试连接", "Test Connection"), "variant": "secondary"},
+                        {"id": "save_config", "label": self._tr("保存", "Save"), "variant": "primary"},
                     ],
                 },
             ]
 
             target_card = {
                 "id": "target-card",
-                "title": "同步目标",
+                "title": self._tr("同步目标", "Sync Destination"),
                 "items": target_items,
             }
             options_card = {
                 "id": "options-card",
-                "title": "同步选项",
+                "title": self._tr("同步选项", "Sync Options"),
                 "items": [
                     self._conflict_policy_item(c),
                     {
                         "kind": "switch",
                         "id": "auto_sync",
-                        "label": "保存笔记后自动同步",
+                        "label": self._tr("保存笔记后自动同步", "Sync Automatically on Save"),
                         "value": c["auto_sync"],
                     },
                 ],
@@ -2597,24 +2741,24 @@ class SyncPlugin:
         last_result = self._get_last_result() or {}
         last_ok = last_result.get("last_success")
         history_meta = (
-            f"上次成功 {last_ok['time']}"
+            self._tr(f"上次成功 {last_ok['time']}", f"Last successful sync: {last_ok['time']}")
             if isinstance(last_ok, dict) and last_ok.get("time")
             else ""
         )
         history_entries = [
-            self._normalize_log(entry)
+            self._log_for_page(entry)
             for entry in self.logs[:6]
             if isinstance(entry, dict)
         ]
         cards.append({
             "id": "history-card",
-            "title": "最近同步记录",
+            "title": self._tr("最近同步记录", "Recent Sync Activity"),
             "meta": history_meta,
             "items": [
                 {
                     "kind": "log_list",
                     "id": "sync_logs",
-                    "empty_text": "暂无同步记录",
+                    "empty_text": self._tr("暂无同步记录", "No sync activity yet"),
                     "entries": history_entries,
                 }
             ],
@@ -2623,14 +2767,16 @@ class SyncPlugin:
         status = self.last_status
         if not status and configured and c == self.config:
             if isinstance(last_ok, dict) and last_ok.get("time"):
-                status = f"上次同步 {last_ok['time']}"
+                status = self._tr(f"上次同步 {last_ok['time']}", f"Last sync: {last_ok['time']}")
             elif last_result.get("summary"):
                 status = str(last_result["summary"])
+                if self._is_en() and last_result.get("locale") != "en" and CHINESE_TEXT.search(status):
+                    status = LOG_STATUS_EN.get(str(last_result.get("status")), "See recent sync activity for the last result")
         return {
-            "title": "同步",
+            "title": self._tr("同步", "Sync"),
             "status": status,
             "header_actions": [
-                {"id": "sync_now", "label": "立即同步", "variant": "primary"},
+                {"id": "sync_now", "label": self._tr("立即同步", "Sync Now"), "variant": "primary"},
             ] if configured else [],
             "cards": cards,
         }
@@ -2685,7 +2831,7 @@ class SyncPlugin:
                             self.config["mirror_dir"] = cfg["mirror_dir"]
                             self.pending_confirm = None
                             self._remote_preview_cache.clear()
-                            self.last_status = "已启用本地镜像目录"
+                            self.last_status = self._tr("已启用本地镜像目录", "Local mirror folder enabled")
                             changed_immediate = True
                     elif cfg["mirror_dir"]:
                         render_status = mirror_err
@@ -2727,7 +2873,7 @@ class SyncPlugin:
                     self._remote_preview_cache.clear()
                 self.config = next_cfg
                 self._save_config(bridge)
-                status = "已保存同步目标配置"
+                status = self._tr("已保存同步目标配置", "Sync destination saved")
                 self.last_status = status
                 ok = True
                 tone = "success"
@@ -2762,7 +2908,7 @@ class SyncPlugin:
                         self._save_config(bridge)
                 err = self._target_error(self.config)
                 if err or not self._selected_notebooks(self.config):
-                    status = err or "请至少选择一个笔记本"
+                    status = err or self._tr("请至少选择一个笔记本", "Select at least one notebook")
                     self.last_status = status
                     ok = False
                     tone = "danger"
@@ -2778,7 +2924,7 @@ class SyncPlugin:
             elif action_id == "confirm_sync":
                 pc = self.pending_confirm
                 if not pc or pc.get("scope_key") != self._result_key():
-                    status = "当前没有待确认的同步计划"
+                    status = self._tr("当前没有待确认的同步计划", "No sync plan is awaiting confirmation")
                     self.last_status = status
                     ok = False
                     tone = "warning"
@@ -2788,8 +2934,14 @@ class SyncPlugin:
                     try:
                         batch = self._compute_batch_plan(bridge, self.config, notebooks, inspect_remote=True, force_refresh=True)
                     except Exception as exc:
-                        msg = f"{self._protocol_label(protocol)}同步未完成: {sanitize_error_text(exc)}"
-                        self._append_log(f"{self._protocol_label(protocol)}同步", "失败", tone="danger", tooltip=msg)
+                        msg = self._tr(
+                            f"{self._protocol_label(protocol)}同步未完成: {self._error_detail(exc)}",
+                            f"{self._protocol_label(protocol)} sync failed: {self._error_detail(exc)}",
+                        )
+                        self._append_log(self._tr(
+                            f"{self._protocol_label(protocol)}同步",
+                            f"{self._protocol_label(protocol)} sync",
+                        ), "失败", tone="danger", tooltip=msg)
                         self._record_result("失败", msg, protocol=protocol)
                         self._save_runtime(bridge)
                         self.last_status = msg
@@ -2797,7 +2949,10 @@ class SyncPlugin:
 
                     if batch.get("remote_error"):
                         msg = batch["remote_error"]
-                        self._append_log(f"{self._protocol_label(batch['protocol'])}同步", "失败", tone="danger", tooltip=msg)
+                        self._append_log(self._tr(
+                            f"{self._protocol_label(batch['protocol'])}同步",
+                            f"{self._protocol_label(batch['protocol'])} sync",
+                        ), "失败", tone="danger", tooltip=msg)
                         self._record_result("失败", msg, protocol=batch["protocol"], target=batch["target_display"])
                         self._save_runtime(bridge)
                         self.last_status = msg
@@ -2807,19 +2962,31 @@ class SyncPlugin:
                         reasons = self._assess_batch_dangerous_changes(batch, self.config)
                         if reasons:
                             self.pending_confirm = self._build_pending_confirm(batch, reasons)
-                            self._append_log(reasons[0], "待确认", tone="warning", tooltip="同步计划已变化，请重新确认")
-                            self._record_result("待确认", "同步计划已变化，请重新确认", protocol=batch["protocol"], target=batch["target_display"])
+                            self._append_log(reasons[0], "待确认", tone="warning", tooltip=self._tr(
+                                "同步计划已变化，请重新确认",
+                                "The sync plan changed. Review and confirm it again.",
+                            ))
+                            self._record_result("待确认", self._tr(
+                                "同步计划已变化，请重新确认",
+                                "The sync plan changed. Review and confirm it again.",
+                            ), protocol=batch["protocol"], target=batch["target_display"])
                             self._save_runtime(bridge)
-                            status = "同步计划已变化，请重新确认"
+                            status = self._tr("同步计划已变化，请重新确认", "The sync plan changed. Review and confirm it again.")
                             self.last_status = status
                             ok = False
                             tone = "warning"
                         else:
                             self.pending_confirm = None
-                            self._append_log("同步计划已变化", "待确认", tone="warning", tooltip="原危险变更已消除，请重新同步")
-                            self._record_result("待确认", "同步计划已变化，请重新同步", protocol=batch["protocol"], target=batch["target_display"])
+                            self._append_log(self._tr("同步计划已变化", "The sync plan changed"), "待确认", tone="warning", tooltip=self._tr(
+                                "原危险变更已消除，请重新同步",
+                                "The original risks are gone. Start sync again.",
+                            ))
+                            self._record_result("待确认", self._tr(
+                                "同步计划已变化，请重新同步",
+                                "The sync plan changed. Start sync again.",
+                            ), protocol=batch["protocol"], target=batch["target_display"])
                             self._save_runtime(bridge)
-                            status = "同步计划已变化，请重新同步"
+                            status = self._tr("同步计划已变化，请重新同步", "The sync plan changed. Start sync again.")
                             self.last_status = status
                             ok = False
                             tone = "warning"
@@ -2827,7 +2994,7 @@ class SyncPlugin:
                         self.pending_confirm = None
                         err = self._target_error(self.config)
                         if err or not self._selected_notebooks(self.config):
-                            status = err or "请至少选择一个笔记本"
+                            status = err or self._tr("请至少选择一个笔记本", "Select at least one notebook")
                             self.last_status = status
                             ok = False
                             tone = "danger"
@@ -2837,15 +3004,18 @@ class SyncPlugin:
                             tone = "success"
             elif action_id == "cancel_confirm":
                 self.pending_confirm = None
-                self._append_log("危险变更同步", "已取消", tone="info", tooltip="用户已取消本次同步")
-                self._record_result("已取消", "用户已取消危险变更")
+                self._append_log(self._tr("危险变更同步", "Sync with risky changes"), "已取消", tone="info", tooltip=self._tr(
+                    "用户已取消本次同步",
+                    "The user canceled this sync",
+                ))
+                self._record_result("已取消", self._tr("用户已取消危险变更", "The user canceled the risky changes"))
                 self._save_runtime(bridge)
-                status = "已取消本次同步"
+                status = self._tr("已取消本次同步", "Sync canceled")
                 self.last_status = status
                 ok = True
                 tone = "info"
             else:
-                status = "已完成操作"
+                status = self._tr("已完成操作", "Action complete")
                 self.last_status = status
                 ok = True
                 tone = "info"
@@ -2880,7 +3050,7 @@ class SyncPlugin:
 
 def main():
     plugin = SyncPlugin()
-    HostBridge().serve(plugin.handle)
+    HostBridge().serve(plugin.handle, plugin._localize_error)
 
 
 if __name__ == "__main__":
