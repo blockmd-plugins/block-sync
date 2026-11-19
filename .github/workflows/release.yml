@@ -34,6 +34,7 @@ jobs:
         run: |
           python3 - <<'PY'
           import json
+          import os
           from collections import deque
           from concurrent.futures import ThreadPoolExecutor
           from pathlib import Path
@@ -44,14 +45,21 @@ jobs:
           from tempfile import TemporaryDirectory
           from threading import Thread
 
-          CHINESE = re.compile(r"[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]")
-          HAN = re.compile(r"[\u4e00-\u9fff]")
-          EMOJI = re.compile(
-              r"[\U0001f000-\U0001faff\u2300-\u23ff\u25aa-\u27ff"
-              r"\u2934\u2935\u2b05-\u2b07\u2b1b\u2b1c\u2b50\u2b55"
-              r"\u3030\u303d\u3297\u3299\u2139\u2194-\u2199"
-              r"\u21a9\u21aa\u00a9\u00ae\u203c\u2049\u2122\ufe0f\u20e3]"
+          CHINESE = re.compile(
+              r"[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+              r"\ufe10-\ufe1f\ufe30-\ufe4f\uff00-\uffef"
+              r"\U00020000-\U0002ffff\U00030000-\U000323af]"
           )
+          HAN = re.compile(
+              r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+              r"\U00020000-\U0002ffff\U00030000-\U000323af]"
+          )
+          EMOJI = re.compile(
+              r"[©®‼⁉™ℹ↔-↙↩↪⌚-⌛⌨⏏⏩-⏳⏸-⏺Ⓜ▪▫▶◀◻-◾"
+              r"\u2600-\u27bf⤴⤵⬅-⬇⬛⬜⭐⭕〰〽㊗㊙"
+              r"\u20e3\ufe00-\ufe0f\U0001f000-\U0001faff]"
+          )
+          MAX_README_BYTES = 512 * 1024
           NOTEBOOK_NAME = "示例笔记本"
           NOTE_NAME = "示例笔记.md"
           LAYOUTS = {
@@ -63,20 +71,59 @@ jobs:
               if not condition:
                   raise ValueError(message)
 
-          def check_text(value, locale, context):
-              # Scan every string, including option details, nested previews, and metrics.
-              # Remove only the names supplied by the host fixture, even within longer text.
+          def check_text(value, locale, context, *, allow_fixture=False):
+              # Scan every string, including option details, nested previews (body/before/after), and metrics.
+              # Remove only the names supplied by the host fixture when checking runtime UI output.
               if isinstance(value, str):
-                  value = value.replace(NOTEBOOK_NAME, "").replace(NOTE_NAME, "")
+                  if allow_fixture:
+                      value = value.replace(NOTEBOOK_NAME, "").replace(NOTE_NAME, "")
                   require(not EMOJI.search(value), f"{context}: emoji in {value!r}")
                   if locale.lower().startswith("en"):
                       require(not CHINESE.search(value), f"{context}: Chinese text in {value!r}")
               elif isinstance(value, dict):
                   for key, child in value.items():
-                      check_text(child, locale, f"{context}.{key}")
+                      check_text(key, "zh", f"{context}.<key>", allow_fixture=False)
+                      check_text(child, locale, f"{context}.{key}", allow_fixture=allow_fixture)
               elif isinstance(value, list):
                   for index, child in enumerate(value):
-                      check_text(child, locale, f"{context}[{index}]")
+                      check_text(child, locale, f"{context}[{index}]", allow_fixture=allow_fixture)
+
+          def check_contributes_en(value, context="manifest.contributes"):
+              if isinstance(value, dict):
+                  for key, child in value.items():
+                      if key == "en":
+                          check_text(child, "en", f"{context}.en")
+                      else:
+                          check_contributes_en(child, f"{context}.{key}")
+              elif isinstance(value, list):
+                  for index, child in enumerate(value):
+                      check_contributes_en(child, f"{context}[{index}]")
+
+          def declared_surfaces(manifest):
+              surfaces = list(manifest.get("surfaces") or [])
+              contributes = manifest.get("contributes") or {}
+              for sec in contributes.get("settings_sections") or []:
+                  surfaces.append(f"settings_section:{sec['id']}")
+              for panel in contributes.get("panels") or []:
+                  surfaces.append(f"panel:{panel['id']}")
+              for dialog in contributes.get("dialogs") or []:
+                  surfaces.append(f"dialog:{dialog['id']}")
+              require(surfaces, "manifest must declare at least one surface")
+              return list(dict.fromkeys(surfaces))
+
+          def read_strict_readme(repo, filename):
+              path = repo / filename
+              p = str(path)
+              require(not os.path.islink(p) and os.path.isfile(p), f"{filename} must be a non-symlink regular file")
+              raw = path.read_bytes()
+              require(len(raw) <= MAX_README_BYTES, f"{filename} exceeds {MAX_README_BYTES} bytes")
+              try:
+                  text = raw.decode("utf-8")
+              except UnicodeDecodeError as exc:
+                  raise ValueError(f"{filename} must be valid UTF-8: {exc}") from None
+              text = text.lstrip("\ufeff").strip()
+              require(bool(text), f"{filename} must not be empty")
+              return text
 
           def controls(value):
               if isinstance(value, dict):
@@ -92,17 +139,18 @@ jobs:
                   for child in value:
                       yield from controls(child)
 
-          def check_renders(rpc, locale, base):
+          def check_renders(rpc, locale, surface, base):
               pending = deque([{}])
               seen = {()}
               count = 0
               while pending:
                   values = pending.popleft()
-                  page = rpc("plugin.render", {"values": {**base, **values}})["page"]
-                  context = f"{locale} render {values}"
-                  check_text(page, locale, context)
+                  page = rpc("plugin.render", {"surface": surface, "values": {**base, **values}})["page"]
+                  context = f"{locale} {surface} render {values}"
+                  check_text(page, locale, context, allow_fixture=True)
                   rendered = list(controls(page))
-                  require(rendered, f"{context}: no controls found")
+                  if surface == "settings_page":
+                      require(rendered, f"{context}: no controls found")
                   # Include defaults before varying a control so each request is explicit.
                   state = {**values, **{key: current for key, current, _ in rendered}}
                   for key, current, choices in rendered:
@@ -117,7 +165,7 @@ jobs:
                   count += 1
               return count
 
-          def run_plugin(entry, locale, layout, capabilities, root, actions=False):
+          def run_plugin(entry, locale, layout, capabilities, root, surfaces, actions=False):
               notebook = root / NOTEBOOK_NAME
               downloads = root / "Downloads"
               data_dir = root / "Data"
@@ -196,19 +244,22 @@ jobs:
                       "notebook_root": str(notebook), "ui_capabilities": capabilities,
                   })
                   require(init.get("ready") is True, f"{locale}/{layout}: plugin is not ready")
-                  initial = rpc("plugin.render")["page"]
-                  check_text(initial, locale, f"{locale}/{layout} initial page")
-                  title = initial.get("title")
-                  require(isinstance(title, str) and title.strip(), f"{locale}/{layout}: missing page title")
                   # Only render these remote destinations. Actions below use local folders.
                   base = {"webdav_url": "https://dav.example.invalid", "git_remote": str(root / "repo")}
-                  count = 1 + check_renders(rpc, locale, base)
-                  print(f"{locale}/{layout}: {count} renders passed")
+                  pages_by_surface = {}
+                  for surface in surfaces:
+                      initial = rpc("plugin.render", {"surface": surface})["page"]
+                      check_text(initial, locale, f"{locale}/{layout} {surface} initial page", allow_fixture=True)
+                      title = initial.get("title")
+                      require(isinstance(title, str) and title.strip(), f"{locale}/{layout} {surface}: missing page title")
+                      pages_by_surface[surface] = initial
+                      count = 1 + check_renders(rpc, locale, surface, base)
+                      print(f"{locale}/{layout} {surface}: {count} renders passed")
                   if actions:
                       check_actions(rpc, locale, notebook, mirror, notes)
                   require(rpc("plugin.shutdown").get("ok") is True, f"{locale}/{layout}: shutdown failed")
                   require(process.wait(timeout=10) == 0, f"{locale}/{layout}: plugin exited unsuccessfully")
-                  return title
+                  return pages_by_surface
               finally:
                   if process.poll() is None:
                       process.kill()
@@ -228,8 +279,8 @@ jobs:
                   require(result.get("status"), f"{context}: missing status")
                   if tone is not None:
                       require(result.get("tone") == tone, f"{context}: expected {tone} tone")
-                  check_text(result["status"], locale, f"{context}.status")
-                  check_text(result["page"], locale, f"{context}.page")
+                  check_text(result["status"], locale, f"{context}.status", allow_fixture=True)
+                  check_text(result["page"], locale, f"{context}.page", allow_fixture=True)
                   count += 1
                   return result["page"]
 
@@ -261,25 +312,36 @@ jobs:
           def main():
               repo = Path.cwd()
               manifest = json.loads((repo / "manifest.json").read_text(encoding="utf-8"))
-              for field in ("name", "summary"):
-                  for locale in ("zh", "en"):
-                      value = manifest[field][locale]
-                      require(isinstance(value, str) and value.strip(), f"Missing manifest.{field}.{locale}")
-              check_text(manifest, "zh", "manifest")
+              plugin_id = manifest.get("id")
+              require(isinstance(plugin_id, str) and plugin_id.strip(), "Missing manifest.id")
+              require(plugin_id.strip() != "block-diagnostics", "Reserved plugin id: block-diagnostics")
 
-              zh_readme = (repo / "README.md").read_text(encoding="utf-8").strip()
-              en_readme = (repo / "README.en.md").read_text(encoding="utf-8").strip()
-              require(zh_readme and HAN.search(zh_readme), "README.md must contain Chinese text")
-              require(en_readme and not CHINESE.search(en_readme), "README.en.md must contain English-only text")
+              for field in ("name", "summary"):
+                  translations = manifest.get(field)
+                  require(isinstance(translations, dict), f"manifest.{field} must be an object")
+                  for locale in ("zh", "en"):
+                      value = translations.get(locale)
+                      require(isinstance(value, str) and value.strip(), f"Missing manifest.{field}.{locale}")
+                      if locale == "en":
+                          require(not CHINESE.search(value), f"manifest.{field}.en: Chinese text in {value!r}")
+              check_text(manifest, "zh", "manifest")
+              check_contributes_en(manifest.get("contributes"))
+
+              zh_readme = read_strict_readme(repo, "README.md")
+              en_readme = read_strict_readme(repo, "README.en.md")
+              require(HAN.search(zh_readme), "README.md must contain Chinese text")
+              require(not CHINESE.search(en_readme), "README.en.md must contain English-only text")
+              require(re.search(r"[A-Za-z]", en_readme), "README.en.md must contain at least one ASCII letter")
               require(zh_readme != en_readme, "The two README files must differ")
 
+              surfaces = declared_surfaces(manifest)
               entry = manifest["entry"]["command"]
               entry = [str(repo / part) if (repo / part).is_file() else part for part in entry]
               def run_case(case):
                   layout, capabilities, locale = case
                   with TemporaryDirectory(prefix="block-sync-i18n-") as temp:
                       return (layout, locale), run_plugin(
-                          entry, locale, layout, capabilities, Path(temp), actions=(layout == "form")
+                          entry, locale, layout, capabilities, Path(temp), surfaces, actions=(layout == "form")
                       )
 
               cases = [
@@ -288,9 +350,18 @@ jobs:
                   for locale in ("zh", "en")
               ]
               with ThreadPoolExecutor(max_workers=len(cases)) as pool:
-                  titles = dict(pool.map(run_case, cases))
+                  pages_by_case = dict(pool.map(run_case, cases))
               for layout in LAYOUTS:
-                  require(titles[(layout, "zh")] != titles[(layout, "en")], f"{layout}: Chinese and English page titles must differ")
+                  for surface in surfaces:
+                      require(
+                          pages_by_case[(layout, "zh")][surface]["title"]
+                          != pages_by_case[(layout, "en")][surface]["title"],
+                          f"{layout} {surface}: Chinese and English page titles must differ",
+                      )
+                      require(
+                          pages_by_case[(layout, "zh")][surface] != pages_by_case[(layout, "en")][surface],
+                          f"{layout} {surface}: Chinese and English rendered pages must differ",
+                      )
               print("Bilingual release gate passed; no Chinese text found in English plugin output.")
 
           try:
