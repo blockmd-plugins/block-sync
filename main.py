@@ -4,12 +4,17 @@
 import base64
 from datetime import datetime
 import hashlib
+import html
 import json
 import os
+import posixpath
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -21,6 +26,7 @@ VALID_CONFLICT_POLICIES = ("keep_both", "remote_first", "local_first")
 VALID_GIT_AUTHS = ("ssh", "token")
 DELETE_GUARD_THRESHOLD = 5
 MAX_LOG_ENTRIES = 20
+LAYOUTS_META_KEY = "notebook_layouts"
 
 DEFAULT_CONFIG = {
     "selected_notebooks": [],
@@ -110,7 +116,7 @@ def conflict_stamp():
 
 
 def is_safe_rel_path(rel_path):
-    if not rel_path or rel_path.startswith("/") or rel_path.startswith("\\"):
+    if not rel_path or "\x00" in rel_path or rel_path.startswith(("/", "\\")):
         return False
     norm = rel_path.replace("\\", "/")
     parts = norm.split("/")
@@ -120,19 +126,69 @@ def is_safe_rel_path(rel_path):
 
 
 def is_safe_rel_md(rel_path):
-    return is_safe_rel_path(rel_path) and rel_path.replace("\\", "/").endswith(".md")
+    return is_safe_rel_path(rel_path) and os.path.splitext(rel_path)[1].lower() in {
+        ".md", ".markdown", ".mdown", ".mkd", ".mkdn", ".mdwn", ".mdtxt", ".mdtext", ".mdx",
+    }
 
 
 def is_safe_rel_asset(rel_path):
-    norm = rel_path.replace("\\", "/")
-    return is_safe_rel_path(norm) and norm.startswith("assets/")
+    return "\\" not in rel_path and is_safe_rel_path(rel_path) and "assets" in rel_path.split("/")[:-1]
+
+
+def sync_dir_key(name):
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def in_sync_subdir(rel_path, subdirs):
+    return sync_dir_key(rel_path.split("/", 1)[0]) in subdirs
+
+
+def note_asset_paths(note_path, text):
+    # Block emits Markdown links/images and HTML src attributes for resized media.
+    fence = ""
+    visible = []
+    for line in text.splitlines():
+        marker = re.match(r"^\s*(\x60{3,}|~{3,})(.*)$", line)
+        if fence:
+            if marker and marker[1].startswith(fence) and not marker[2].strip():
+                fence = ""
+            visible.append("")
+        elif marker:
+            fence = marker[1]
+            visible.append("")
+        else:
+            visible.append(re.sub(
+                r"(\x60+)(?!\x60)(.+?)(?<!\x60)\1(?!\x60)",
+                lambda span: " " * len(span[0]), line,
+            ))
+    text = "\n".join(visible)
+    bare_dest = r"(?:\\.|[^\s()<>\\]|\((?:\\.|[^\s()<>\\])*\))+"
+    link_dest = rf"<([^>\n]+)>|({bare_dest})"
+    links = re.findall(rf"\]\(\s*(?:{link_dest})(?=[\s)])", text)
+    refs = re.findall(
+        rf"(?m)^ {{0,3}}\[(?:\\.|[^\]\\\n])+\]:[ \t]*(?:\r?\n[ \t]*)?(?:{link_dest})(?=[ \t\r]|$)",
+        text,
+    )
+    attrs = re.findall(r"""(?is)\b(?:src|href)\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))""", text)
+    note_dir = posixpath.dirname(note_path)
+    paths = set()
+    for dest in (*links, *refs, *attrs):
+        value = html.unescape(next(part for part in dest if part))
+        value = re.sub(r"\\([()<>])", r"\1", value)
+        decoded = urllib.parse.unquote(value.split("#", 1)[0].split("?", 1)[0])
+        for candidate in {value, decoded}:
+            if candidate.startswith(("/", "\\")) or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", candidate):
+                continue
+            rel_path = posixpath.normpath(posixpath.join(note_dir, candidate))
+            if is_safe_rel_asset(rel_path):
+                paths.add(rel_path)
+    return paths
 
 
 def make_conflict_path(rel_path, stamp):
     norm = rel_path.replace("\\", "/")
-    if norm.endswith(".md"):
-        return f"{norm[:-3]}.conflict-{stamp}.md"
-    return f"{norm}.conflict-{stamp}.md"
+    stem, extension = os.path.splitext(norm)
+    return f"{stem}.conflict-{stamp}{extension or '.md'}"
 
 
 def sanitize_error_text(exc):
@@ -261,49 +317,119 @@ class SyncPlugin:
             return [active_norm] if active_norm else []
         return out
 
-    def _notebook_subdir_map(self, notebooks, protocol, target_base):
-        """Assign stable, collision-free subdirectories per notebook.
+    def _legacy_root_owner(self, protocol, target_bases):
+        candidates = []
+        for nb, cfg in self.notebook_configs.items():
+            if nb == "default" or cfg.get("protocol") != protocol:
+                continue
+            selected = cfg.get("selected_notebooks")
+            if selected and selected != [nb]:
+                continue
+            if self._sync_target_base(cfg) in target_bases:
+                candidates.append(nb)
+        if len(candidates) == 1:
+            return candidates[0]
+        if not candidates and len(self.known_notebooks) == 1:
+            return self.known_notebooks[0]["path"]
+        raise RuntimeError("旧同步根目录缺少唯一的笔记本归属，无法安全继续同步")
 
-        Preserves legacy root layout when only one notebook is selected and it
-        has not been synced under a subdirectory yet.
-        """
-        if not notebooks:
-            return {}
-        clean_names = {}
+    def _valid_sync_subdir(self, subdir):
+        return is_safe_rel_path(subdir) and "/" not in subdir and "\\" not in subdir
+
+    def _notebook_subdir_map(self, notebooks, protocol, target_bases):
+        layout_key = f"{protocol}:{target_bases[0]}"
+        layouts = self.sync_meta.get(LAYOUTS_META_KEY, {})
+        stored = layouts.get(layout_key, {}) if isinstance(layouts, dict) else {}
+        bindings = dict(stored) if isinstance(stored, dict) else {}
+        for subdir in bindings.values():
+            if not isinstance(subdir, str) or (subdir and not self._valid_sync_subdir(subdir)):
+                raise RuntimeError("保存的笔记本同步目录无效")
+        historical = {}
+        legacy_root = False
+        marker = f"|{protocol}:"
+        legacy_keys = {f"{protocol}:{base}" for base in target_bases}
+        for key, entry in self.sync_meta.items():
+            if not isinstance(entry, dict):
+                continue
+            if key in legacy_keys:
+                legacy_root = True
+                continue
+            if not key.startswith("nb:") or marker not in key:
+                continue
+            nb, location = key[3:].rsplit(marker, 1)
+            for base in target_bases:
+                if location == base:
+                    historical.setdefault(nb, set()).add("")
+                    break
+                if location.startswith(base + "::"):
+                    subdir = location[len(base) + 2:]
+                    if self._valid_sync_subdir(subdir):
+                        historical.setdefault(nb, set()).add(subdir)
+                    break
+
+        if legacy_root and not any("" in dirs for dirs in historical.values()) and "" not in bindings.values():
+            owner = self._legacy_root_owner(protocol, target_bases)
+            historical.setdefault(owner, set()).add("")
+
+        # Reserve old directories even after their owners are deselected.
+        owners = {}
+        for nb in set(bindings) | set(historical):
+            dirs = set(historical.get(nb, ()))
+            if nb in bindings:
+                dirs.add(bindings[nb])
+            for subdir in dirs:
+                folded = sync_dir_key(subdir)
+                if folded in owners and owners[folded] != nb:
+                    raise RuntimeError("同步目标的旧路径被多个笔记本共用，无法安全继续同步")
+                owners[folded] = nb
+            if nb not in bindings:
+                if "" in dirs:
+                    bindings[nb] = ""
+                elif len(dirs) == 1:
+                    bindings[nb] = next(iter(dirs))
+                elif nb in notebooks:
+                    raise RuntimeError(f"笔记本「{self._notebook_label(nb)}」有多个旧同步目录，无法安全选择")
+
+        if not owners and len(notebooks) == 1:
+            bindings[notebooks[0]] = ""
+            return layout_key, bindings, set()
+
+        names = {}
         name_counts = {}
         for nb in notebooks:
-            base = os.path.basename(nb) or "notebook"
-            safe = "".join(ch if ch not in ("/", "\\", "\x00") else "-" for ch in base).strip().strip(".") or "notebook"
-            clean_names[nb] = safe
-            name_counts[safe] = name_counts.get(safe, 0) + 1
+            if nb in bindings:
+                continue
+            name = os.path.basename(nb).strip().strip(".") or "notebook"
+            name = name.replace("\\", "-")
+            names[nb] = name
+            folded = sync_dir_key(name)
+            name_counts[folded] = name_counts.get(folded, 0) + 1
 
-        subdirs = {}
-        for nb in notebooks:
-            safe = clean_names[nb]
-            if name_counts[safe] > 1:
-                subdirs[nb] = f"{safe}-{sha256_text(nb)[:4]}"
-            else:
-                subdirs[nb] = safe
+        for nb, name in sorted(names.items()):
+            folded = sync_dir_key(name)
+            # Beside a legacy root, an ordinary folder name can belong to that notebook.
+            if "" in owners or folded in owners or folded == "assets" or name_counts[folded] > 1:
+                name = f"{name}-{sha256_text(nb)[:8]}"
+                folded = sync_dir_key(name)
+            suffix = 2
+            subdir = name
+            while folded in owners:
+                subdir = f"{name}-{suffix}"
+                folded = sync_dir_key(subdir)
+                suffix += 1
+            bindings[nb] = subdir
+            owners[folded] = nb
 
-        if len(notebooks) == 1:
-            nb = notebooks[0]
-            sub = subdirs[nb]
-            sub_meta = self._meta_key(protocol, f"{target_base}::{sub}", nb_key=nb)
-            if sub_meta in self.sync_meta:
-                return {nb: sub}
-            return {nb: ""}
-
-        return subdirs
+        return layout_key, bindings, set(owners) - {""}
 
     def _meta_key(self, protocol, target_id, nb_key=None):
         nb = nb_key or self._notebook_key()
         return f"nb:{nb}|{protocol}:{target_id}"
 
-    def _get_base_map(self, meta_key, legacy_key=None):
-        if meta_key in self.sync_meta and isinstance(self.sync_meta[meta_key], dict):
-            return dict(self.sync_meta[meta_key])
-        if legacy_key and legacy_key in self.sync_meta and isinstance(self.sync_meta[legacy_key], dict):
-            return dict(self.sync_meta[legacy_key])
+    def _get_base_map(self, *keys):
+        for key in keys:
+            if isinstance(self.sync_meta.get(key), dict):
+                return dict(self.sync_meta[key])
         return {}
 
     def _load_state(self, bridge):
@@ -670,7 +796,7 @@ class SyncPlugin:
         paths = []
         for item in listed:
             rel_path = str(item.get("path") or "").replace("\\", "/")
-            if is_safe_rel_md(rel_path):
+            if is_safe_rel_md(rel_path) and not is_safe_rel_asset(rel_path):
                 paths.append(rel_path)
         return sorted(set(paths))
 
@@ -691,51 +817,80 @@ class SyncPlugin:
             notes[rel_path] = str(res.get("content") or "")
         return notes
 
-    def _write_local_note(self, bridge, rel_path, content, nb_root=None):
-        params = {"path": rel_path, "content": content}
+    def _write_local_note(self, bridge, rel_path, content, nb_root=None, expected_revision=""):
+        params = {"path": rel_path, "content": content, "expected_revision": expected_revision}
         if nb_root and self.supports_multi_notebook:
             params["notebook_root"] = nb_root
         bridge.call_host("host.notes.write", params)
 
-    def _read_local_assets(self, nb_root=None):
-        assets = {}
-        root_dir = nb_root or self.notebook_root
-        if not root_dir:
-            return assets
+    def _asset_file(self, root_dir, rel_path):
+        if not is_safe_rel_asset(rel_path):
+            raise ValueError(f"无效的附件路径：{rel_path}")
         root_real = os.path.realpath(root_dir)
-        assets_dir = os.path.join(root_real, "assets")
-        if not os.path.isdir(assets_dir):
-            return assets
-        for root, dirs, files in os.walk(assets_dir):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
-            for name in files:
-                if name.startswith("."):
-                    continue
-                full = os.path.join(root, name)
-                real_full = os.path.realpath(full)
-                if not real_full.startswith(root_real + os.sep):
-                    continue
-                rel = os.path.relpath(real_full, root_real).replace(os.sep, "/")
-                if not is_safe_rel_asset(rel):
-                    continue
-                with open(real_full, "rb") as fh:
-                    assets[rel] = fh.read()
-        return assets
+        path = os.path.join(root_real, *rel_path.split("/"))
+        if not os.path.realpath(path).startswith(root_real + os.sep):
+            raise ValueError(f"附件路径超出同步目录：{rel_path}")
+        return path
 
-    def _write_local_asset(self, rel_asset_path, data, nb_root=None):
-        root_dir = nb_root or self.notebook_root
-        if not root_dir or not is_safe_rel_asset(rel_asset_path):
-            return False
-        root_real = os.path.realpath(root_dir)
-        dest = os.path.normpath(os.path.join(root_real, *rel_asset_path.split("/")))
-        if not dest.startswith(root_real + os.sep):
-            return False
-        parent = os.path.dirname(dest)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(dest, "wb") as fh:
-            fh.write(data)
-        return True
+    def _read_asset_file(self, root_dir, rel_path):
+        try:
+            with open(self._asset_file(root_dir, rel_path), "rb") as fh:
+                return fh.read()
+        except FileNotFoundError:
+            return None
+
+    def _list_dir_assets(self, root_dir, excluded_subdirs=()):
+        names = set()
+        for root, dirs, files in os.walk(root_dir):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            if root == root_dir:
+                dirs[:] = [d for d in dirs if sync_dir_key(d) not in excluded_subdirs]
+            for name in files:
+                rel = os.path.relpath(os.path.join(root, name), root_dir).replace(os.sep, "/")
+                if is_safe_rel_asset(rel):
+                    names.add(rel)
+        return names
+
+    def _sync_assets(self, paths, read_local, read_remote, write_local, write_remote, policy):
+        synced = 0
+        for rel in sorted(paths):
+            local_data = read_local(rel)
+            remote_data = read_remote(rel)
+            if local_data == remote_data:
+                continue
+            if local_data is None or (remote_data is not None and policy == "remote_first"):
+                write_local(rel, remote_data)
+            else:
+                if remote_data is not None and policy == "keep_both":
+                    stem, ext = posixpath.splitext(rel)
+                    fingerprint = sha256_bytes(remote_data)[:16]
+                    suffix = ""
+                    attempt = 1
+                    while True:
+                        copy_rel = f"{stem}.conflict-{fingerprint}{suffix}{ext}"
+                        local_copy = read_local(copy_rel)
+                        remote_copy = read_remote(copy_rel)
+                        if local_copy in (None, remote_data) and remote_copy in (None, remote_data):
+                            break
+                        attempt += 1
+                        suffix = f"-{attempt}"
+
+                    # Keep a copy on each side before replacing the original. The
+                    # content-based name also works when just one copy was saved.
+                    if local_copy is None:
+                        write_local(copy_rel, remote_data)
+                    if remote_copy is None:
+                        write_remote(copy_rel, remote_data)
+                write_remote(rel, local_data)
+            synced += 1
+        return synced
+
+    def _asset_paths_for_sync(self, root_dir, paths, excluded_subdirs):
+        local_paths = self._list_dir_assets(root_dir) if paths is None else paths
+        for rel in local_paths:
+            if in_sync_subdir(rel, excluded_subdirs):
+                raise RuntimeError(f"附件路径与其他笔记本的同步目录重叠：{rel}")
+        return local_paths
 
     def _check_delete_guard(self, base_map, local_notes, remote_notes, only_path=None):
         if only_path is not None or not self.config.get("delete_guard", True):
@@ -780,44 +935,21 @@ class SyncPlugin:
         conflict_rel = make_conflict_path(rel_path, conflict_stamp())
         return "keep_both", local_text, (conflict_rel, remote_text), local_hash
 
-    def _sync_local_dir_assets(self, remote_dir, nb_root=None):
+    def _sync_local_dir_assets(self, remote_dir, nb_root=None, paths=None, excluded_subdirs=(), cfg=None):
+        c = cfg or self.config
         root_dir = nb_root or self.notebook_root
-        if not self.config.get("sync_assets", True) or not root_dir:
+        if not c.get("sync_assets", True) or not root_dir:
             return 0
-        local_assets = self._read_local_assets(nb_root=root_dir)
-        remote_assets = {}
-        assets_dir = os.path.join(remote_dir, "assets")
-        if os.path.isdir(assets_dir):
-            for root, dirs, files in os.walk(assets_dir):
-                dirs[:] = [d for d in dirs if not d.startswith(".")]
-                for name in files:
-                    if name.startswith("."):
-                        continue
-                    full = os.path.join(root, name)
-                    rel = os.path.relpath(full, remote_dir).replace(os.sep, "/")
-                    if is_safe_rel_asset(rel):
-                        with open(full, "rb") as fh:
-                            remote_assets[rel] = fh.read()
-
-        policy = self.config.get("conflict_policy", "keep_both")
-        synced = 0
-        for rel in sorted(set(local_assets.keys()) | set(remote_assets.keys())):
-            in_local = rel in local_assets
-            in_remote = rel in remote_assets
-            if in_local and not in_remote:
-                self._write_mirror_bytes(remote_dir, rel, local_assets[rel])
-                synced += 1
-            elif in_remote and not in_local:
-                if self._write_local_asset(rel, remote_assets[rel], nb_root=root_dir):
-                    synced += 1
-            elif sha256_bytes(local_assets[rel]) != sha256_bytes(remote_assets[rel]):
-                if policy == "remote_first":
-                    if self._write_local_asset(rel, remote_assets[rel], nb_root=root_dir):
-                        synced += 1
-                else:
-                    self._write_mirror_bytes(remote_dir, rel, local_assets[rel])
-                    synced += 1
-        return synced
+        local_paths = self._asset_paths_for_sync(root_dir, paths, excluded_subdirs)
+        candidates = local_paths if paths is not None else local_paths | self._list_dir_assets(remote_dir, excluded_subdirs)
+        return self._sync_assets(
+            candidates,
+            lambda rel: self._read_asset_file(root_dir, rel),
+            lambda rel: self._read_asset_file(remote_dir, rel),
+            lambda rel, data: self._write_mirror_bytes(root_dir, rel, data),
+            lambda rel, data: self._write_mirror_bytes(remote_dir, rel, data),
+            c.get("conflict_policy", "keep_both"),
+        )
 
     # ---------- Local Mirror Mode ----------
 
@@ -833,11 +965,13 @@ class SyncPlugin:
         except Exception as exc:
             return False, f"目录镜像不可写: {sanitize_error_text(exc)}"
 
-    def _scan_mirror_files(self, mirror_dir, only_path=None, scope=None):
+    def _scan_mirror_files(self, mirror_dir, only_path=None, scope=None, excluded_subdirs=()):
         remote_files = {}
         if not os.path.isdir(mirror_dir):
             return remote_files
         if only_path:
+            if is_safe_rel_asset(only_path) or in_sync_subdir(only_path, excluded_subdirs):
+                return remote_files
             candidate = os.path.join(mirror_dir, *only_path.split("/"))
             if os.path.isfile(candidate):
                 with open(candidate, "r", encoding="utf-8", errors="replace") as fh:
@@ -845,13 +979,15 @@ class SyncPlugin:
             return remote_files
 
         for root, dirs, files in os.walk(mirror_dir):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d != "assets"]
+            if root == mirror_dir:
+                dirs[:] = [d for d in dirs if sync_dir_key(d) not in excluded_subdirs]
             for name in files:
-                if name.startswith(".") or not name.endswith(".md"):
+                if name.startswith("."):
                     continue
                 full = os.path.join(root, name)
                 rel = os.path.relpath(full, mirror_dir).replace(os.sep, "/")
-                if not is_safe_rel_md(rel) or not self._matches_scope(rel, scope):
+                if not is_safe_rel_md(rel) or in_sync_subdir(rel, excluded_subdirs) or not self._matches_scope(rel, scope):
                     continue
                 with open(full, "r", encoding="utf-8", errors="replace") as fh:
                     remote_files[rel] = fh.read()
@@ -866,12 +1002,18 @@ class SyncPlugin:
             fh.write(content)
 
     def _write_mirror_bytes(self, mirror_dir, rel_path, data):
-        dest = os.path.join(mirror_dir, *rel_path.split("/"))
+        dest = self._asset_file(mirror_dir, rel_path)
         parent = os.path.dirname(dest)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(dest, "wb") as fh:
-            fh.write(data)
+        os.makedirs(parent, exist_ok=True)
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=parent, prefix=".block-sync-", delete=False) as fh:
+                temp_path = fh.name
+                fh.write(data)
+            os.replace(temp_path, dest)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
 
     def _sync_local_mirror(self, bridge, only_path=None):
         mirror_dir = self._resolve_mirror_dir()
@@ -1004,13 +1146,13 @@ class SyncPlugin:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, resp.read()
 
-    def _webdav_ensure_dir(self, root_url, dir_rel):
+    def _webdav_ensure_dir(self, root_url, dir_rel, cfg=None):
         parts = [p for p in dir_rel.strip("/").split("/") if p and p not in (".", "..")]
         cur = root_url
         for part in parts:
             cur = cur + urllib.parse.quote(part) + "/"
             try:
-                self._webdav_request("MKCOL", cur)
+                self._webdav_request("MKCOL", cur, cfg=cfg)
             except urllib.error.HTTPError as exc:
                 if exc.code not in (405, 301, 302, 409):
                     raise
@@ -1039,7 +1181,7 @@ class SyncPlugin:
         except Exception as exc:
             return False, f"WebDAV 连接不可达: {sanitize_error_text(exc)}"
 
-    def _webdav_list_files(self, base_url, filter_fn, cfg=None, timeout=6):
+    def _webdav_list_files(self, base_url, filter_fn, cfg=None, timeout=6, excluded_subdirs=(), skip_assets=False):
         root_parsed = urllib.parse.urlparse(base_url)
         root_path = urllib.parse.unquote(root_parsed.path).rstrip("/") + "/"
         if not root_path.startswith("/"):
@@ -1088,10 +1230,12 @@ class SyncPlugin:
                     continue
 
                 rel = href_path[len(root_path):].lstrip("/")
-                if not rel:
+                if not rel or in_sync_subdir(rel, excluded_subdirs):
                     continue
                 if is_col or href_text.endswith("/"):
-                    rel_dir = rel.strip("/")
+                    rel_dir = rel.rstrip("/")
+                    if skip_assets and "assets" in rel_dir.split("/"):
+                        continue
                     if any(part.startswith(".") for part in rel_dir.split("/") if part):
                         continue
                     if norm_dir not in visited and len(visited) + len(queue) < max_dirs:
@@ -1109,13 +1253,13 @@ class SyncPlugin:
 
         return sorted(set(items))
 
-    def _webdav_ensure_parents(self, base_url, rel_path):
+    def _webdav_ensure_parents(self, base_url, rel_path, cfg=None):
         parts = rel_path.split("/")[:-1]
         cur = base_url
         for part in parts:
             cur = cur + urllib.parse.quote(part) + "/"
             try:
-                self._webdav_request("MKCOL", cur)
+                self._webdav_request("MKCOL", cur, cfg=cfg)
             except urllib.error.HTTPError as exc:
                 if exc.code not in (405, 301, 302, 409):
                     raise
@@ -1131,62 +1275,52 @@ class SyncPlugin:
                 return False, b""
             raise
 
-    def _webdav_put_text(self, base_url, rel_path, content):
-        self._webdav_ensure_parents(base_url, rel_path)
+    def _webdav_put_text(self, base_url, rel_path, content, cfg=None):
+        self._webdav_ensure_parents(base_url, rel_path, cfg=cfg)
         file_url = base_url + "/".join(urllib.parse.quote(p) for p in rel_path.split("/"))
         self._webdav_request(
             "PUT",
             file_url,
             body=content.encode("utf-8"),
             extra_headers={"Content-Type": "text/markdown; charset=utf-8"},
+            cfg=cfg,
         )
 
-    def _webdav_put_bytes(self, base_url, rel_path, data):
-        self._webdav_ensure_parents(base_url, rel_path)
+    def _webdav_put_bytes(self, base_url, rel_path, data, cfg=None):
+        self._webdav_ensure_parents(base_url, rel_path, cfg=cfg)
         file_url = base_url + "/".join(urllib.parse.quote(p) for p in rel_path.split("/"))
         self._webdav_request(
             "PUT",
             file_url,
             body=data,
             extra_headers={"Content-Type": "application/octet-stream"},
+            cfg=cfg,
         )
 
-    def _sync_webdav_assets(self, base_url, nb_root=None):
+    def _sync_webdav_assets(self, base_url, nb_root=None, paths=None, excluded_subdirs=(), cfg=None):
+        c = cfg or self.config
         root_dir = nb_root or self.notebook_root
-        if not self.config.get("sync_assets", True) or not root_dir:
+        if not c.get("sync_assets", True) or not root_dir:
             return 0
-        local_assets = self._read_local_assets(nb_root=root_dir)
-        assets_url = base_url + "assets/"
-        remote_asset_names = self._webdav_list_files(assets_url, lambda p: is_safe_rel_path(p) and not p.endswith("/"))
-        remote_assets = {}
-        for name in remote_asset_names:
-            rel = f"assets/{name}"
-            if not is_safe_rel_asset(rel):
-                continue
-            file_url = assets_url + "/".join(urllib.parse.quote(p) for p in name.split("/"))
-            found, data = self._webdav_get_bytes(file_url)
-            if found:
-                remote_assets[rel] = data
+        candidates = self._asset_paths_for_sync(root_dir, paths, excluded_subdirs)
+        if paths is None:
+            candidates.update(self._webdav_list_files(
+                base_url, is_safe_rel_asset, cfg=c, excluded_subdirs=excluded_subdirs,
+            ))
 
-        policy = self.config.get("conflict_policy", "keep_both")
-        synced = 0
-        for rel in sorted(set(local_assets.keys()) | set(remote_assets.keys())):
-            in_local = rel in local_assets
-            in_remote = rel in remote_assets
-            if in_local and not in_remote:
-                self._webdav_put_bytes(base_url, rel, local_assets[rel])
-                synced += 1
-            elif in_remote and not in_local:
-                if self._write_local_asset(rel, remote_assets[rel], nb_root=root_dir):
-                    synced += 1
-            elif sha256_bytes(local_assets[rel]) != sha256_bytes(remote_assets[rel]):
-                if policy == "remote_first":
-                    if self._write_local_asset(rel, remote_assets[rel], nb_root=root_dir):
-                        synced += 1
-                else:
-                    self._webdav_put_bytes(base_url, rel, local_assets[rel])
-                    synced += 1
-        return synced
+        def read_remote(rel):
+            file_url = base_url + "/".join(urllib.parse.quote(p) for p in rel.split("/"))
+            found, data = self._webdav_get_bytes(file_url, cfg=c)
+            return data if found else None
+
+        return self._sync_assets(
+            candidates,
+            lambda rel: self._read_asset_file(root_dir, rel),
+            read_remote,
+            lambda rel, data: self._write_mirror_bytes(root_dir, rel, data),
+            lambda rel, data: self._webdav_put_bytes(base_url, rel, data, cfg=c),
+            c.get("conflict_policy", "keep_both"),
+        )
 
     def _sync_webdav(self, bridge, only_path=None):
         root_url = self._webdav_root_url()
@@ -1324,24 +1458,42 @@ class SyncPlugin:
             timeout=timeout,
         )
 
-    def _resolve_local_git_dir(self, cfg=None):
-        c = cfg or self.config
-        target = str(c.get("git_remote") or "").strip()
+    def _git_repo_dirs(self, cfg):
+        target = str(cfg.get("git_remote") or "").strip()
         if target and not self._is_remote_git_url(target):
             expanded = os.path.expanduser(target)
-            if os.path.isabs(expanded):
-                return os.path.normpath(expanded)
             base = self.data_dir or os.getcwd()
-            return os.path.normpath(os.path.join(base, expanded))
-        selected = self._selected_notebooks(c)
-        base_repos = os.path.join(self.data_dir or os.getcwd(), "git-repos")
-        if len(selected) == 1:
-            legacy = os.path.join(base_repos, self._notebook_slug(selected[0]))
-            if os.path.isdir(os.path.join(legacy, ".git")):
-                return legacy
-        if target:
-            return os.path.join(base_repos, f"repo-{sha256_text(target)[:12]}")
-        return os.path.join(base_repos, self._notebook_slug())
+            path = os.path.normpath(os.path.join(base, expanded))
+            return [path]
+        base = os.path.join(self.data_dir or os.getcwd(), "git-repos")
+        if not target:
+            return [os.path.join(base, self._notebook_slug())]
+
+        canonical = os.path.join(base, f"repo-{sha256_text(target)[:12]}")
+        legacy = []
+        if os.path.isdir(base) and shutil.which("git"):
+            for name in sorted(os.listdir(base)):
+                path = os.path.join(base, name)
+                if path == canonical or not re.search(r"-[0-9a-f]{8}$", name):
+                    continue
+                if not os.path.isdir(os.path.join(path, ".git")):
+                    continue
+                result = self._run_git(["config", "--local", "--get", "remote.origin.url"], cwd=path, cfg=cfg)
+                if result.returncode == 0 and result.stdout.strip() == target:
+                    legacy.append(path)
+        return [canonical, *legacy]
+
+    def _resolve_local_git_dir(self, cfg=None):
+        dirs = self._git_repo_dirs(cfg or self.config)
+        return next((path for path in dirs if os.path.isdir(os.path.join(path, ".git"))), dirs[0])
+
+    def _sync_target_base(self, cfg):
+        protocol = cfg["protocol"]
+        if protocol == "local_mirror":
+            return self._resolve_mirror_dir(cfg)
+        if protocol == "webdav":
+            return self._webdav_base_url(cfg) or "unconfigured"
+        return f"{self._resolve_local_git_dir(cfg)}:{self._git_branch(cfg)}"
 
     def _test_git(self):
         if not shutil.which("git"):
@@ -1373,12 +1525,12 @@ class SyncPlugin:
         except Exception as exc:
             return False, f"Git 检测异常: {sanitize_error_text(exc)}"
 
-    def _prepare_git_repo(self, cfg, allow_init_or_clone=True, allow_pull=True):
+    def _prepare_git_repo(self, cfg, allow_init_or_clone=True, allow_pull=True, repo_dir=None):
         if not shutil.which("git"):
             return False, "当前环境未安装 git 命令"
         target = str(cfg.get("git_remote") or "").strip()
         branch = self._git_branch(cfg)
-        repo_dir = self._resolve_local_git_dir(cfg)
+        repo_dir = repo_dir or self._resolve_local_git_dir(cfg)
 
         if target and self._is_remote_git_url(target):
             if not os.path.isdir(os.path.join(repo_dir, ".git")):
@@ -1420,13 +1572,13 @@ class SyncPlugin:
 
         return True, repo_dir
 
-    def _fetch_webdav_notes(self, cfg, only_path=None, scope="all", timeout=6, force_refresh=False, subdir=""):
+    def _fetch_webdav_notes(self, cfg, only_path=None, scope="all", timeout=6, force_refresh=False, subdir="", excluded_subdirs=()):
         root_url = self._webdav_root_url(cfg)
         base_url = self._webdav_base_url(cfg, subdir=subdir)
         if not root_url or not base_url:
             return False, {}, "请先填写有效的 WebDAV http(s) 地址"
 
-        cache_key = (base_url, scope, only_path or "")
+        cache_key = (base_url, scope, only_path or "", frozenset(excluded_subdirs))
         if not force_refresh and only_path is None and cache_key in self._remote_preview_cache:
             cached_ts, cached_notes = self._remote_preview_cache[cache_key]
             if time.time() - cached_ts < 15.0:
@@ -1437,13 +1589,16 @@ class SyncPlugin:
                 [only_path]
                 if only_path
                 else [
-                    p for p in self._webdav_list_files(base_url, is_safe_rel_md, cfg=cfg, timeout=timeout)
+                    p for p in self._webdav_list_files(
+                        base_url, is_safe_rel_md, cfg=cfg, timeout=timeout,
+                        excluded_subdirs=excluded_subdirs, skip_assets=True,
+                    )
                     if self._matches_scope(p, scope)
                 ]
             )
             remote_notes = {}
             for rel_path in remote_paths:
-                if not is_safe_rel_md(rel_path):
+                if not is_safe_rel_md(rel_path) or is_safe_rel_asset(rel_path) or in_sync_subdir(rel_path, excluded_subdirs):
                     continue
                 file_url = base_url + "/".join(urllib.parse.quote(p) for p in rel_path.split("/"))
                 found, raw_bytes = self._webdav_get_bytes(file_url, cfg=cfg, timeout=timeout)
@@ -1465,6 +1620,8 @@ class SyncPlugin:
         nb_root=None,
         subdir="",
         prepared_repo_dir=None,
+        target_bases=(),
+        excluded_subdirs=(),
     ):
         nb_key = self._notebook_key(nb_root)
         nb_label = self._notebook_label(nb_root)
@@ -1472,6 +1629,9 @@ class SyncPlugin:
         scope = cfg.get("sync_scope", "all")
         policy = cfg.get("conflict_policy", "keep_both")
         local_notes = self._read_local_notes(bridge, only_path=only_path, scope=scope, nb_root=nb_root)
+        for rel_path in local_notes:
+            if in_sync_subdir(rel_path, excluded_subdirs):
+                raise RuntimeError(f"笔记路径与其他笔记本的同步目录重叠：{rel_path}")
         target_display = self._target_display(cfg)
 
         remote_notes = {}
@@ -1487,7 +1647,7 @@ class SyncPlugin:
             meta_target = f"{base_dir}::{subdir}" if subdir else base_dir
             meta_key = self._meta_key("local_mirror", meta_target, nb_key=nb_key)
             legacy_key = f"local_mirror:{base_dir}" if not subdir else None
-            remote_notes = self._scan_mirror_files(target_dir, only_path=only_path, scope=scope)
+            remote_notes = self._scan_mirror_files(target_dir, only_path=only_path, scope=scope, excluded_subdirs=excluded_subdirs)
         elif protocol == "webdav":
             root_base_url = self._webdav_base_url(cfg)
             base_url = self._webdav_base_url(cfg, subdir=subdir)
@@ -1505,6 +1665,7 @@ class SyncPlugin:
                     timeout=6 if inspect_remote else 4,
                     force_refresh=force_refresh,
                     subdir=subdir,
+                    excluded_subdirs=excluded_subdirs,
                 )
                 if ok:
                     remote_notes = fetched
@@ -1512,7 +1673,7 @@ class SyncPlugin:
                     remote_inspected = False
                     remote_error = err
             else:
-                cache_key = (base_url, scope, only_path or "")
+                cache_key = (base_url, scope, only_path or "", frozenset(excluded_subdirs))
                 if cache_key in self._remote_preview_cache:
                     _, cached_notes = self._remote_preview_cache[cache_key]
                     remote_notes = dict(cached_notes)
@@ -1527,22 +1688,27 @@ class SyncPlugin:
             meta_key = self._meta_key("git", meta_target, nb_key=nb_key)
             legacy_key = f"git:{repo_dir}:{branch}" if not subdir else None
             if prepared_repo_dir:
-                remote_notes = self._scan_mirror_files(target_dir, only_path=only_path, scope=scope)
+                remote_notes = self._scan_mirror_files(target_dir, only_path=only_path, scope=scope, excluded_subdirs=excluded_subdirs)
             elif inspect_remote:
                 ok, res = self._prepare_git_repo(cfg, allow_init_or_clone=True, allow_pull=True)
                 if ok:
                     repo_root = res
                     target_dir = os.path.join(res, subdir) if subdir else res
-                    remote_notes = self._scan_mirror_files(target_dir, only_path=only_path, scope=scope)
+                    remote_notes = self._scan_mirror_files(target_dir, only_path=only_path, scope=scope, excluded_subdirs=excluded_subdirs)
                 else:
                     remote_inspected = False
                     remote_error = res
             elif os.path.isdir(os.path.join(repo_dir, ".git")):
-                remote_notes = self._scan_mirror_files(target_dir, only_path=only_path, scope=scope)
+                remote_notes = self._scan_mirror_files(target_dir, only_path=only_path, scope=scope, excluded_subdirs=excluded_subdirs)
             else:
                 remote_inspected = False
 
-        base_map = self._get_base_map(meta_key, legacy_key=legacy_key)
+        aliases = [
+            self._meta_key(protocol, f"{base}::{subdir}" if subdir else base, nb_key=nb_key)
+            for base in target_bases
+        ]
+        legacy_aliases = [f"{protocol}:{base}" for base in target_bases] if not subdir else []
+        base_map = self._get_base_map(meta_key, *aliases, legacy_key, *legacy_aliases)
         is_first_sync = len(base_map) == 0
 
         to_push_new = []
@@ -1598,6 +1764,7 @@ class SyncPlugin:
         fp_payload = json.dumps({
             "nb": nb_key,
             "subdir": subdir,
+            "excluded_subdirs": sorted(excluded_subdirs),
             "protocol": protocol,
             "target": target_display,
             "scope": scope,
@@ -1620,6 +1787,7 @@ class SyncPlugin:
             "nb_key": nb_key,
             "nb_label": nb_label,
             "subdir": subdir,
+            "excluded_subdirs": excluded_subdirs,
             "protocol": protocol,
             "target_display": target_display,
             "target_dir": target_dir,
@@ -1764,8 +1932,8 @@ class SyncPlugin:
             sub_dir = self._resolve_webdav_dir(cfg).strip().strip("/")
             full_sub = "/".join(p for p in (sub_dir, subdir.strip("/")) if p)
             if full_sub:
-                self._webdav_ensure_dir(root_url, full_sub)
-            write_remote = lambda rel, text: self._webdav_put_text(base_url, rel, text)
+                self._webdav_ensure_dir(root_url, full_sub, cfg=cfg)
+            write_remote = lambda rel, text: self._webdav_put_text(base_url, rel, text, cfg=cfg)
         else:
             os.makedirs(target_dir, exist_ok=True)
             write_remote = lambda rel, text: self._write_mirror_file(target_dir, rel, text)
@@ -1774,6 +1942,26 @@ class SyncPlugin:
         pulled = 0
         conflict_count = 0
         prefix = f"{plan.get('nb_label')}/" if subdir else ""
+
+        asset_count = 0
+        if cfg.get("sync_assets", True):
+            paths = None
+            if only_path is not None:
+                paths = note_asset_paths(only_path, local_notes.get(only_path, ""))
+                paths.update(note_asset_paths(only_path, remote_notes.get(only_path, "")))
+                if is_safe_rel_asset(only_path):
+                    paths.add(only_path)
+            excluded_subdirs = plan["excluded_subdirs"]
+            if protocol == "webdav":
+                asset_count = self._sync_webdav_assets(
+                    base_url, nb_root=nb_root, paths=paths, excluded_subdirs=excluded_subdirs, cfg=cfg,
+                )
+            else:
+                asset_count = self._sync_local_dir_assets(
+                    target_dir, nb_root=nb_root, paths=paths, excluded_subdirs=excluded_subdirs, cfg=cfg,
+                )
+            if asset_count > 0:
+                self._append_log(f"{prefix}同步 {asset_count} 个附件", "成功", tone="success")
 
         for rel_path in plan["synced"]:
             base_map[rel_path] = sha256_text(local_notes[rel_path])
@@ -1801,7 +1989,9 @@ class SyncPlugin:
 
         for rel_path in plan["to_pull_overwrite"]:
             text = remote_notes[rel_path]
-            self._write_local_note(bridge, rel_path, text, nb_root=nb_root)
+            self._write_local_note(
+                bridge, rel_path, text, nb_root=nb_root, expected_revision=sha256_text(local_notes[rel_path])
+            )
             base_map[rel_path] = sha256_text(text)
             pulled += 1
             self._append_log(f"远端覆盖 {prefix}{rel_path}", "成功", tone="success", tooltip=f"{self._protocol_label(protocol)}优先更新本地")
@@ -1816,34 +2006,27 @@ class SyncPlugin:
             conflict_count += 1
             self._append_log(f"冲突保留 {prefix}{rel_path}", "冲突副本", tone="warning", tooltip=f"已保留副本 {conflict_rel}")
 
-        asset_count = 0
-        if only_path is None:
-            if protocol == "webdav":
-                asset_count = self._sync_webdav_assets(base_url, nb_root=nb_root)
-            else:
-                asset_count = self._sync_local_dir_assets(target_dir, nb_root=nb_root)
-            if asset_count > 0:
-                self._append_log(f"{prefix}同步 {asset_count} 个附件", "成功", tone="success")
-
         self.sync_meta[plan["meta_key"]] = base_map
         return pushed, pulled, conflict_count, asset_count
 
     def _compute_batch_plan(self, bridge, cfg, notebooks, only_path=None, inspect_remote=True, force_refresh=False):
         protocol = cfg.get("protocol", "local_mirror")
         target_display = self._target_display(cfg)
-        if protocol == "local_mirror":
-            target_base = self._resolve_mirror_dir(cfg)
-        elif protocol == "webdav":
-            target_base = self._webdav_base_url(cfg) or "unconfigured"
+        repo_dir = None
+        if protocol == "git":
+            repo_dirs = self._git_repo_dirs(cfg)
+            repo_dir = next((path for path in repo_dirs if os.path.isdir(os.path.join(path, ".git"))), repo_dirs[0])
+            target_bases = [f"{path}:{self._git_branch(cfg)}" for path in repo_dirs]
         else:
-            target_base = f"{self._resolve_local_git_dir(cfg)}:{self._git_branch(cfg)}"
+            target_bases = [self._sync_target_base(cfg)]
 
-        all_selected = self._selected_notebooks(cfg)
-        subdir_map = self._notebook_subdir_map(all_selected or notebooks, protocol, target_base)
+        layout_key, bindings, reserved_subdirs = self._notebook_subdir_map(
+            self._selected_notebooks(cfg) or notebooks, protocol, target_bases,
+        )
 
         prepared_repo_dir = None
         if protocol == "git" and inspect_remote:
-            ok, res = self._prepare_git_repo(cfg, allow_init_or_clone=True, allow_pull=True)
+            ok, res = self._prepare_git_repo(cfg, repo_dir=repo_dir, allow_init_or_clone=True, allow_pull=True)
             if not ok:
                 return {
                     "cfg": dict(cfg),
@@ -1858,7 +2041,7 @@ class SyncPlugin:
 
         plans = []
         for nb in notebooks:
-            sub = subdir_map.get(nb, "")
+            sub = bindings[nb]
             plan = self._compute_sync_plan(
                 bridge,
                 cfg,
@@ -1868,6 +2051,8 @@ class SyncPlugin:
                 nb_root=nb,
                 subdir=sub,
                 prepared_repo_dir=prepared_repo_dir,
+                target_bases=target_bases,
+                excluded_subdirs=reserved_subdirs if not sub else (),
             )
             if plan.get("remote_error"):
                 return {
@@ -1888,6 +2073,8 @@ class SyncPlugin:
             "target_display": target_display,
             "repo_root": prepared_repo_dir or (plans[0]["repo_root"] if plans else ""),
             "plans": plans,
+            "layout_key": layout_key,
+            "bindings": bindings,
             "remote_error": None,
             "fingerprint": fp,
         }
@@ -1899,6 +2086,14 @@ class SyncPlugin:
         total_pulled = 0
         total_conflicts = 0
         total_assets = 0
+
+        layouts = self.sync_meta.get(LAYOUTS_META_KEY, {})
+        layouts = dict(layouts) if isinstance(layouts, dict) else {}
+        if layouts.get(batch["layout_key"]) != batch["bindings"]:
+            layouts[batch["layout_key"]] = batch["bindings"]
+            updated_meta = {**self.sync_meta, LAYOUTS_META_KEY: layouts}
+            bridge.call_host("host.storage.set", {"key": "sync_meta", "value": updated_meta})
+            self.sync_meta = updated_meta
 
         for plan in batch["plans"]:
             pushed, pulled, conflicts, assets = self._apply_notebook_plan(bridge, plan, only_path=only_path)
@@ -2463,6 +2658,7 @@ class SyncPlugin:
             self._refresh_known_notebooks(bridge)
             values = params.get("values")
             render_status = ""
+            accepted = {}
             if isinstance(values, dict) and values:
                 cfg = self._normalize_config(values, base=self.config)
                 changed_immediate = False
@@ -2495,13 +2691,18 @@ class SyncPlugin:
                         render_status = mirror_err
                 if changed_immediate:
                     self._save_config(bridge)
+                accepted = {
+                    key: self.config[key]
+                    for key in ("selected_notebooks", "auto_sync", "conflict_policy", "protocol", "mirror_dir")
+                    if key in values and cfg[key] == self.config[key]
+                }
             else:
                 cfg = dict(self.config)
                 cfg["selected_notebooks"] = list(self.config.get("selected_notebooks") or [])
             page = self.build_page(cfg=cfg)
             if render_status:
                 page["status"] = render_status
-            return {"page": page}
+            return {"page": page, "values": accepted}
 
         if method == "plugin.action":
             self._refresh_known_notebooks(bridge)
