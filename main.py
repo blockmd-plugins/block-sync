@@ -2067,7 +2067,7 @@ class SyncPlugin:
         err = self._target_error(c, require_notebooks=False)
         if err:
             self.last_status = err
-            return err
+            return False, err
         prev_cfg = self.config
         self.config = c
         try:
@@ -2087,7 +2087,7 @@ class SyncPlugin:
             tooltip=msg,
         )
         self.last_status = msg
-        return msg
+        return bool(ok), msg
 
     def _confirmation_card(self):
         pending = self.pending_confirm
@@ -2462,6 +2462,7 @@ class SyncPlugin:
         if method == "plugin.render":
             self._refresh_known_notebooks(bridge)
             values = params.get("values")
+            render_status = ""
             if isinstance(values, dict) and values:
                 cfg = self._normalize_config(values, base=self.config)
                 changed_immediate = False
@@ -2480,42 +2481,62 @@ class SyncPlugin:
                     self._remote_preview_cache.clear()
                     self.last_status = ""
                     changed_immediate = True
-                if cfg["protocol"] == "local_mirror" and not self._target_error(cfg, require_notebooks=False):
-                    if self.config["protocol"] != "local_mirror" or self.config["mirror_dir"] != cfg["mirror_dir"]:
-                        self.config["protocol"] = "local_mirror"
-                        self.config["mirror_dir"] = cfg["mirror_dir"]
-                        self.pending_confirm = None
-                        self._remote_preview_cache.clear()
-                        self.last_status = ""
-                        changed_immediate = True
+                if cfg["protocol"] == "local_mirror":
+                    mirror_err = self._target_error(cfg, require_notebooks=False)
+                    if not mirror_err:
+                        if self.config["protocol"] != "local_mirror" or self.config["mirror_dir"] != cfg["mirror_dir"]:
+                            self.config["protocol"] = "local_mirror"
+                            self.config["mirror_dir"] = cfg["mirror_dir"]
+                            self.pending_confirm = None
+                            self._remote_preview_cache.clear()
+                            self.last_status = "已启用本地镜像目录"
+                            changed_immediate = True
+                    elif cfg["mirror_dir"]:
+                        render_status = mirror_err
                 if changed_immediate:
                     self._save_config(bridge)
             else:
                 cfg = dict(self.config)
                 cfg["selected_notebooks"] = list(self.config.get("selected_notebooks") or [])
-            return {"page": self.build_page(cfg=cfg)}
+            page = self.build_page(cfg=cfg)
+            if render_status:
+                page["status"] = render_status
+            return {"page": page}
 
         if method == "plugin.action":
             self._refresh_known_notebooks(bridge)
             values = params.get("values") or {}
             action_id = str(params.get("action_id") or "")
+            ok = True
+            tone = "info"
             if action_id == "save_config":
                 next_cfg = self._normalize_config(values)
                 status = self._target_error(next_cfg, require_notebooks=False)
                 if status:
-                    return {"status": status}
+                    self.last_status = status
+                    return {
+                        "ok": False,
+                        "tone": "danger",
+                        "values": dict(next_cfg),
+                        "page": self.build_page(cfg=next_cfg),
+                        "status": status,
+                    }
                 if next_cfg != self.config:
                     self.pending_confirm = None
                     self._remote_preview_cache.clear()
                 self.config = next_cfg
                 self._save_config(bridge)
-                status = "已保存"
+                status = "已保存同步目标配置"
                 self.last_status = status
+                ok = True
+                tone = "success"
             elif action_id == "test_conn":
                 next_cfg = self._normalize_config(values)
-                status = self._run_test_conn(cfg=next_cfg)
+                ok, status = self._run_test_conn(cfg=next_cfg)
                 self._save_runtime(bridge)
                 return {
+                    "ok": ok,
+                    "tone": "success" if ok else "danger",
                     "values": dict(next_cfg),
                     "page": self.build_page(cfg=next_cfg),
                     "status": status,
@@ -2525,18 +2546,41 @@ class SyncPlugin:
                     next_cfg = self._normalize_config(values)
                     err = self._target_error(next_cfg)
                     if err:
-                        return {"status": err}
+                        self.last_status = err
+                        return {
+                            "ok": False,
+                            "tone": "danger",
+                            "values": dict(next_cfg),
+                            "page": self.build_page(cfg=next_cfg),
+                            "status": err,
+                        }
                     if next_cfg != self.config:
                         self.pending_confirm = None
                         self._remote_preview_cache.clear()
                         self.config = next_cfg
                         self._save_config(bridge)
-                status = self._run_sync(bridge)
+                err = self._target_error(self.config)
+                if err or not self._selected_notebooks(self.config):
+                    status = err or "请至少选择一个笔记本"
+                    self.last_status = status
+                    ok = False
+                    tone = "danger"
+                else:
+                    self.pending_confirm = None
+                    status = self._run_sync(bridge)
+                    if self.pending_confirm:
+                        ok = True
+                        tone = "warning"
+                    else:
+                        ok = True
+                        tone = "success"
             elif action_id == "confirm_sync":
                 pc = self.pending_confirm
                 if not pc or pc.get("scope_key") != self._result_key():
                     status = "当前没有待确认的同步计划"
                     self.last_status = status
+                    ok = False
+                    tone = "warning"
                 else:
                     protocol = self.config.get("protocol", "local_mirror")
                     notebooks = self._selected_notebooks(self.config)
@@ -2567,6 +2611,8 @@ class SyncPlugin:
                             self._save_runtime(bridge)
                             status = "同步计划已变化，请重新确认"
                             self.last_status = status
+                            ok = False
+                            tone = "warning"
                         else:
                             self.pending_confirm = None
                             self._append_log("同步计划已变化", "待确认", tone="warning", tooltip="原危险变更已消除，请重新同步")
@@ -2574,9 +2620,20 @@ class SyncPlugin:
                             self._save_runtime(bridge)
                             status = "同步计划已变化，请重新同步"
                             self.last_status = status
+                            ok = False
+                            tone = "warning"
                     else:
                         self.pending_confirm = None
-                        status = self._run_sync(bridge, confirmed=True, approved_batch=batch)
+                        err = self._target_error(self.config)
+                        if err or not self._selected_notebooks(self.config):
+                            status = err or "请至少选择一个笔记本"
+                            self.last_status = status
+                            ok = False
+                            tone = "danger"
+                        else:
+                            status = self._run_sync(bridge, confirmed=True, approved_batch=batch)
+                            ok = True
+                            tone = "success"
             elif action_id == "cancel_confirm":
                 self.pending_confirm = None
                 self._append_log("危险变更同步", "已取消", tone="info", tooltip="用户已取消本次同步")
@@ -2584,11 +2641,17 @@ class SyncPlugin:
                 self._save_runtime(bridge)
                 status = "已取消本次同步"
                 self.last_status = status
+                ok = True
+                tone = "info"
             else:
                 status = "已完成操作"
                 self.last_status = status
+                ok = True
+                tone = "info"
 
             res = {
+                "ok": ok,
+                "tone": tone,
                 "values": dict(self.config),
                 "page": self.build_page(cfg=self.config),
                 "status": status,
