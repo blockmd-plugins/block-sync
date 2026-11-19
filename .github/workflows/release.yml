@@ -2,12 +2,12 @@ name: Daily Release
 
 on:
   schedule:
-    # 每天 00:00 UTC（北京时间 08:00）自动检查；有新插件代码提交且当日未发版时自动递增版本号发版（08:15 由 store-index 自动采集）。
+    # 每天 00:00 UTC（北京时间 08:00）自动检查；有新的打包内容且当日未发版时自动递增版本号发版（08:15 由 store-index 自动采集）。
     - cron: "0 0 * * *"
   workflow_dispatch:
     inputs:
       force:
-        description: "Force publish a new patch release even without new runtime changes"
+        description: "Force publish a new patch release even without new package changes"
         type: boolean
         default: false
   push:
@@ -29,6 +29,266 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Check bilingual documentation and plugin UI
+        run: |
+          python3 - <<'PY'
+          import json
+          from collections import deque
+          from pathlib import Path
+          from queue import Empty, Queue
+          import re
+          import subprocess
+          import sys
+          from tempfile import TemporaryDirectory
+          from threading import Thread
+
+          CHINESE = re.compile(r"[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]")
+          HAN = re.compile(r"[\u4e00-\u9fff]")
+          EMOJI = re.compile(
+              r"[\U0001f000-\U0001faff\u2300-\u23ff\u25aa-\u27ff"
+              r"\u2934\u2935\u2b05-\u2b07\u2b1b\u2b1c\u2b50\u2b55"
+              r"\u3030\u303d\u3297\u3299\u2139\u2194-\u2199"
+              r"\u21a9\u21aa\u00a9\u00ae\u203c\u2049\u2122\ufe0f\u20e3]"
+          )
+          NOTEBOOK_NAME = "示例笔记本"
+          NOTE_NAME = "示例笔记.md"
+          LAYOUTS = {
+              "legacy": [],
+              "form": ["checklist", "form_layout", "multi_notebook", "kv_tooltip"],
+          }
+
+          def require(condition, message):
+              if not condition:
+                  raise ValueError(message)
+
+          def check_text(value, locale, context):
+              # Scan every string, including option details, nested previews, and metrics.
+              # Remove only the names supplied by the host fixture, even within longer text.
+              if isinstance(value, str):
+                  value = value.replace(NOTEBOOK_NAME, "").replace(NOTE_NAME, "")
+                  require(not EMOJI.search(value), f"{context}: emoji in {value!r}")
+                  if locale.lower().startswith("en"):
+                      require(not CHINESE.search(value), f"{context}: Chinese text in {value!r}")
+              elif isinstance(value, dict):
+                  for key, child in value.items():
+                      check_text(child, locale, f"{context}.{key}")
+              elif isinstance(value, list):
+                  for index, child in enumerate(value):
+                      check_text(child, locale, f"{context}[{index}]")
+
+          def controls(value):
+              if isinstance(value, dict):
+                  kind = value.get("kind")
+                  if kind in ("segmented", "select", "switch"):
+                      choices = [False, True] if kind == "switch" else [
+                          opt["value"] for opt in value["options"]
+                      ]
+                      yield value["id"], value["value"], choices
+                  for child in value.values():
+                      yield from controls(child)
+              elif isinstance(value, list):
+                  for child in value:
+                      yield from controls(child)
+
+          def check_renders(rpc, locale, base):
+              pending = deque([{}])
+              seen = {()}
+              count = 0
+              while pending:
+                  values = pending.popleft()
+                  page = rpc("plugin.render", {"values": {**base, **values}})["page"]
+                  context = f"{locale} render {values}"
+                  check_text(page, locale, context)
+                  rendered = list(controls(page))
+                  require(rendered, f"{context}: no controls found")
+                  # Include defaults before varying a control so each request is explicit.
+                  state = {**values, **{key: current for key, current, _ in rendered}}
+                  for key, current, choices in rendered:
+                      if key in values:
+                          require(current == values[key], f"{context}: {key} ignored requested value")
+                      for choice in choices:
+                          variant = {**state, key: choice}
+                          signature = tuple(sorted(variant.items()))
+                          if signature not in seen:
+                              seen.add(signature)
+                              pending.append(variant)
+                  count += 1
+              return count
+
+          def run_plugin(entry, locale, layout, capabilities, root, actions=False):
+              notebook = root / NOTEBOOK_NAME
+              downloads = root / "Downloads"
+              data_dir = root / "Data"
+              mirror = root / "Mirror"
+              for directory in (notebook, downloads, data_dir, mirror):
+                  directory.mkdir()
+              notes = {NOTE_NAME: "Local fixture"}
+              storage = {
+                  "config": {"mirror_dir": str(mirror), "selected_notebooks": [str(notebook)]},
+                  "logs": [{"title": "推送旧笔记", "status": "成功", "tooltip": "已镜像到本地目录", "time": "12:00:00"}],
+                  "notebook_results": {
+                      "__multi__": {"status": "失败", "summary": "旧版同步未完成"},
+                  },
+              }
+
+              def host(method, params):
+                  if method == "host.storage.get":
+                      key = params["key"]
+                      return {"found": key in storage, "value": storage.get(key)}
+                  if method == "host.storage.set":
+                      storage[params["key"]] = params["value"]
+                      return {"ok": True}
+                  if method == "host.notebooks.list":
+                      return {"notebooks": [{"path": str(notebook), "name": NOTEBOOK_NAME, "active": True}]}
+                  if method == "host.notes.list":
+                      return {"notes": [{"path": path} for path in notes]}
+                  if method == "host.notes.read":
+                      return {"content": notes[params["path"]]}
+                  if method == "host.notes.write":
+                      notes[params["path"]] = params["content"]
+                      return {"ok": True}
+                  raise ValueError(f"Unexpected host request: {method}")
+
+              process = subprocess.Popen(
+                  entry, cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                  text=True, encoding="utf-8",
+              )
+              replies = Queue()
+
+              def read_replies():
+                  for line in process.stdout:
+                      replies.put(line)
+                  replies.put(None)
+
+              reader = Thread(target=read_replies, daemon=True)
+              reader.start()
+              request_id = 0
+
+              def send(message):
+                  process.stdin.write(json.dumps({"jsonrpc": "2.0", **message}) + "\n")
+                  process.stdin.flush()
+
+              def rpc(method, params=None):
+                  nonlocal request_id
+                  request_id += 1
+                  send({"id": request_id, "method": method, "params": params or {}})
+                  while True:
+                      try:
+                          line = replies.get(timeout=10)
+                      except Empty:
+                          raise ValueError(f"{locale}/{layout}: timed out during {method}") from None
+                      require(line is not None, f"{locale}/{layout}: plugin exited during {method}")
+                      message = json.loads(line)
+                      require(message.get("jsonrpc") == "2.0", f"{method}: invalid JSON-RPC version")
+                      if "method" in message:
+                          result = host(message["method"], message.get("params", {}))
+                          send({"id": message["id"], "result": result})
+                          continue
+                      require(message.get("id") == request_id, f"{method}: unexpected response id")
+                      require("error" not in message, f"{method}: {message.get('error')}")
+                      return message["result"]
+
+              try:
+                  init = rpc("plugin.initialize", {
+                      "locale": locale, "data_dir": str(data_dir), "downloads_dir": str(downloads),
+                      "notebook_root": str(notebook), "ui_capabilities": capabilities,
+                  })
+                  require(init.get("ready") is True, f"{locale}/{layout}: plugin is not ready")
+                  initial = rpc("plugin.render")["page"]
+                  check_text(initial, locale, f"{locale}/{layout} initial page")
+                  title = initial.get("title")
+                  require(isinstance(title, str) and title.strip(), f"{locale}/{layout}: missing page title")
+                  # Only render these remote destinations. Actions below use local folders.
+                  base = {"webdav_url": "https://dav.example.invalid", "git_remote": str(root / "repo")}
+                  count = 1 + check_renders(rpc, locale, base)
+                  print(f"{locale}/{layout}: {count} renders passed")
+                  if actions:
+                      check_actions(rpc, locale, notebook, mirror, notes)
+                  require(rpc("plugin.shutdown").get("ok") is True, f"{locale}/{layout}: shutdown failed")
+                  require(process.wait(timeout=10) == 0, f"{locale}/{layout}: plugin exited unsuccessfully")
+                  return title
+              finally:
+                  if process.poll() is None:
+                      process.kill()
+                      process.wait()
+                  reader.join(timeout=1)
+                  process.stdin.close()
+                  process.stdout.close()
+
+          def check_actions(rpc, locale, notebook, mirror, notes):
+              count = 0
+
+              def action(action_id, values=None, *, ok=True, tone=None):
+                  nonlocal count
+                  result = rpc("plugin.action", {"action_id": action_id, "values": values or {}})
+                  context = f"{locale} action {action_id}"
+                  require(result.get("ok") is ok, f"{context}: unexpected result {result.get('status')!r}")
+                  require(result.get("status"), f"{context}: missing status")
+                  if tone is not None:
+                      require(result.get("tone") == tone, f"{context}: expected {tone} tone")
+                  check_text(result["status"], locale, f"{context}.status")
+                  check_text(result["page"], locale, f"{context}.page")
+                  count += 1
+                  return result["page"]
+
+              local = {"protocol": "local_mirror", "mirror_dir": str(mirror),
+                       "selected_notebooks": [str(notebook)], "conflict_policy": "keep_both"}
+              for values in (
+                  {"protocol": "webdav", "webdav_url": ""},
+                  {"protocol": "git", "git_remote": ""},
+                  {**local, "mirror_dir": ""},
+                  {**local, "mirror_dir": str(notebook)},
+              ):
+                  action("save_config", values, ok=False)
+                  action("test_conn", values, ok=False)
+              action("sync_now", {**local, "selected_notebooks": []}, ok=False)
+              action("confirm_sync", ok=False)
+              action("save_config", local)
+              action("test_conn", local)
+              (mirror / "remote.md").write_text("Remote fixture", encoding="utf-8")
+              preview = action("sync_now", tone="warning")
+              require(any(card["id"] == "preview-card" for card in preview["cards"]), "Missing confirmation preview")
+              action("cancel_confirm")
+              action("sync_now", tone="warning")
+              action("confirm_sync", tone="success")
+              require(notes.get("remote.md") == "Remote fixture", "Sync did not pull the fixture")
+              require((mirror / NOTE_NAME).read_text(encoding="utf-8") == notes[NOTE_NAME], "Sync did not push the fixture")
+              action("sync_now", tone="success")
+              print(f"{locale}: {count} actions passed")
+
+          def main():
+              repo = Path.cwd()
+              manifest = json.loads((repo / "manifest.json").read_text(encoding="utf-8"))
+              for field in ("name", "summary"):
+                  for locale in ("zh", "en"):
+                      value = manifest[field][locale]
+                      require(isinstance(value, str) and value.strip(), f"Missing manifest.{field}.{locale}")
+              check_text(manifest, "zh", "manifest")
+
+              zh_readme = (repo / "README.md").read_text(encoding="utf-8").strip()
+              en_readme = (repo / "README.en.md").read_text(encoding="utf-8").strip()
+              require(zh_readme and HAN.search(zh_readme), "README.md must contain Chinese text")
+              require(en_readme and not CHINESE.search(en_readme), "README.en.md must contain English-only text")
+              require(zh_readme != en_readme, "The two README files must differ")
+
+              entry = manifest["entry"]["command"]
+              entry = [str(repo / part) if (repo / part).is_file() else part for part in entry]
+              for layout, capabilities in LAYOUTS.items():
+                  titles = []
+                  for locale in ("zh", "en"):
+                      with TemporaryDirectory(prefix="block-sync-i18n-") as temp:
+                          titles.append(run_plugin(entry, locale, layout, capabilities, Path(temp),
+                                                   actions=(layout == "form")))
+                  require(titles[0] != titles[1], f"{layout}: Chinese and English page titles must differ")
+              print("Bilingual release gate passed; no Chinese text found in English plugin output.")
+
+          try:
+              main()
+          except Exception as exc:
+              print(f"Bilingual release gate failed: {exc}", file=sys.stderr)
+              sys.exit(1)
+          PY
 
       - name: Plan version and package plugin
         id: plan
@@ -143,10 +403,10 @@ jobs:
                   if is_anc:
                       changed = [
                           p for p in sh("git", "diff", "--name-only", prev_sha, head_sha).splitlines()
-                          if p and not p.startswith(".github/") and p not in {".gitignore", "README.md", "LICENSE"}
+                          if p and not p.startswith(".github/") and p not in {".gitignore", "LICENSE"}
                       ]
                       if not changed:
-                          summary(f"自 {previous['tag_name']} 以来仅包含 CI 或文档变更，无需发包，本次跳过。")
+                          summary(f"自 {previous['tag_name']} 以来仅包含 CI 或仓库元数据变更，无需发包，本次跳过。")
                           set_output(should_release="no")
                           sys.exit(0)
                       subjects = sh("git", "log", "--no-merges", "--format=%s", f"{prev_sha}..{head_sha}").splitlines()
