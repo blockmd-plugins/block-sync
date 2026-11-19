@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -35,6 +35,7 @@ jobs:
           python3 - <<'PY'
           import json
           from collections import deque
+          from concurrent.futures import ThreadPoolExecutor
           from pathlib import Path
           from queue import Empty, Queue
           import re
@@ -274,13 +275,22 @@ jobs:
 
               entry = manifest["entry"]["command"]
               entry = [str(repo / part) if (repo / part).is_file() else part for part in entry]
-              for layout, capabilities in LAYOUTS.items():
-                  titles = []
-                  for locale in ("zh", "en"):
-                      with TemporaryDirectory(prefix="block-sync-i18n-") as temp:
-                          titles.append(run_plugin(entry, locale, layout, capabilities, Path(temp),
-                                                   actions=(layout == "form")))
-                  require(titles[0] != titles[1], f"{layout}: Chinese and English page titles must differ")
+              def run_case(case):
+                  layout, capabilities, locale = case
+                  with TemporaryDirectory(prefix="block-sync-i18n-") as temp:
+                      return (layout, locale), run_plugin(
+                          entry, locale, layout, capabilities, Path(temp), actions=(layout == "form")
+                      )
+
+              cases = [
+                  (layout, capabilities, locale)
+                  for layout, capabilities in LAYOUTS.items()
+                  for locale in ("zh", "en")
+              ]
+              with ThreadPoolExecutor(max_workers=len(cases)) as pool:
+                  titles = dict(pool.map(run_case, cases))
+              for layout in LAYOUTS:
+                  require(titles[(layout, "zh")] != titles[(layout, "en")], f"{layout}: Chinese and English page titles must differ")
               print("Bilingual release gate passed; no Chinese text found in English plugin output.")
 
           try:
@@ -346,7 +356,7 @@ jobs:
               m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)$", (tag or "").strip())
               return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
 
-          raw_rels = sh("gh", "api", "--paginate", f"repos/{repo}/releases?per_page=100", "--jq", ".[]")
+          raw_rels = sh("gh", "api", f"repos/{repo}/releases?per_page=100", "--jq", ".[]")
           releases = [json.loads(line) for line in raw_rels.splitlines() if line.strip()]
           stable = [r for r in releases if not r.get("draft") and not r.get("prerelease") and parse_ver(r.get("tag_name"))]
           stable.sort(key=lambda r: parse_ver(r["tag_name"]))
