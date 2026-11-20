@@ -3514,6 +3514,55 @@ class SyncPlugin:
                 heads.append(parts[1][len("refs/heads/"):])
         return True, heads
 
+    def _git_path(self, repo_dir, rel, cfg=None):
+        proc = self._run_git(["rev-parse", "--git-path", rel], cwd=repo_dir, cfg=cfg)
+        if proc.returncode == 0 and proc.stdout.strip():
+            raw = proc.stdout.strip()
+            return raw if os.path.isabs(raw) else os.path.join(repo_dir, raw)
+        git_dir = self._resolve_git_dir(repo_dir)
+        return os.path.join(git_dir, rel) if git_dir else ""
+
+    def _load_git_pushed_refs(self, repo_dir, cfg=None):
+        p = self._git_path(repo_dir, "block-sync-pushed-refs.json", cfg=cfg)
+        if not p or not os.path.isfile(p):
+            return {}
+        try:
+            with open(p, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _record_git_synced_branch(self, repo_dir, branch, oid, remote_name="origin", cfg=None):
+        oid = str(oid or "").strip()
+        if not oid or not branch:
+            return
+        p = self._git_path(repo_dir, "block-sync-pushed-refs.json", cfg=cfg)
+        if not p:
+            return
+        try:
+            data = self._load_git_pushed_refs(repo_dir, cfg=cfg)
+            data[f"{remote_name}:{branch}"] = oid
+            tmp_p = f"{p}.{os.getpid()}.tmp"
+            with open(tmp_p, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, sort_keys=True)
+            os.replace(tmp_p, p)
+        except Exception:
+            pass
+
+    def _get_git_synced_branch_oid(self, repo_dir, branch, remote_name="origin", cfg=None):
+        if not repo_dir or not branch or not self._has_git_marker(repo_dir):
+            return ""
+        ref_proc = self._run_git(
+            ["rev-parse", "--verify", f"refs/remotes/{remote_name}/{branch}"],
+            cwd=repo_dir,
+            cfg=cfg,
+        )
+        if ref_proc.returncode == 0 and ref_proc.stdout.strip():
+            return ref_proc.stdout.strip()
+        data = self._load_git_pushed_refs(repo_dir, cfg=cfg)
+        return str(data.get(f"{remote_name}:{branch}") or "").strip()
+
     def _test_git(self):
         if not shutil.which("git"):
             return False, self._tr("当前环境未安装 git 命令", "Git is not installed")
@@ -3526,6 +3575,12 @@ class SyncPlugin:
                     return False, self._tr(f"Git 远端不可达: {res}", f"Git remote is unreachable: {res}")
                 heads = res
                 if not heads:
+                    repo_dir = self._resolve_local_git_dir(self.config)
+                    if self._get_git_synced_branch_oid(repo_dir, branch, remote_name="origin", cfg=self.config):
+                        return False, self._tr(
+                            f"远端分支 {branch} 已不存在（疑似被删除或重置），请先确认远端状态",
+                            f"Remote branch {branch} no longer exists (it may have been deleted or reset); verify remote state first",
+                        )
                     return True, self._tr(
                         f"Git 远端为空仓库（首次同步将创建分支 {branch}）",
                         f"Git remote is empty (first sync will create branch {branch})",
@@ -3553,6 +3608,11 @@ class SyncPlugin:
                 remote_name = "origin" if "origin" in remotes else remotes[0]
                 ok, res = self._git_remote_heads(remote_name, cfg=self.config, cwd=repo_dir, timeout=10, retries=1, total_budget=20.0)
                 if ok:
+                    if not res and self._get_git_synced_branch_oid(repo_dir, branch, remote_name=remote_name, cfg=self.config):
+                        return False, self._tr(
+                            f"远端 {remote_name} 的分支 {branch} 已不存在（疑似被删除或重置），请先确认远端状态",
+                            f"Remote {remote_name} branch {branch} no longer exists (it may have been deleted or reset); verify remote state first",
+                        )
                     if not res or branch in res:
                         return True, self._tr(f"Git 仓库及远端 {remote_name} 正常", f"Git repository and remote {remote_name} are available")
                     avail = ", ".join(res[:4]) + ("..." if len(res) > 4 else "")
@@ -3605,11 +3665,10 @@ class SyncPlugin:
                     elif url_proc.stdout.strip() != target:
                         self._run_git(["remote", "set-url", "origin", target], cwd=repo_dir, cfg=cfg)
                     if self._is_managed_git_dir(repo_dir):
-                        # If we previously synced with origin/<branch> (remote-tracking ref exists) and the remote
-                        # now has no branches, the remote branch was deleted or reset — abort loudly instead of
-                        # silently pushing local history back to origin or deleting the local cache.
-                        remote_ref = f"refs/remotes/origin/{branch}"
-                        if self._run_git(["rev-parse", "--verify", remote_ref], cwd=repo_dir, cfg=cfg).returncode == 0:
+                        # If we previously synced with origin/<branch> (tracking ref or persisted ledger exists)
+                        # and the remote now has no branches, the remote branch was deleted or reset — abort
+                        # loudly instead of silently pushing local history back to origin or wiping the cache.
+                        if self._get_git_synced_branch_oid(repo_dir, branch, remote_name="origin", cfg=cfg):
                             return False, self._tr(
                                 f"远端分支 {branch} 已不存在（疑似被删除或重置），为避免未经确认重建远端历史已中止同步",
                                 f"Remote branch {branch} no longer exists (it may have been deleted or reset); sync aborted to avoid silently recreating remote history",
@@ -3619,7 +3678,7 @@ class SyncPlugin:
                         local_ref = f"refs/heads/{branch}"
                         if self._run_git(["rev-parse", "--verify", local_ref], cwd=repo_dir, cfg=cfg).returncode == 0:
                             retry_push = self._run_git_network(
-                                ["push", "-u", "origin", f"{local_ref}:{local_ref}"],
+                                ["push", f"--force-with-lease=refs/heads/{branch}:", "-u", "origin", f"{local_ref}:{local_ref}"],
                                 cwd=repo_dir,
                                 timeout=12,
                                 cfg=cfg,
@@ -3635,6 +3694,9 @@ class SyncPlugin:
                                     retries=1,
                                     total_budget=15.0,
                                 )
+                                oid_p = self._run_git(["rev-parse", "--verify", f"refs/remotes/origin/{branch}"], cwd=repo_dir, cfg=cfg)
+                                if oid_p.returncode == 0 and oid_p.stdout.strip():
+                                    self._record_git_synced_branch(repo_dir, branch, oid_p.stdout.strip(), remote_name="origin", cfg=cfg)
                                 return True, repo_dir
                             backup_ref = f"pending-push-{branch}-{int(time.time())}"
                             self._run_git(["branch", "-f", backup_ref, local_ref], cwd=repo_dir, cfg=cfg)
@@ -3683,6 +3745,9 @@ class SyncPlugin:
                     _cleanup_partial_clone()
                     err = self._git_error_message(clone_proc.stderr or clone_proc.stdout, self._tr("clone 失败", "Clone failed"))
                     return False, self._tr(f"Git 远端不可达: {err}", f"Git remote is unreachable: {err}")
+                oid_p = self._run_git(["rev-parse", "--verify", f"refs/remotes/origin/{branch}"], cwd=repo_dir, cfg=cfg)
+                if oid_p.returncode == 0 and oid_p.stdout.strip():
+                    self._record_git_synced_branch(repo_dir, branch, oid_p.stdout.strip(), remote_name="origin", cfg=cfg)
             else:
                 url_proc = self._run_git(["remote", "get-url", "origin"], cwd=repo_dir, cfg=cfg)
                 if url_proc.returncode != 0:
@@ -3703,6 +3768,9 @@ class SyncPlugin:
                     if fetch_proc.returncode != 0:
                         err = self._git_error_message(fetch_proc.stderr or fetch_proc.stdout, self._tr("fetch 失败", "Fetch failed"))
                         return False, self._tr(f"Git 拉取失败: {err}", f"Git pull failed: {err}")
+                    oid_p = self._run_git(["rev-parse", "--verify", f"refs/remotes/origin/{branch}"], cwd=repo_dir, cfg=cfg)
+                    if oid_p.returncode == 0 and oid_p.stdout.strip():
+                        self._record_git_synced_branch(repo_dir, branch, oid_p.stdout.strip(), remote_name="origin", cfg=cfg)
                     # Before resetting a managed clone to origin/<branch>, check for unpushed local commits
                     # (e.g. from a prior push rejected by a receive hook or transient outage) so they are never lost.
                     if self._is_managed_git_dir(repo_dir):
@@ -3715,8 +3783,11 @@ class SyncPlugin:
                             behind_n = int((behind_p.stdout or "0").strip() or "0") if behind_p.returncode == 0 else 0
                             if ahead_n > 0:
                                 if behind_n == 0:
+                                    exp_oid_p = self._run_git(["rev-parse", "--verify", remote_ref], cwd=repo_dir, cfg=cfg)
+                                    exp_oid = exp_oid_p.stdout.strip() if exp_oid_p.returncode == 0 else ""
+                                    lease_arg = f"--force-with-lease=refs/heads/{branch}:{exp_oid}"
                                     retry_push = self._run_git_network(
-                                        ["push", "-u", "origin", f"{local_ref}:{local_ref}"],
+                                        ["push", lease_arg, "-u", "origin", f"{local_ref}:{local_ref}"],
                                         cwd=repo_dir,
                                         timeout=12,
                                         cfg=cfg,
@@ -3732,6 +3803,9 @@ class SyncPlugin:
                                             retries=1,
                                             total_budget=15.0,
                                         )
+                                        oid_p2 = self._run_git(["rev-parse", "--verify", remote_ref], cwd=repo_dir, cfg=cfg)
+                                        if oid_p2.returncode == 0 and oid_p2.stdout.strip():
+                                            self._record_git_synced_branch(repo_dir, branch, oid_p2.stdout.strip(), remote_name="origin", cfg=cfg)
                                     else:
                                         backup_ref = f"pending-push-{branch}-{int(time.time())}"
                                         self._run_git(["branch", "-f", backup_ref, local_ref], cwd=repo_dir, cfg=cfg)
@@ -3806,6 +3880,11 @@ class SyncPlugin:
                                 f"远端 {remote_name} 不存在分支 {branch}（已有分支：{avail}）",
                                 f"Remote {remote_name} does not have branch {branch} (available: {avail})",
                             )
+                        if not heads_or_err and self._get_git_synced_branch_oid(repo_dir, branch, remote_name=remote_name, cfg=cfg):
+                            return False, self._tr(
+                                f"远端 {remote_name} 的分支 {branch} 已不存在（疑似被删除或重置），为避免未经确认重建远端历史已中止同步",
+                                f"Remote {remote_name} branch {branch} no longer exists (it may have been deleted or reset); sync aborted to avoid silently recreating remote history",
+                            )
                         if branch in heads_or_err:
                             fetch_proc = self._run_git_network(
                                 ["fetch", remote_name, f"refs/heads/{branch}:refs/remotes/{remote_name}/{branch}"],
@@ -3818,6 +3897,9 @@ class SyncPlugin:
                             if fetch_proc.returncode != 0:
                                 err = self._git_error_message(fetch_proc.stderr or fetch_proc.stdout, self._tr("fetch 失败", "Fetch failed"))
                                 return False, self._tr(f"Git 拉取失败: {err}", f"Git pull failed: {err}")
+                            oid_p = self._run_git(["rev-parse", "--verify", f"refs/remotes/{remote_name}/{branch}"], cwd=repo_dir, cfg=cfg)
+                            if oid_p.returncode == 0 and oid_p.stdout.strip():
+                                self._record_git_synced_branch(repo_dir, branch, oid_p.stdout.strip(), remote_name=remote_name, cfg=cfg)
                             head_chk = self._run_git(["rev-parse", "--verify", "HEAD"], cwd=repo_dir, cfg=cfg)
                             if head_chk.returncode != 0:
                                 self._run_git(["checkout", "-B", branch, f"refs/remotes/{remote_name}/{branch}"], cwd=repo_dir, cfg=cfg)
@@ -4812,7 +4894,9 @@ class SyncPlugin:
             remote_name = "origin" if "origin" in remotes else remotes[0]
             head_proc = self._run_git(["rev-parse", "--verify", "HEAD"], cwd=repo_root, cfg=cfg)
             if head_proc.returncode == 0:
+                head_oid = (head_proc.stdout or "").strip()
                 needs_push = False
+                expected_remote_oid = self._get_git_synced_branch_oid(repo_root, branch, remote_name=remote_name, cfg=cfg)
                 ref_proc = self._run_git(
                     ["rev-parse", "--verify", f"refs/remotes/{remote_name}/{branch}"],
                     cwd=repo_root,
@@ -4830,8 +4914,18 @@ class SyncPlugin:
                         needs_push = True
 
                 if needs_push:
+                    if expected_remote_oid:
+                        anc_proc = self._run_git(["merge-base", "--is-ancestor", expected_remote_oid, "HEAD"], cwd=repo_root, cfg=cfg)
+                        if anc_proc.returncode != 0:
+                            raise RuntimeError(self._tr(
+                                f"本地 Git 分支 {branch} 与远端记录分叉，为避免覆盖远端历史已中止推送",
+                                f"Local Git branch {branch} diverged from last synced remote commit; push aborted",
+                            ))
+                        lease_arg = f"--force-with-lease=refs/heads/{branch}:{expected_remote_oid}"
+                    else:
+                        lease_arg = f"--force-with-lease=refs/heads/{branch}:"
                     push_proc = self._run_git_network(
-                        ["push", "-u", remote_name, f"HEAD:refs/heads/{branch}"],
+                        ["push", lease_arg, "-u", remote_name, f"HEAD:refs/heads/{branch}"],
                         cwd=repo_root,
                         timeout=12,
                         cfg=cfg,
@@ -4841,6 +4935,7 @@ class SyncPlugin:
                     if push_proc.returncode != 0:
                         err = self._git_error_message(push_proc.stderr or push_proc.stdout, self._tr("push 失败", "Push failed"))
                         raise RuntimeError(self._tr(f"已提交到本地 Git，但远端推送未完成: {err}", f"Committed locally. Git push failed: {err}"))
+                    self._record_git_synced_branch(repo_root, branch, head_oid, remote_name=remote_name, cfg=cfg)
                     return True
         return did_commit
 
