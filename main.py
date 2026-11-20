@@ -3131,6 +3131,12 @@ class SyncPlugin:
         )
         max_retries = (2 if can_retry else 0) if retries is None else max(0, int(retries))
         for attempt in range(max_retries + 1):
+            request_timeout = timeout
+            if self._webdav_deadline:
+                remaining = self._webdav_deadline - time.monotonic()
+                if remaining < 1:
+                    raise TimeoutError("WebDAV sync deadline reached")
+                request_timeout = min(timeout, remaining)
             req = urllib.request.Request(
                 url,
                 data=body,
@@ -3138,9 +3144,17 @@ class SyncPlugin:
                 method=upper,
             )
             try:
-                with WEBDAV_OPENER.open(req, timeout=timeout) as resp:
+                with WEBDAV_OPENER.open(req, timeout=request_timeout) as resp:
                     resp_headers = {k.lower(): v for k, v in resp.headers.items()} if resp.headers else {}
-                    return resp.status, resp.read(), resp_headers
+                    if not self._webdav_deadline:
+                        return resp.status, resp.read(), resp_headers
+                    data = bytearray()
+                    while time.monotonic() < self._webdav_deadline:
+                        part = resp.read1(65536)
+                        if not part:
+                            return resp.status, bytes(data), resp_headers
+                        data.extend(part)
+                    raise TimeoutError("WebDAV sync deadline reached")
             except urllib.error.HTTPError as exc:
                 if attempt < max_retries and exc.code in (429, 502, 503, 504):
                     time.sleep(min(0.4 * (attempt + 1), 1.5))
@@ -3327,6 +3341,8 @@ class SyncPlugin:
         return bool(raw) and not raw.lower().startswith("w/")
 
     def _webdav_lock(self, file_url, cfg=None, timeout=6):
+        if self._webdav_deadline and self._webdav_deadline - time.monotonic() < 12:
+            raise TimeoutError("WebDAV sync deadline reached before acquiring another lock")
         lock_body = (
             b'<?xml version="1.0" encoding="utf-8"?>'
             b'<D:lockinfo xmlns:D="DAV:">'
@@ -3566,11 +3582,19 @@ class SyncPlugin:
             raise
         finally:
             if lock_token:
-                if created_lock_placeholder:
-                    ok_del, del_detail = self._webdav_delete_placeholder(file_url, lock_token, cfg=cfg)
-                    if not ok_del:
-                        cleanup_err = del_detail
-                self._webdav_unlock(file_url, lock_token, cfg=cfg)
+                original_deadline = self._webdav_deadline
+                if original_deadline:
+                    self._webdav_deadline += 15
+                try:
+                    if created_lock_placeholder:
+                        ok_del, del_detail = self._webdav_delete_placeholder(
+                            file_url, lock_token, cfg=cfg, timeout=2 if original_deadline else 6,
+                        )
+                        if not ok_del:
+                            cleanup_err = del_detail
+                    self._webdav_unlock(file_url, lock_token, cfg=cfg)
+                finally:
+                    self._webdav_deadline = original_deadline
                 if cleanup_err:
                     raise RuntimeError(self._tr(
                         f"WebDAV 写入失败且清理临时占位文件失败（{rel_path}）：{cleanup_err}",
@@ -7812,12 +7836,16 @@ class SyncPlugin:
         self._refresh_known_notebooks(bridge)
         if self._target_error(self.config) or not self._selected_notebooks(self.config):
             return skipped
+        if protocol == "webdav":
+            self._webdav_deadline = time.monotonic() + 95
         try:
             self._run_sync(bridge)
         except SyncStateError:
             return {"handled": True, "outcome": "state_error"}
         except RuntimeError:
             return {"handled": True, "outcome": "failed"}
+        finally:
+            self._webdav_deadline = 0.0
         return {"handled": True, "outcome": self._last_sync_outcome, "synced_notebooks": self._last_synced_notebooks}
 
 
