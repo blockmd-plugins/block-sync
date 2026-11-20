@@ -1971,7 +1971,9 @@ class SyncPlugin:
                     remote_files[rel] = fh.read()
         return remote_files
 
-    def _write_mirror_file(self, mirror_dir, rel_path, content, expected_hash=None, create_only=False, excluded_subdirs=()):
+    def _write_mirror_file(self, mirror_dir, rel_path, content, expected_hash=None, create_only=False, excluded_subdirs=(), verify_target=None):
+        if verify_target is not None:
+            verify_target()
         dest = self._safe_mirror_dest(mirror_dir, rel_path, excluded_subdirs=excluded_subdirs)
         parent = os.path.dirname(dest)
         if parent:
@@ -2182,7 +2184,9 @@ class SyncPlugin:
                             f"Could not clean up stale temporary files; aborted commit: {detail}",
                         ))
 
-    def _write_mirror_bytes(self, mirror_dir, rel_path, data, expected_hash=None, create_only=False, excluded_subdirs=()):
+    def _write_mirror_bytes(self, mirror_dir, rel_path, data, expected_hash=None, create_only=False, excluded_subdirs=(), verify_target=None):
+        if verify_target is not None:
+            verify_target()
         dest = self._asset_file(mirror_dir, rel_path, excluded_subdirs=excluded_subdirs)
         parent = os.path.dirname(dest)
         os.makedirs(parent, exist_ok=True)
@@ -4242,6 +4246,59 @@ class SyncPlugin:
                     return True
         return did_commit
 
+    def _validate_physical_targets(self, protocol, cfg, bindings, base_root, expected_identities=None):
+        if protocol not in ("local_mirror", "git") or not base_root:
+            return {}, ""
+        base_real = os.path.realpath(base_root)
+        identities = {}
+        resolved_targets = []
+        for nb, sub in bindings.items():
+            tdir = os.path.join(base_root, sub) if sub else base_root
+            if sub and os.path.islink(tdir):
+                return {}, self._tr(
+                    f"笔记本「{self._notebook_label(nb)}」的同步子目录是符号链接，已中止同步",
+                    f"Sync subfolder for notebook {self._notebook_label(nb)} is a symlink; sync aborted",
+                )
+            treal = os.path.realpath(tdir)
+            if sub:
+                if treal == base_real or not treal.startswith(base_real + os.sep):
+                    return {}, self._tr(
+                        f"笔记本「{self._notebook_label(nb)}」的同步子目录超出同步根目录，已中止同步",
+                        f"Sync subfolder for notebook {self._notebook_label(nb)} resolves outside the sync root; sync aborted",
+                    )
+            for prev_nb, prev_sub, prev_real in resolved_targets:
+                same_or_nested = treal == prev_real or (
+                    bool(sub) and bool(prev_sub) and paths_overlap(treal, prev_real)
+                )
+                if same_or_nested:
+                    return {}, self._tr(
+                        f"笔记本「{self._notebook_label(prev_nb)}」与「{self._notebook_label(nb)}」的同步目标目录指向同一或嵌套物理目录，已中止同步",
+                        f"Sync folders for {self._notebook_label(prev_nb)} and {self._notebook_label(nb)} resolve to the same or nested directory; sync aborted",
+                    )
+            stat_id = None
+            try:
+                st = os.lstat(tdir)
+                stat_id = (st.st_dev, st.st_ino)
+            except FileNotFoundError:
+                stat_id = None
+            if expected_identities and nb in expected_identities:
+                exp = expected_identities[nb]
+                exp_real = exp.get("real")
+                exp_stat = exp.get("stat_id")
+                if exp_real and treal != exp_real:
+                    return {}, self._tr(
+                        f"笔记本「{self._notebook_label(nb)}」的同步目标目录在执行期间已变更，已中止同步",
+                        f"Sync target folder for {self._notebook_label(nb)} changed during execution; sync aborted",
+                    )
+                if exp_stat is not None and stat_id != exp_stat:
+                    return {}, self._tr(
+                        f"笔记本「{self._notebook_label(nb)}」的同步目标目录已被替换，已中止同步",
+                        f"Sync target folder for {self._notebook_label(nb)} was replaced during execution; sync aborted",
+                    )
+            identities[nb] = {"sub": sub, "tdir": tdir, "real": treal, "stat_id": stat_id}
+            resolved_targets.append((nb, sub, treal))
+        return identities, ""
+
     def _apply_notebook_plan(self, bridge, plan, only_path=None, progress_state=None):
         protocol = plan["protocol"]
         cfg = plan["cfg"]
@@ -4257,14 +4314,35 @@ class SyncPlugin:
         target_dir = plan["target_dir"]
         base_url = plan["base_url"]
         excluded_subdirs = plan.get("excluded_subdirs") or ()
+        batch_base_root = plan.get("batch_base_root") or (self._resolve_mirror_dir(cfg) if protocol == "local_mirror" else plan.get("repo_root") or "")
+        batch_bindings = plan.get("batch_bindings") or {}
+        target_identities = dict(plan.get("target_identities") or {})
         written_remote_paths = []
+
+        def verify_target():
+            if protocol not in ("local_mirror", "git") or not batch_base_root:
+                return
+            if batch_bindings:
+                fresh_ids, v_err = self._validate_physical_targets(
+                    protocol, cfg, batch_bindings, batch_base_root, expected_identities=target_identities,
+                )
+                if v_err:
+                    raise RuntimeError(v_err)
+                # Once target_dir exists, pin its stat_id so any later swap during execution is also caught.
+                for k_nb, info in fresh_ids.items():
+                    if k_nb in target_identities and target_identities[k_nb].get("stat_id") is None and info.get("stat_id") is not None:
+                        target_identities[k_nb] = dict(info)
+            elif subdir and os.path.islink(target_dir):
+                raise RuntimeError(self._tr(
+                    f"同步目标子目录是符号链接，已中止同步：{subdir}",
+                    f"Sync target subfolder is a symlink; sync aborted: {subdir}",
+                ))
 
         def record_remote_path(rel):
             repo_rel = f"{subdir.strip('/')}/{rel}" if subdir.strip("/") else rel
             written_remote_paths.append(repo_rel)
 
         if protocol == "local_mirror":
-            os.makedirs(target_dir, exist_ok=True)
             def write_remote_note(rel, text, expected_hash=None, create_only=False):
                 self._write_mirror_file(
                     target_dir,
@@ -4273,6 +4351,7 @@ class SyncPlugin:
                     expected_hash=expected_hash,
                     create_only=create_only,
                     excluded_subdirs=excluded_subdirs,
+                    verify_target=verify_target,
                 )
                 record_remote_path(rel)
             def write_remote_asset(rel, data, expected_hash=None, create_only=False):
@@ -4283,6 +4362,7 @@ class SyncPlugin:
                     expected_hash=expected_hash,
                     create_only=create_only,
                     excluded_subdirs=excluded_subdirs,
+                    verify_target=verify_target,
                 )
                 record_remote_path(rel)
         elif protocol == "webdav":
@@ -4312,7 +4392,6 @@ class SyncPlugin:
                     create_only=create_only,
                 )
         else:
-            os.makedirs(target_dir, exist_ok=True)
             def write_remote_note(rel, text, expected_hash=None, create_only=False):
                 self._write_mirror_file(
                     target_dir,
@@ -4321,6 +4400,7 @@ class SyncPlugin:
                     expected_hash=expected_hash,
                     create_only=create_only,
                     excluded_subdirs=excluded_subdirs,
+                    verify_target=verify_target,
                 )
                 record_remote_path(rel)
             def write_remote_asset(rel, data, expected_hash=None, create_only=False):
@@ -4331,6 +4411,7 @@ class SyncPlugin:
                     expected_hash=expected_hash,
                     create_only=create_only,
                     excluded_subdirs=excluded_subdirs,
+                    verify_target=verify_target,
                 )
                 record_remote_path(rel)
 
@@ -4346,9 +4427,13 @@ class SyncPlugin:
                 progress_state["done"] += 1
                 self._emit_progress(bridge, done=progress_state["done"], total=progress_state["total"])
 
-        lock_dir = target_dir if protocol == "local_mirror" else (plan.get("repo_root") if protocol == "git" else "")
+        lock_dir = batch_base_root if protocol == "local_mirror" else (plan.get("repo_root") if protocol == "git" else "")
         try:
             with self._target_lock(lock_dir):
+                if protocol in ("local_mirror", "git"):
+                    verify_target()
+                    os.makedirs(target_dir, exist_ok=True)
+                    verify_target()
                 # 1. Planned attachment sync (with conditional verification and conflict-copy mapping).
                 for rel in plan.get("assets_synced") or ():
                     if rel in local_assets:
@@ -4612,47 +4697,22 @@ class SyncPlugin:
                     }
 
         # Validate physical target directories across ALL configured notebook bindings (not only the narrowed
-        # auto-sync target) so a symlink pointing into another notebook's folder is caught even on note.saved.
+        # auto-sync target) and record directory identities for post-plan TOCTOU verification during execution.
+        base_root = ""
+        target_identities = {}
         if protocol in ("local_mirror", "git"):
             base_root = self._resolve_mirror_dir(cfg) if protocol == "local_mirror" else (prepared_repo_dir or repo_dir)
-            if base_root:
-                base_real = os.path.realpath(base_root)
-                resolved_targets = []
-                for nb, sub in bindings.items():
-                    tdir = os.path.join(base_root, sub) if sub else base_root
-                    treal = os.path.realpath(tdir)
-                    if sub:
-                        if treal == base_real or not treal.startswith(base_real + os.sep):
-                            return {
-                                "cfg": dict(cfg),
-                                "protocol": protocol,
-                                "target_display": target_display,
-                                "repo_root": prepared_repo_dir or "",
-                                "plans": [],
-                                "remote_error": self._tr(
-                                    f"笔记本「{self._notebook_label(nb)}」的同步子目录超出同步根目录，已中止同步",
-                                    f"Sync subfolder for notebook {self._notebook_label(nb)} resolves outside the sync root; sync aborted",
-                                ),
-                                "fingerprint": "",
-                            }
-                    for prev_nb, prev_sub, prev_real in resolved_targets:
-                        same_or_nested = treal == prev_real or (
-                            bool(sub) and bool(prev_sub) and paths_overlap(treal, prev_real)
-                        )
-                        if same_or_nested:
-                            return {
-                                "cfg": dict(cfg),
-                                "protocol": protocol,
-                                "target_display": target_display,
-                                "repo_root": prepared_repo_dir or "",
-                                "plans": [],
-                                "remote_error": self._tr(
-                                    f"笔记本「{self._notebook_label(prev_nb)}」与「{self._notebook_label(nb)}」的同步目标目录指向同一或嵌套物理目录，已中止同步",
-                                    f"Sync folders for {self._notebook_label(prev_nb)} and {self._notebook_label(nb)} resolve to the same or nested directory; sync aborted",
-                                ),
-                                "fingerprint": "",
-                            }
-                    resolved_targets.append((nb, sub, treal))
+            target_identities, phys_err = self._validate_physical_targets(protocol, cfg, bindings, base_root)
+            if phys_err:
+                return {
+                    "cfg": dict(cfg),
+                    "protocol": protocol,
+                    "target_display": target_display,
+                    "repo_root": prepared_repo_dir or "",
+                    "plans": [],
+                    "remote_error": phys_err,
+                    "fingerprint": "",
+                }
 
         plans = []
         for nb in notebooks:
@@ -4679,6 +4739,9 @@ class SyncPlugin:
                     "remote_error": plan["remote_error"],
                     "fingerprint": "",
                 }
+            plan["batch_base_root"] = base_root
+            plan["batch_bindings"] = dict(bindings)
+            plan["target_identities"] = {k: dict(v) for k, v in target_identities.items()}
             plans.append(plan)
 
         fp = sha256_text(json.dumps([p["fingerprint"] for p in plans], ensure_ascii=False))
