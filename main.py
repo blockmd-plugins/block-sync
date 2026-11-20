@@ -837,6 +837,8 @@ class SyncPlugin:
         self.supports_system = False
         self._stored_global = None
         self._credential_cleanup = set()
+        self._legacy_cleanup = False
+        self._webdav_deadline = 0.0
         self._saved_config = dict(self.config)
         self._result_notice = None
         self.last_status = ""
@@ -1188,6 +1190,14 @@ class SyncPlugin:
             journal = bridge.call_host("host.storage.get", {"key": "credential_cleanup"}).get("value")
             if isinstance(journal, list):
                 self._credential_cleanup = {ref for ref in journal if isinstance(ref, str) and CREDENTIAL_REF.fullmatch(ref)}
+                self._legacy_cleanup = True
+            try:
+                with open(os.path.join(self.data_dir, "credential-cleanup.json"), encoding="utf-8") as saved:
+                    pending = json.loads(saved.read(262145))
+                if isinstance(pending, list):
+                    self._credential_cleanup.update(ref for ref in pending if isinstance(ref, str) and CREDENTIAL_REF.fullmatch(ref))
+            except (OSError, ValueError):
+                pass
 
     def _load_config_record(self, raw):
         config = self._normalize_config(raw, base=DEFAULT_CONFIG)
@@ -1256,6 +1266,24 @@ class SyncPlugin:
     def _config_refs(notebooks, shared, current):
         return {ref for cfg in [*notebooks.values(), shared, current] if cfg for ref in cfg.get("credential_refs", {}).values()}
 
+    def _write_credential_cleanup(self, refs):
+        raw = json.dumps(sorted(refs), separators=(",", ":"))
+        if len(raw) > 262144:
+            raise RuntimeError("credential cleanup journal is full")
+        target = os.path.join(self.data_dir, "credential-cleanup.json")
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.data_dir, delete=False) as temp:
+            stage = temp.name
+            try:
+                temp.write(raw)
+                temp.flush()
+                os.fsync(temp.fileno())
+                temp.close()
+                os.replace(stage, target)
+            finally:
+                if os.path.exists(stage):
+                    os.unlink(stage)
+        self._credential_cleanup = refs
+
     def _cleanup_credentials(self, bridge):
         active = self._config_refs(self.notebook_configs, self._stored_global, self.config)
         complete = self._credential_cleanup & active
@@ -1265,10 +1293,11 @@ class SyncPlugin:
             except (RuntimeError, OSError):
                 break
             complete.add(ref)
-        if complete:
-            remaining = self._credential_cleanup - complete
-            bridge.call_host("host.storage.set", {"key": "credential_cleanup", "value": sorted(remaining)})
-            self._credential_cleanup = remaining
+        if complete or self._legacy_cleanup:
+            self._write_credential_cleanup(self._credential_cleanup - complete)
+            if self._legacy_cleanup:
+                bridge.call_host("host.storage.set", {"key": "credential_cleanup", "value": None})
+                self._legacy_cleanup = False
 
     def _commit_system_config(self, bridge, notebooks, shared, current, migrate=None, clear_pending=False):
         staged = {}
@@ -1304,18 +1333,17 @@ class SyncPlugin:
             actual_notebooks[self._notebook_key()] = actual_current
         old_refs = self._config_refs(self.notebook_configs, self._stored_global, self.config)
         new_refs = self._config_refs(actual_notebooks, actual_shared, actual_current)
+        pending_refs = self._credential_cleanup | set(staged) | (old_refs - new_refs)
+        if pending_refs != self._credential_cleanup:
+            self._write_credential_cleanup(pending_refs)
         if staged:
-            pending = self._credential_cleanup | set(staged)
-            bridge.call_host("host.storage.set", {"key": "credential_cleanup", "value": sorted(pending)})
-            self._credential_cleanup = pending
             for ref, secret in staged.items():
                 bridge.call_host("host.secrets.set", {"key": ref, "value": secret})
                 check = bridge.call_host("host.secrets.get", {"key": ref})
                 if not check.get("found") or check.get("value") != secret:
                     raise RuntimeError("system credential verification failed")
-        retired = (self._credential_cleanup | old_refs) - new_refs
         updates = {
-            "notebook_configs": actual_notebooks, "config": actual_shared, "credential_cleanup": sorted(retired),
+            "notebook_configs": actual_notebooks, "config": actual_shared,
         }
         if clear_pending:
             pending = dict(self.pending_confirms)
@@ -1326,7 +1354,6 @@ class SyncPlugin:
         self._stored_global = actual_shared
         self.config = actual_current
         self._saved_config = dict(self.config)
-        self._credential_cleanup = retired
         if clear_pending:
             self.pending_confirms = pending
             self.pending_confirm = None
