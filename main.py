@@ -1364,8 +1364,19 @@ class SyncPlugin:
         }
         if clear_pending:
             pending = dict(self.pending_confirms)
-            pending.pop(self._result_key(), None)
-            updates.update(pending_confirms=pending, pending_confirm=None)
+            scope = self._result_key()
+            pending.pop(scope, None)
+            cleared_scopes = {scope}
+            if shared is current:
+                cleared_scopes.update(self._notebook_key(root) for root in current.get("selected_notebooks", ()))
+                cleared_scopes.add("__multi__")
+            queued = dict(self._pending_notices)
+            for key, notice in self._pending_notices.items():
+                if isinstance(notice, dict) and self._is_pause_notice(notice):
+                    notice_scope = notice.get("scope", key)
+                    if isinstance(notice_scope, str) and notice_scope in cleared_scopes:
+                        queued.pop(key)
+            updates.update(pending_confirms=pending, pending_confirm=None, pending_notices=queued)
         bridge.call_host("host.storage.set_many", {"values": updates})
         self.notebook_configs = actual_notebooks
         self._stored_global = actual_shared
@@ -1375,6 +1386,7 @@ class SyncPlugin:
             self.pending_confirms = pending
             self._saved_pending_confirms = dict(pending)
             self.pending_confirm = None
+            self._pending_notices = queued
             self._remote_preview_cache.clear()
 
     def _migrate_credentials(self, bridge):
@@ -1757,7 +1769,7 @@ class SyncPlugin:
             self._clear_pending_confirm(bridge)
             self._remote_preview_cache.clear()
 
-    def _save_runtime(self, bridge):
+    def _save_runtime(self, bridge, only_path=None, notebook_root=None):
         key = self._result_key()
         if self.pending_confirm is None:
             self.pending_confirms.pop(key, None)
@@ -1772,19 +1784,30 @@ class SyncPlugin:
         queue_notice = self.supports_system and self.config["system_notifications"] and notice and (
             notice[0] == "待确认" or (notice[1] > 0 and notice[0] != "失败")
         )
+        queued = dict(self._pending_notices)
+        if notice and notice[0] in ("成功", "无变更"):
+            for entry_key, previous in self._pending_notices.items():
+                if not isinstance(previous, dict) or previous.get("scope", entry_key) != key or not self._is_pause_notice(previous):
+                    continue
+                if only_path is None or (previous.get("path") == only_path and previous.get("notebook_root") == notebook_root):
+                    queued.pop(entry_key)
+        notice_key = key
         if queue_notice:
-            queued = dict(self._pending_notices)
-            queued.pop(key, None)
-            queued[key] = {
+            paused_file = notice[0] == "待确认" and only_path is not None
+            if paused_file:
+                notice_key = "note:" + sha256_text(json.dumps([key, notebook_root, only_path], ensure_ascii=False))
+            queued.pop(notice_key, None)
+            queued[notice_key] = {
                 "params": self._result_notice_params(*notice),
                 "fingerprint": self.pending_confirm.get("fingerprint", "") if notice[0] == "待确认" and self.pending_confirm else "",
                 "status": notice[0],
+                "scope": key,
             }
+            if paused_file:
+                queued[notice_key].update(path=only_path, notebook_root=notebook_root)
             values["pending_notices"] = dict(list(queued.items())[-32:])
-        elif notice and notice[0] in ("成功", "无变更"):
-            previous = self._pending_notices.get(key)
-            if isinstance(previous, dict) and self._is_pause_notice(previous):
-                values["pending_notices"] = {scope: item for scope, item in self._pending_notices.items() if scope != key}
+        elif queued != self._pending_notices:
+            values["pending_notices"] = queued
         try:
             if self.supports_system:
                 bridge.call_host("host.storage.set_many", {"values": values})
@@ -1805,7 +1828,7 @@ class SyncPlugin:
             self._pending_notices = values["pending_notices"]
         self._send_result_notice(bridge)
         if queue_notice and self._result_notified:
-            self._ack_result_notices(bridge, [key])
+            self._ack_result_notices(bridge, [notice_key])
 
     def _result_key(self):
         if self.supports_multi_notebook and (
@@ -1926,15 +1949,17 @@ class SyncPlugin:
         deadline = time.monotonic() + 2
         done = []
         for key, notice in self._pending_notices.items():
-            config = self._stored_global if key == "__multi__" else self.notebook_configs.get(key)
-            if config is None and key == self._result_key():
-                config = self.config
             params = notice.get("params") if isinstance(notice, dict) else None
             fingerprint = notice.get("fingerprint") if isinstance(notice, dict) else None
-            plan = self.pending_confirms.get(key) or {}
-            status = (self.notebook_results.get(key) or {}).get("status")
-            cleared_pause = isinstance(notice, dict) and self._is_pause_notice(notice) and status in ("成功", "无变更")
-            if not isinstance(params, dict) or cleared_pause or (fingerprint and fingerprint != plan.get("fingerprint")) or not config or not config["system_notifications"]:
+            scope = notice.get("scope", key) if isinstance(notice, dict) else key
+            if not isinstance(scope, str):
+                done.append(key)
+                continue
+            config = self._stored_global if scope == "__multi__" else self.notebook_configs.get(scope)
+            if config is None and scope == self._result_key():
+                config = self.config
+            plan = self.pending_confirms.get(scope) or {}
+            if not isinstance(params, dict) or (fingerprint and fingerprint != plan.get("fingerprint")) or not config or not config["system_notifications"]:
                 done.append(key)
                 continue
             remaining = int((deadline - time.monotonic()) * 1000)
@@ -7204,7 +7229,7 @@ class SyncPlugin:
                         log_args={"path": only_path},
                     )
                     self._record_result("待确认", msg, protocol=protocol, target=batch["target_display"], notice_key=batch["fingerprint"])
-                    self._save_runtime(bridge)
+                    self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root)
                     self.last_status = msg
                     return msg
                 self._set_pending_confirm(self._build_pending_confirm(batch, reason_items))
@@ -7236,7 +7261,7 @@ class SyncPlugin:
 
         self._last_sync_outcome = "synced"
         self._last_synced_notebooks = [p["nb_root"] for p in batch.get("plans") or () if p.get("nb_root")]
-        self._save_runtime(bridge)
+        self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root)
         self.last_status = msg
         return msg
 
