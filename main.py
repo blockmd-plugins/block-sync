@@ -4216,11 +4216,13 @@ class SyncPlugin:
         only_path=None,
         excluded_subdirs=(),
         tracked_remote_paths=None,
+        git_tree_paths=None,
     ):
         empty = {
             "local_assets": {},
             "remote_assets": {},
             "remote_asset_etags": {},
+            "remote_asset_path_map": {},
             "assets_to_push_new": [],
             "assets_to_push_overwrite": [],
             "assets_to_pull_new": [],
@@ -4269,6 +4271,13 @@ class SyncPlugin:
         local_assets = {}
         remote_assets = {}
         remote_asset_etags = {}
+        remote_asset_path_map = {}
+        git_tracked_assets_folded = {}
+        if git_tree_paths:
+            for tp in sorted(git_tree_paths):
+                if is_safe_rel_asset(tp) and not in_sync_subdir(tp, excluded_subdirs):
+                    git_tracked_assets_folded.setdefault(tp.casefold(), []).append(tp)
+
         for rel in sorted(candidates):
             if excluded_subdirs and in_sync_subdir(rel, excluded_subdirs):
                 continue
@@ -4282,11 +4291,69 @@ class SyncPlugin:
                     remote_assets[rel] = rdata
                     if etag:
                         remote_asset_etags[rel] = etag
+                elif explicit_paths is not None:
+                    for alt_rel in self._webdav_find_case_variants(
+                        base_url, rel, scope=scope, cfg=cfg, excluded_subdirs=excluded_subdirs, filter_fn=is_safe_rel_asset
+                    ):
+                        alt_url = base_url + "/".join(urllib.parse.quote(p, safe="") for p in alt_rel.split("/"))
+                        found_a, rdata_a, etag_a = self._webdav_get_bytes_with_etag(alt_url, cfg=cfg)
+                        if found_a:
+                            remote_assets[alt_rel] = rdata_a
+                            if etag_a:
+                                remote_asset_etags[alt_rel] = etag_a
             elif target_dir:
-                if tracked_remote_paths is None or rel in tracked_remote_paths:
-                    rdata = self._read_asset_file(target_dir, rel, excluded_subdirs=excluded_subdirs)
+                actual_rel = rel
+                if git_tree_paths and rel not in git_tree_paths:
+                    folded_hits = git_tracked_assets_folded.get(rel.casefold()) or []
+                    if len(folded_hits) == 1:
+                        actual_rel = folded_hits[0]
+                if tracked_remote_paths is None or actual_rel in tracked_remote_paths:
+                    rdata = self._read_asset_file(target_dir, actual_rel, excluded_subdirs=excluded_subdirs)
                     if rdata is not None:
-                        remote_assets[rel] = rdata
+                        if actual_rel == rel:
+                            actual_rel = self._resolve_actual_rel_casing(target_dir, rel)
+                        remote_assets[actual_rel] = rdata
+
+        # Detect multi-file attachment case collisions and pair 1-to-1 case-only renamed attachments.
+        local_afolded = {}
+        for lp in sorted(local_assets):
+            local_afolded.setdefault(lp.casefold(), []).append(lp)
+        remote_afolded = {}
+        for rp in sorted(remote_assets):
+            remote_afolded.setdefault(rp.casefold(), []).append(rp)
+
+        multi_remote_a = [grp for grp in remote_afolded.values() if len(grp) > 1]
+        if multi_remote_a and self._dir_is_case_insensitive(nb_root, local_assets.keys()):
+            pair = " / ".join(multi_remote_a[0][:2])
+            raise RuntimeError(self._tr(
+                f"远端存在仅大小写不同的同名附件（{pair}），当前本地磁盘不区分大小写，请先重命名其中一个",
+                f"Remote contains attachments differing only in letter case ({pair}) on a case-insensitive local disk; rename one first",
+            ))
+        multi_local_a = [grp for grp in local_afolded.values() if len(grp) > 1]
+        if multi_local_a and protocol in ("local_mirror", "git") and self._dir_is_case_insensitive(target_dir, remote_assets.keys()):
+            pair = " / ".join(multi_local_a[0][:2])
+            raise RuntimeError(self._tr(
+                f"本地存在仅大小写不同的同名附件（{pair}），同步目标磁盘不区分大小写，请先重命名其中一个",
+                f"Local notebook contains attachments differing only in letter case ({pair}) on a case-insensitive sync target; rename one first",
+            ))
+
+        for fk, l_list in local_afolded.items():
+            r_list = remote_afolded.get(fk)
+            if not r_list or len(l_list) != 1 or len(r_list) != 1:
+                continue
+            lp, rp = l_list[0], r_list[0]
+            if lp == rp or lp in remote_assets or rp in local_assets:
+                continue
+            collides = self._paths_case_collide_on_dir(nb_root, lp, rp) or (
+                protocol in ("local_mirror", "git") and self._paths_case_collide_on_dir(target_dir, lp, rp)
+            )
+            if collides:
+                remote_asset_path_map[lp] = rp
+                remote_assets[lp] = remote_assets.pop(rp)
+                if rp in remote_asset_etags:
+                    remote_asset_etags[lp] = remote_asset_etags.pop(rp)
+                if f"asset:{lp}" not in base_map and f"asset:{rp}" in base_map:
+                    base_map[f"asset:{lp}"] = base_map[f"asset:{rp}"]
 
         push_new = []
         push_ow = []
@@ -4296,7 +4363,7 @@ class SyncPlugin:
         synced = []
         reserved_copies = set()
 
-        for rel in sorted(candidates):
+        for rel in sorted(set(local_assets.keys()) | set(remote_assets.keys())):
             ldata = local_assets.get(rel)
             rdata = remote_assets.get(rel)
             if ldata is None and rdata is None:
@@ -4354,6 +4421,7 @@ class SyncPlugin:
             "local_assets": local_assets,
             "remote_assets": remote_assets,
             "remote_asset_etags": remote_asset_etags,
+            "remote_asset_path_map": remote_asset_path_map,
             "assets_to_push_new": push_new,
             "assets_to_push_overwrite": push_ow,
             "assets_to_pull_new": pull_new,
@@ -4505,13 +4573,29 @@ class SyncPlugin:
                 local_base_dir = nb_root or self.notebook_root
                 tracked_folded = {}
                 only_cf = only_path.casefold() if only_path else None
+                sync_assets_on = bool(cfg.get("sync_assets", True))
+                only_asset_cfs = set()
+                if only_path is not None and sync_assets_on:
+                    for ap in note_asset_paths(only_path, local_notes.get(only_path, "")):
+                        only_asset_cfs.add(ap.casefold())
+                    for ap in note_asset_paths(only_path, remote_notes.get(only_path, "")):
+                        only_asset_cfs.add(ap.casefold())
+                    if is_safe_rel_asset(only_path):
+                        only_asset_cfs.add(only_path.casefold())
                 for tp in sorted(git_tree_paths):
-                    if not is_safe_rel_md(tp) or is_safe_rel_asset(tp) or in_sync_subdir(tp, excluded_subdirs):
+                    if in_sync_subdir(tp, excluded_subdirs):
                         continue
-                    if not self._matches_scope(tp, scope):
+                    is_md = is_safe_rel_md(tp) and not is_safe_rel_asset(tp)
+                    is_as = sync_assets_on and is_safe_rel_asset(tp)
+                    if not (is_md or is_as):
                         continue
-                    if only_cf is not None and tp.casefold() != only_cf:
+                    if is_md and not self._matches_scope(tp, scope):
                         continue
+                    if only_cf is not None:
+                        if is_md and tp.casefold() != only_cf:
+                            continue
+                        if is_as and tp.casefold() not in only_asset_cfs:
+                            continue
                     tracked_folded.setdefault(tp.casefold(), []).append(tp)
                 multi_tracked = [grp for grp in tracked_folded.values() if len(grp) > 1]
                 if multi_tracked and (
@@ -4521,8 +4605,8 @@ class SyncPlugin:
                     pair = " / ".join(multi_tracked[0][:2])
                     remote_inspected = False
                     remote_error = self._tr(
-                        f"Git 远端分支存在仅大小写不同的同名笔记（{pair}），当前磁盘不区分大小写，请先在 Git 仓库中重命名其中一个",
-                        f"Git remote branch contains notes differing only in letter case ({pair}) on a case-insensitive disk; rename one in Git first",
+                        f"Git 远端分支存在仅大小写不同的同名文件（{pair}），当前磁盘不区分大小写，请先在 Git 仓库中重命名其中一个",
+                        f"Git remote branch contains files differing only in letter case ({pair}) on a case-insensitive disk; rename one in Git first",
                     )
 
         aliases = [
@@ -4661,6 +4745,7 @@ class SyncPlugin:
             "local_assets": {},
             "remote_assets": {},
             "remote_asset_etags": {},
+            "remote_asset_path_map": {},
             "assets_to_push_new": [],
             "assets_to_push_overwrite": [],
             "assets_to_pull_new": [],
@@ -4684,6 +4769,7 @@ class SyncPlugin:
                     only_path=only_path,
                     excluded_subdirs=excluded_subdirs,
                     tracked_remote_paths=tracked_remote_paths if protocol == "git" else None,
+                    git_tree_paths=git_tree_paths if protocol == "git" else None,
                 )
             except Exception as exc:
                 remote_inspected = False
@@ -4756,6 +4842,7 @@ class SyncPlugin:
             "remote_asset_hashes": remote_asset_hashes,
             "base_hashes": base_hashes,
             "remote_path_map": remote_path_map,
+            "remote_asset_path_map": asset_plan.get("remote_asset_path_map") or {},
         }, sort_keys=True, ensure_ascii=False)
 
         return {
@@ -5432,6 +5519,7 @@ class SyncPlugin:
                 ))
 
         remote_path_map = plan.get("remote_path_map") or {}
+        remote_asset_path_map = plan.get("remote_asset_path_map") or {}
         planned_git_blobs = {}
 
         def record_remote_path(rel, raw_bytes=None):
@@ -5455,9 +5543,10 @@ class SyncPlugin:
                 )
                 record_remote_path(target_rel)
             def write_remote_asset(rel, data, expected_hash=None, create_only=False):
+                target_rel = remote_asset_path_map.get(rel, rel)
                 self._write_mirror_bytes(
                     target_dir,
-                    rel,
+                    target_rel,
                     data,
                     expected_hash=expected_hash,
                     create_only=create_only,
@@ -5465,7 +5554,7 @@ class SyncPlugin:
                     verify_target=verify_target,
                     root_dir_fd=active_target_fd[0],
                 )
-                record_remote_path(rel)
+                record_remote_path(target_rel)
         elif protocol == "webdav":
             root_url = self._webdav_root_url(cfg)
             sub_dir = self._resolve_webdav_dir(cfg).strip().strip("/")
@@ -5484,9 +5573,10 @@ class SyncPlugin:
                     create_only=create_only,
                 )
             def write_remote_asset(rel, data, expected_hash=None, create_only=False):
+                target_rel = remote_asset_path_map.get(rel, rel)
                 self._webdav_put_bytes(
                     base_url,
-                    rel,
+                    target_rel,
                     data,
                     cfg=cfg,
                     expected_hash=expected_hash,
@@ -5508,9 +5598,10 @@ class SyncPlugin:
                 )
                 record_remote_path(target_rel, text.encode("utf-8"))
             def write_remote_asset(rel, data, expected_hash=None, create_only=False):
+                target_rel = remote_asset_path_map.get(rel, rel)
                 self._write_mirror_bytes(
                     target_dir,
-                    rel,
+                    target_rel,
                     data,
                     expected_hash=expected_hash,
                     create_only=create_only,
@@ -5518,7 +5609,7 @@ class SyncPlugin:
                     verify_target=verify_target,
                     root_dir_fd=active_target_fd[0],
                 )
-                record_remote_path(rel, data)
+                record_remote_path(target_rel, data)
 
         pushed = 0
         pulled = 0
@@ -5550,20 +5641,20 @@ class SyncPlugin:
                     sub_prefix = f"{subdir.strip('/')}/" if subdir.strip("/") else ""
                     planned_git_writes = []
                     for p in plan["to_push_new"]:
-                        planned_git_writes.append(f"{sub_prefix}{p}")
+                        planned_git_writes.append(f"{sub_prefix}{remote_path_map.get(p, p)}")
                     for p in plan["to_push_overwrite"]:
-                        planned_git_writes.append(f"{sub_prefix}{p}")
+                        planned_git_writes.append(f"{sub_prefix}{remote_path_map.get(p, p)}")
                     for p, cp, _ in plan["conflicts"]:
-                        planned_git_writes.append(f"{sub_prefix}{p}")
+                        planned_git_writes.append(f"{sub_prefix}{remote_path_map.get(p, p)}")
                         planned_git_writes.append(f"{sub_prefix}{cp}")
                     for _, cp, _ in (plan.get("asset_view_copies") or ()):
                         planned_git_writes.append(f"{sub_prefix}{cp}")
                     for p in (plan.get("assets_to_push_new") or ()):
-                        planned_git_writes.append(f"{sub_prefix}{p}")
+                        planned_git_writes.append(f"{sub_prefix}{remote_asset_path_map.get(p, p)}")
                     for p, _ in (plan.get("assets_to_push_overwrite") or ()):
-                        planned_git_writes.append(f"{sub_prefix}{p}")
+                        planned_git_writes.append(f"{sub_prefix}{remote_asset_path_map.get(p, p)}")
                     for p, cp in (plan.get("asset_conflicts") or ()):
-                        planned_git_writes.append(f"{sub_prefix}{p}")
+                        planned_git_writes.append(f"{sub_prefix}{remote_asset_path_map.get(p, p)}")
                         planned_git_writes.append(f"{sub_prefix}{cp}")
                     if planned_git_writes:
                         self._check_git_staged_conflicts(plan["repo_root"], planned_git_writes, cfg=cfg)
@@ -5783,6 +5874,9 @@ class SyncPlugin:
         for lp, rp in remote_path_map.items():
             if rp != lp and lp in base_map and rp not in local_notes:
                 base_map.pop(rp, None)
+        for lp, rp in remote_asset_path_map.items():
+            if rp != lp and f"asset:{lp}" in base_map and rp not in local_assets:
+                base_map.pop(f"asset:{rp}", None)
 
         synced_repo_paths = []
         if protocol == "git":
@@ -5793,7 +5887,7 @@ class SyncPlugin:
                 if repo_rel not in planned_git_blobs and rel_path in local_notes:
                     planned_git_blobs[repo_rel] = local_notes[rel_path].encode("utf-8")
             for rel_path in plan.get("assets_synced") or ():
-                repo_rel = f"{sub_prefix}{rel_path}"
+                repo_rel = f"{sub_prefix}{remote_asset_path_map.get(rel_path, rel_path)}"
                 synced_repo_paths.append(repo_rel)
                 if repo_rel not in planned_git_blobs and rel_path in local_assets:
                     planned_git_blobs[repo_rel] = bytes(local_assets[rel_path])
@@ -5957,6 +6051,7 @@ class SyncPlugin:
                 sub = (plan.get("subdir") or "").strip("/")
                 sub_prefix = f"{sub}/" if sub else ""
                 rpm = plan.get("remote_path_map") or {}
+                rapm = plan.get("remote_asset_path_map") or {}
                 asset_copy_map = {orig: cp for orig, cp in (plan.get("asset_conflicts") or ())}
                 remote_notes = plan.get("remote_notes") or {}
                 for p in plan["to_push_new"]:
@@ -5978,16 +6073,16 @@ class SyncPlugin:
                 for _, cp, _ in (plan.get("asset_view_copies") or ()):
                     all_planned_git_writes.append(f"{sub_prefix}{cp}")
                 for p in (plan.get("assets_to_push_new") or ()):
-                    all_planned_git_writes.append(f"{sub_prefix}{p}")
+                    all_planned_git_writes.append(f"{sub_prefix}{rapm.get(p, p)}")
                 for p, _ in (plan.get("assets_to_push_overwrite") or ()):
-                    all_planned_git_writes.append(f"{sub_prefix}{p}")
+                    all_planned_git_writes.append(f"{sub_prefix}{rapm.get(p, p)}")
                 for p, cp in (plan.get("asset_conflicts") or ()):
-                    all_planned_git_writes.append(f"{sub_prefix}{p}")
+                    all_planned_git_writes.append(f"{sub_prefix}{rapm.get(p, p)}")
                     all_planned_git_writes.append(f"{sub_prefix}{cp}")
                 for p in plan["synced"]:
                     all_planned_git_writes.append(f"{sub_prefix}{rpm.get(p, p)}")
                 for p in (plan.get("assets_synced") or ()):
-                    all_planned_git_writes.append(f"{sub_prefix}{p}")
+                    all_planned_git_writes.append(f"{sub_prefix}{rapm.get(p, p)}")
             if all_planned_git_writes:
                 with self._target_lock(batch["repo_root"]):
                     self._check_git_ignored(batch["repo_root"], all_planned_git_writes, cfg=cfg)
