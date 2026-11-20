@@ -15,11 +15,14 @@ import html
 import json
 import os
 import posixpath
+from queue import Empty, Queue
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+from threading import Thread
 import time
 import unicodedata
 import urllib.error
@@ -3158,6 +3161,21 @@ class SyncPlugin:
             return False
         if pid == os.getpid():
             return True
+        if sys.platform == "win32":
+            from ctypes import wintypes
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            kernel.OpenProcess.restype = wintypes.HANDLE
+            kernel.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+            kernel.WaitForSingleObject.restype = wintypes.DWORD
+            kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+            handle = kernel.OpenProcess(0x00100000, False, pid)
+            if not handle:
+                return ctypes.get_last_error() != 87
+            try:
+                return kernel.WaitForSingleObject(handle, 0) != 0
+            finally:
+                kernel.CloseHandle(handle)
         try:
             os.kill(pid, 0)
             return True
@@ -5779,6 +5797,118 @@ class SyncPlugin:
     def _git_index_owner_path(self, repo_root, cfg=None):
         return self._git_path(repo_root, "block-sync-index.owner", cfg=cfg)
 
+    def _git_checkout_state(self, repo, cfg, expected=None):
+        branch = self._git_branch(cfg)
+        head = self._run_git(["rev-parse", "--verify", f"refs/heads/{branch}"], cwd=repo, cfg=cfg)
+        info = os.stat(repo)
+        state = (info.st_dev, info.st_ino, head.stdout.strip() if head.returncode == 0 else "")
+        if self._git_current_branch(repo, cfg=cfg) != branch or (expected is not None and state != expected):
+            raise RuntimeError(self._tr("Git 工作区已切换或更新，请重试同步", "The Git worktree switched branches or changed. Retry sync."))
+        return state
+
+    @contextmanager
+    def _guard_git_branch_ref(self, repo, branch, head):
+        args = ["git", "-c", "core.filesRefLockTimeout=500", "-c", "core.packedRefsTimeout=500", "update-ref", "--stdin", "-z"]
+        with subprocess.Popen(args, cwd=repo, env=self._git_env(), stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as transaction:
+            response = Queue(maxsize=1)
+            reader = Thread(target=lambda: response.put((transaction.stdout.readline().strip(), transaction.stdout.readline().strip())), daemon=True)
+            reader.start()
+            request = b"start\0verify refs/heads/" + os.fsencode(branch) + b"\0" + head.encode("ascii") + b"\0prepare\0"
+            try:
+                try:
+                    transaction.stdin.write(request)
+                    transaction.stdin.flush()
+                    prepared = response.get(timeout=3) == (b"start: ok", b"prepare: ok")
+                except (BrokenPipeError, Empty):
+                    prepared = False
+                if not prepared:
+                    raise RuntimeError(self._tr("Git 分支已变化或正被使用，请重试同步", "The Git branch changed or is busy. Retry sync."))
+                yield
+            finally:
+                try:
+                    transaction.stdin.close()
+                    transaction.wait(timeout=1)
+                except (BrokenPipeError, subprocess.TimeoutExpired):
+                    transaction.kill()
+                    transaction.wait()
+                reader.join(timeout=1)
+
+    def _is_git_checkout_lock(self, marker, index_lock):
+        marker_info, lock_info = os.lstat(marker), os.lstat(index_lock)
+        if not stat.S_ISREG(marker_info.st_mode) or not stat.S_ISREG(lock_info.st_mode):
+            return False
+        if marker_info.st_ino and os.path.samestat(marker_info, lock_info):
+            return True
+        with open(marker, "rb") as owner:
+            token = owner.read(72)
+        if not re.fullmatch(rb"block-sync-checkout-[0-9]{1,10}-[0-9a-f]{32}", token):
+            return False
+        with open(index_lock, "rb") as lock:
+            return lock.read(len(token) + 1) == token
+
+    @contextmanager
+    def _guard_local_git_checkout(self, repo, cfg, expected=None):
+        if not repo or self._is_remote_git_url(cfg.get("git_remote") or ""):
+            yield None
+            return
+        index = self._git_path(repo, "index", cfg=cfg)
+        if not index:
+            raise RuntimeError(self._tr("无法定位 Git 索引文件", "Could not locate Git index file"))
+        index_lock = index + ".lock"
+        marker = os.path.join(os.path.dirname(index), f"block-sync-checkout-{os.getpid()}-{uuid.uuid4().hex}")
+        for entry in os.scandir(os.path.dirname(index)):
+            match = re.fullmatch(r"block-sync-checkout-([0-9]{1,10})-[0-9a-f]{32}", entry.name)
+            if match and entry.is_file(follow_symlinks=False) and not self._pid_is_alive(int(match[1])):
+                try:
+                    os.rename(entry.path, marker)
+                except FileNotFoundError:
+                    continue
+                try:
+                    if self._is_git_checkout_lock(marker, index_lock):
+                        os.unlink(index_lock)
+                except FileNotFoundError:
+                    pass
+                finally:
+                    os.unlink(marker)
+        try:
+            token = os.path.basename(marker).encode("ascii")
+            with open(marker, "xb") as owner:
+                owner.write(token)
+            try:
+                try:
+                    os.link(marker, index_lock)
+                except OSError as exc:
+                    if exc.errno not in (errno.ENOTSUP, errno.ENOSYS, errno.EPERM, errno.EMLINK) and getattr(exc, "winerror", None) not in (1, 50):
+                        raise
+                    with open(index_lock, "xb") as lock:
+                        try:
+                            lock.write(token)
+                            lock.flush()
+                        except OSError:
+                            lock.close()
+                            os.unlink(index_lock)
+                            raise
+            except OSError as exc:
+                raise RuntimeError(self._tr("无法锁定 Git 工作区，请关闭正在执行的 Git 操作后重试", "Could not lock the Git worktree. Finish other Git operations and retry.")) from exc
+            try:
+                state = self._git_checkout_state(repo, cfg, expected)
+                with self._guard_git_branch_ref(repo, self._git_branch(cfg), state[2]):
+                    self._git_checkout_state(repo, cfg, state)
+                    yield state
+                    self._git_checkout_state(repo, cfg, state)
+            finally:
+                try:
+                    if self._is_git_checkout_lock(marker, index_lock):
+                        os.unlink(index_lock)
+                except FileNotFoundError:
+                    pass
+        finally:
+            try:
+                os.unlink(marker)
+            except FileNotFoundError:
+                pass
+
     def _write_git_index_owner(self, repo_root, cfg=None):
         path = self._git_index_owner_path(repo_root, cfg=cfg)
         if not path:
@@ -5943,7 +6073,9 @@ class SyncPlugin:
                 f"Files planned for sync are ignored by Git ignore rules: {sample}",
             ))
 
-    def _commit_and_push_git(self, repo_root, cfg, staged_rel_paths=None, tracked_plan_paths=None, planned_blobs=None):
+    def _commit_and_push_git(self, repo_root, cfg, staged_rel_paths=None, tracked_plan_paths=None, planned_blobs=None, checkout=None):
+        if checkout is not None:
+            self._git_checkout_state(repo_root, cfg, checkout)
         # Remove any stale untracked atomic-write temp files left behind by a prior SIGKILL cancellation
         # so they can never be staged or pushed to the remote repository.
         self._cleanup_stale_temp_files(repo_root, cfg=cfg)
@@ -5970,12 +6102,15 @@ class SyncPlugin:
         # 2. Index flags like --assume-unchanged can NEVER hide a planned write from being committed & pushed.
         # 3. Acquiring .git/index.lock while re-checking staged conflicts, updating refs/heads/<branch>, and
         #    atomically replacing .git/index makes concurrent `git add` races impossible.
-        head_chk = self._run_git(["rev-parse", "--verify", "HEAD"], cwd=repo_root, cfg=cfg)
+        branch_ref = f"refs/heads/{branch}"
+        head_chk = self._run_git(["rev-parse", "--verify", branch_ref], cwd=repo_root, cfg=cfg)
         old_head = head_chk.stdout.strip() if head_chk.returncode == 0 and head_chk.stdout.strip() else ""
+        if checkout is not None and old_head != checkout[2]:
+            raise RuntimeError(self._tr("Git 分支已更新，请重试同步", "The Git branch advanced. Retry sync."))
         old_tree = ""
         head_entries = {}
         if old_head:
-            tree_chk = self._run_git(["rev-parse", "--verify", "HEAD^{tree}"], cwd=repo_root, cfg=cfg)
+            tree_chk = self._run_git(["rev-parse", "--verify", old_head + "^{tree}"], cwd=repo_root, cfg=cfg)
             if tree_chk.returncode == 0 and tree_chk.stdout.strip():
                 old_tree = tree_chk.stdout.strip()
             if all_check_paths:
@@ -6117,7 +6252,6 @@ class SyncPlugin:
                     raise RuntimeError(self._tr(f"Git 提交对象创建失败: {self._error_detail(err_txt)}", f"Git commit-tree failed: {self._error_detail(err_txt)}"))
                 new_commit = (ct_proc.stdout or b"").decode("ascii", errors="replace").strip()
 
-                owner_path = self._write_git_index_owner(repo_root, cfg=cfg)
                 # 2. Acquire .git/index.lock so no concurrent `git add` can mutate the real index between
                 #    our staged-conflict check, branch ref update, and atomic index replacement.
                 lock_fd = None
@@ -6136,7 +6270,11 @@ class SyncPlugin:
 
                 replaced_index = False
                 ref_advanced = False
+                owner_path = ""
                 try:
+                    owner_path = self._write_git_index_owner(repo_root, cfg=cfg)
+                    if checkout is not None:
+                        self._git_checkout_state(repo_root, cfg, checkout)
                     # Re-check staged conflicts under index.lock (read-only against real_index).
                     self._check_git_staged_conflicts(repo_root, all_check_paths, cfg=cfg, recover=False)
 
@@ -6215,7 +6353,7 @@ class SyncPlugin:
         remotes = [r.strip() for r in remote_proc.stdout.splitlines() if r.strip()]
         if remotes:
             remote_name = "origin" if "origin" in remotes else remotes[0]
-            head_proc = self._run_git(["rev-parse", "--verify", "HEAD"], cwd=repo_root, cfg=cfg)
+            head_proc = self._run_git(["rev-parse", "--verify", branch_ref], cwd=repo_root, cfg=cfg)
             if head_proc.returncode == 0:
                 head_oid = (head_proc.stdout or "").strip()
                 needs_push = False
@@ -6525,7 +6663,7 @@ class SyncPlugin:
                         planned_git_writes.append(f"{sub_prefix}{remote_asset_path_map.get(p, p)}")
                         planned_git_writes.append(f"{sub_prefix}{cp}")
                     if planned_git_writes:
-                        self._check_git_staged_conflicts(plan["repo_root"], planned_git_writes, cfg=cfg)
+                        self._check_git_staged_conflicts(plan["repo_root"], planned_git_writes, cfg=cfg, recover=False)
                 # 1. Planned attachment sync (with conditional verification and conflict-copy mapping).
                 for rel in plan.get("assets_synced") or ():
                     if rel in local_assets:
@@ -6825,40 +6963,44 @@ class SyncPlugin:
                 }
 
         plans = []
-        for nb in notebooks:
-            sub = bindings[nb]
-            plan = self._compute_sync_plan(
-                bridge,
-                cfg,
-                only_path=only_path,
-                inspect_remote=inspect_remote,
-                force_refresh=force_refresh,
-                nb_root=nb,
-                subdir=sub,
-                prepared_repo_dir=prepared_repo_dir,
-                target_bases=target_bases,
-                excluded_subdirs=reserved_subdirs if not sub else (),
-            )
-            if plan.get("remote_error"):
-                return {
-                    "cfg": dict(cfg),
-                    "protocol": protocol,
-                    "target_display": target_display,
-                    "repo_root": prepared_repo_dir or "",
-                    "plans": plans,
-                    "remote_error": plan["remote_error"],
-                    "fingerprint": "",
-                }
-            plan["batch_base_root"] = base_root
-            plan["batch_bindings"] = dict(bindings)
-            plan["target_identities"] = {k: dict(v) for k, v in target_identities.items()}
-            plans.append(plan)
+        with self._guard_local_git_checkout(prepared_repo_dir, cfg) as checkout:
+            for nb in notebooks:
+                sub = bindings[nb]
+                plan = self._compute_sync_plan(
+                    bridge,
+                    cfg,
+                    only_path=only_path,
+                    inspect_remote=inspect_remote,
+                    force_refresh=force_refresh,
+                    nb_root=nb,
+                    subdir=sub,
+                    prepared_repo_dir=prepared_repo_dir,
+                    target_bases=target_bases,
+                    excluded_subdirs=reserved_subdirs if not sub else (),
+                )
+                if plan.get("remote_error"):
+                    return {
+                        "cfg": dict(cfg),
+                        "protocol": protocol,
+                        "target_display": target_display,
+                        "repo_root": prepared_repo_dir or "",
+                        "plans": plans,
+                        "remote_error": plan["remote_error"],
+                        "fingerprint": "",
+                    }
+                plan["batch_base_root"] = base_root
+                plan["batch_bindings"] = dict(bindings)
+                plan["target_identities"] = {k: dict(v) for k, v in target_identities.items()}
+                plans.append(plan)
 
         phys_fp = [
             [nb, info.get("real"), list(info["real_stat_id"]) if info.get("real_stat_id") is not None else None]
             for nb, info in sorted(target_identities.items())
         ]
-        fp = sha256_text(json.dumps({"plans": [p["fingerprint"] for p in plans], "targets": phys_fp}, ensure_ascii=False))
+        fp_payload = {"plans": [p["fingerprint"] for p in plans], "targets": phys_fp}
+        if checkout is not None:
+            fp_payload["git_checkout"] = checkout
+        fp = sha256_text(json.dumps(fp_payload, ensure_ascii=False))
         return {
             "cfg": dict(cfg),
             "protocol": protocol,
@@ -6867,6 +7009,7 @@ class SyncPlugin:
             "plans": plans,
             "layout_key": layout_key,
             "bindings": bindings,
+            "git_checkout": checkout,
             "remote_error": None,
             "fingerprint": fp,
         }
@@ -6965,27 +7108,27 @@ class SyncPlugin:
                     all_planned_git_writes.append(f"{sub_prefix}{rpm.get(p, p)}")
                 for p in (plan.get("assets_synced") or ()):
                     all_planned_git_writes.append(f"{sub_prefix}{rapm.get(p, p)}")
-            if all_planned_git_writes:
-                with self._target_lock(batch["repo_root"]):
-                    self._check_git_ignored(batch["repo_root"], all_planned_git_writes, cfg=cfg)
-                    self._check_git_staged_conflicts(batch["repo_root"], all_planned_git_writes, cfg=cfg)
-
-        for plan in batch["plans"]:
-            pushed, pulled, conflicts, assets, updated_base, written_paths, synced_paths, nb_blobs = self._apply_notebook_plan(
-                bridge, plan, only_path=only_path, progress_state=progress_state
-            )
-            total_pushed += pushed
-            total_pulled += pulled
-            total_conflicts += conflicts
-            risks = self._plan_risk_metrics(plan)
-            reported_conflicts += risks["conflicts"] + risks["pull_conflict"] + risks["push_conflict"]
-            total_assets += assets
-            pending_base_maps.append((plan["meta_key"], updated_base))
-            staged_git_paths.extend(written_paths)
-            tracked_git_paths.extend(synced_paths)
-            planned_git_blobs.update(nb_blobs)
-            if protocol != "git":
-                self.sync_meta[plan["meta_key"]] = updated_base
+        checkout = batch.get("git_checkout")
+        with self._guard_local_git_checkout(repo if checkout is not None else None, cfg, expected=checkout):
+            if protocol == "git" and repo and all_planned_git_writes:
+                self._check_git_ignored(repo, all_planned_git_writes, cfg=cfg)
+                self._check_git_staged_conflicts(repo, all_planned_git_writes, cfg=cfg, recover=checkout is None)
+            for plan in batch["plans"]:
+                pushed, pulled, conflicts, assets, updated_base, written_paths, synced_paths, nb_blobs = self._apply_notebook_plan(
+                    bridge, plan, only_path=only_path, progress_state=progress_state
+                )
+                total_pushed += pushed
+                total_pulled += pulled
+                total_conflicts += conflicts
+                risks = self._plan_risk_metrics(plan)
+                reported_conflicts += risks["conflicts"] + risks["pull_conflict"] + risks["push_conflict"]
+                total_assets += assets
+                pending_base_maps.append((plan["meta_key"], updated_base))
+                staged_git_paths.extend(written_paths)
+                tracked_git_paths.extend(synced_paths)
+                planned_git_blobs.update(nb_blobs)
+                if protocol != "git":
+                    self.sync_meta[plan["meta_key"]] = updated_base
 
         did_push = False
         if protocol == "git" and batch.get("repo_root"):
@@ -7003,6 +7146,7 @@ class SyncPlugin:
                     staged_rel_paths=staged_git_paths,
                     tracked_plan_paths=tracked_git_paths,
                     planned_blobs=planned_git_blobs,
+                    checkout=checkout,
                 )
             for mk, updated_base in pending_base_maps:
                 self.sync_meta[mk] = updated_base
