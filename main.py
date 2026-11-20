@@ -1372,7 +1372,7 @@ class SyncPlugin:
                 cleared_scopes.add("__multi__")
             queued = dict(self._pending_notices)
             for key, notice in self._pending_notices.items():
-                if isinstance(notice, dict) and self._is_pause_notice(notice):
+                if isinstance(notice, dict) and (notice.get("status") == "失败" or self._is_pause_notice(notice)):
                     notice_scope = notice.get("scope", key)
                     if isinstance(notice_scope, str) and notice_scope in cleared_scopes:
                         queued.pop(key)
@@ -1782,30 +1782,39 @@ class SyncPlugin:
         }
         notice = self._result_notice
         queue_notice = self.supports_system and self.config["system_notifications"] and notice and (
-            notice[0] == "待确认" or (notice[1] > 0 and notice[0] != "失败")
+            notice[0] in ("待确认", "失败") or notice[1] > 0
         )
         queued = dict(self._pending_notices)
         if notice and notice[0] in ("成功", "无变更"):
             for entry_key, previous in self._pending_notices.items():
-                if not isinstance(previous, dict) or previous.get("scope", entry_key) != key or not self._is_pause_notice(previous):
+                if not isinstance(previous, dict) or previous.get("scope", entry_key) != key:
                     continue
-                if only_path is None or (previous.get("path") == only_path and previous.get("notebook_root") == notebook_root):
+                if previous.get("status") != "失败" and not self._is_pause_notice(previous):
+                    continue
+                legacy_pause = "order" not in previous and not previous.get("path") and not previous.get("fingerprint")
+                if only_path is None or legacy_pause or (previous.get("path") == only_path and previous.get("notebook_root") == notebook_root):
                     queued.pop(entry_key)
         notice_key = key
         if queue_notice:
-            paused_file = notice[0] == "待确认" and only_path is not None
-            if paused_file:
-                notice_key = "note:" + sha256_text(json.dumps([key, notebook_root, only_path], ensure_ascii=False))
+            scoped_file = notice[0] in ("待确认", "失败") and only_path is not None
+            if scoped_file:
+                prefix = "note:" if notice[0] == "待确认" else "failure:"
+                notice_key = prefix + sha256_text(json.dumps([key, notebook_root, only_path], ensure_ascii=False))
+            elif notice[0] == "失败":
+                notice_key = "failure:" + sha256_text(key)
+            elif notice[1] > 0:
+                notice_key = "conflict:" + notice[2]
             queued.pop(notice_key, None)
             queued[notice_key] = {
                 "params": self._result_notice_params(*notice),
                 "fingerprint": self.pending_confirm.get("fingerprint", "") if notice[0] == "待确认" and self.pending_confirm else "",
                 "status": notice[0],
                 "scope": key,
+                "order": max((self._notice_order(item) for item in queued.values()), default=0) + 1,
             }
-            if paused_file:
+            if scoped_file:
                 queued[notice_key].update(path=only_path, notebook_root=notebook_root)
-            values["pending_notices"] = dict(list(queued.items())[-32:])
+            values["pending_notices"] = dict(sorted(queued.items(), key=lambda entry: self._notice_order(entry[1]))[-32:])
         elif queued != self._pending_notices:
             values["pending_notices"] = queued
         try:
@@ -1883,7 +1892,7 @@ class SyncPlugin:
         if last_success is not None:
             entry["last_success"] = last_success
         self.notebook_results[nb_key] = entry
-        self._result_notice = (status_str, int(conflicts or 0), notice_key)
+        self._result_notice = (status_str, int(conflicts or 0), notice_key or (uuid.uuid4().hex if conflicts else ""))
 
     def _send_result_notice(self, bridge):
         notice, self._result_notice = self._result_notice, None
@@ -1920,6 +1929,8 @@ class SyncPlugin:
             fingerprint = (self.pending_confirm or {}).get("fingerprint") or notice_key
             if fingerprint:
                 params["dedup_key"] = fingerprint
+        elif conflicts and notice_key:
+            params["dedup_key"] = notice_key
         if self.notebook_root and self._result_key() != "__multi__":
             root_key = self._notebook_key()
             params["notebook_root"] = next(
@@ -1948,7 +1959,7 @@ class SyncPlugin:
     def _retry_result_notices(self, bridge):
         deadline = time.monotonic() + 2
         done = []
-        for key, notice in self._pending_notices.items():
+        for key, notice in sorted(self._pending_notices.items(), key=lambda entry: self._notice_order(entry[1])):
             params = notice.get("params") if isinstance(notice, dict) else None
             fingerprint = notice.get("fingerprint") if isinstance(notice, dict) else None
             scope = notice.get("scope", key) if isinstance(notice, dict) else key
@@ -1977,6 +1988,10 @@ class SyncPlugin:
         return notice.get("status") == "待确认" or isinstance(params, dict) and params.get("title") in (
             "同步等待确认", "Sync needs confirmation",
         )
+
+    def _notice_order(self, notice):
+        order = notice.get("order", 0) if isinstance(notice, dict) else 0
+        return order if isinstance(order, int) and 0 <= order < 2**52 else 0
 
     def _get_last_result(self):
         return self.notebook_results.get(self._result_key()) or self.notebook_results.get(self._notebook_key())
@@ -7196,7 +7211,7 @@ class SyncPlugin:
                     f"{self._protocol_label(protocol)} sync",
                 ), "失败", tone="danger", tooltip=msg)
                 self._record_result("失败", msg, protocol=protocol)
-                self._save_runtime(bridge)
+                self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root)
                 self.last_status = msg
                 raise self._sync_failure(msg) from exc
 
@@ -7204,7 +7219,7 @@ class SyncPlugin:
             msg = batch["remote_error"]
             self._append_log(self._tr(f"{self._protocol_label(protocol)}同步", f"{self._protocol_label(protocol)} sync"), "失败", tone="danger", tooltip=msg)
             self._record_result("失败", msg, protocol=protocol, target=batch["target_display"])
-            self._save_runtime(bridge)
+            self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root)
             self.last_status = msg
             raise self._sync_failure(msg)
 
@@ -7255,7 +7270,7 @@ class SyncPlugin:
                 msg = self._tr(f"{self._protocol_label(protocol)}同步未完成: {msg}", f"{self._protocol_label(protocol)} sync failed: {msg}")
             self._append_log(self._tr(f"{self._protocol_label(protocol)}同步", f"{self._protocol_label(protocol)} sync"), "失败", tone="danger", tooltip=msg)
             self._record_result("失败", msg, protocol=protocol, target=batch["target_display"])
-            self._save_runtime(bridge)
+            self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root)
             self.last_status = msg
             raise self._sync_failure(msg) from exc
 
@@ -8021,9 +8036,9 @@ class SyncPlugin:
             event_name = str(params.get("event") or "")
             if event_name == "plugin.credentials_migrate":
                 return {"handled": True, "outcome": self._migrate_credentials(bridge)}
-            if event_name in ("app.focus", "system.wake", "network.changed") and self._pending_notices:
+            if event_name in ("app.focus", "system.wake", "network.changed", "plugin.notifications_retry") and self._pending_notices:
                 self._retry_result_notices(bridge)
-            if event_name == "app.focus":
+            if event_name in ("app.focus", "plugin.notifications_retry"):
                 return {"handled": True, "outcome": "skipped"}
             if event_name in ("system.wake", "network.changed"):
                 return self._sync_after_system_event(bridge, event_name, params)
