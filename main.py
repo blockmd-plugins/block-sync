@@ -52,6 +52,7 @@ INITIALIZED_META_KEY = "initialized_targets"
 MAX_STORED_CONFIRM_SAMPLES = 30
 MAX_WEBDAV_DIRS = 2000
 CREDENTIAL_FIELDS = ("git_token", "webdav_pass")
+CREDENTIAL_MAX_BYTES = 1536
 CREDENTIAL_REF = re.compile(r"^sync\.(git_token|webdav_pass)\.[0-9a-f]{32}$")
 
 DEFAULT_CONFIG = {
@@ -1209,9 +1210,20 @@ class SyncPlugin:
         return "" if self.supports_system else config[key]
 
     def _credential_placeholder(self, config, field, default):
-        if self.supports_system and (config.get(field) or config.get("credential_refs", {}).get(field)):
-            return self._tr("已保存，留空保留", "Saved. Leave blank to keep it.")
+        if self.supports_system:
+            value = config.get(field)
+            if value and not self._credential_fits(value):
+                return self._tr("旧凭据仍为明文，请重新录入或清除", "Legacy credential is still stored in plain text. Replace or clear it.")
+            if value or config.get("credential_refs", {}).get(field):
+                return self._tr("已保存，留空保留", "Saved. Leave blank to keep it.")
         return default
+
+    @staticmethod
+    def _credential_fits(value):
+        try:
+            return "\x00" not in value and len(value.encode("utf-8")) <= CREDENTIAL_MAX_BYTES
+        except UnicodeEncodeError:
+            return False
 
     @staticmethod
     def _credential_target(config, field):
@@ -1258,7 +1270,7 @@ class SyncPlugin:
             bridge.call_host("host.storage.set", {"key": "credential_cleanup", "value": sorted(remaining)})
             self._credential_cleanup = remaining
 
-    def _commit_system_config(self, bridge, notebooks, shared, current, migrate=None):
+    def _commit_system_config(self, bridge, notebooks, shared, current, migrate=None, clear_pending=False):
         staged = {}
         refs_by_value = {}
 
@@ -1302,14 +1314,23 @@ class SyncPlugin:
                 if not check.get("found") or check.get("value") != secret:
                     raise RuntimeError("system credential verification failed")
         retired = (self._credential_cleanup | old_refs) - new_refs
-        bridge.call_host("host.storage.set_many", {"values": {
+        updates = {
             "notebook_configs": actual_notebooks, "config": actual_shared, "credential_cleanup": sorted(retired),
-        }})
+        }
+        if clear_pending:
+            pending = dict(self.pending_confirms)
+            pending.pop(self._result_key(), None)
+            updates.update(pending_confirms=pending, pending_confirm=None)
+        bridge.call_host("host.storage.set_many", {"values": updates})
         self.notebook_configs = actual_notebooks
         self._stored_global = actual_shared
         self.config = actual_current
         self._saved_config = dict(self.config)
         self._credential_cleanup = retired
+        if clear_pending:
+            self.pending_confirms = pending
+            self.pending_confirm = None
+            self._remote_preview_cache.clear()
 
     def _migrate_credentials(self, bridge):
         if not self.supports_system:
@@ -1319,7 +1340,7 @@ class SyncPlugin:
             stored = [*self.notebook_configs.values(), self._stored_global, self.config]
             pending = dict.fromkeys(
                 (field, cfg[field]) for cfg in stored if cfg for field in CREDENTIAL_FIELDS
-                if cfg.get(field) and "\x00" not in cfg[field] and len(cfg[field].encode("utf-8", errors="replace")) <= 1536
+                if cfg.get(field) and self._credential_fits(cfg[field])
             )
             if pending:
                 self._commit_system_config(bridge, self.notebook_configs, self._stored_global, self.config, migrate=next(iter(pending)))
@@ -1621,9 +1642,17 @@ class SyncPlugin:
                 merged["credential_refs"] = refs
         return merged
 
-    def _save_config(self, bridge, config=None, forget=None):
+    def _save_config(self, bridge, config=None, forget=None, clear_pending=False):
         candidate = self.config if config is None else config
         if self.supports_system:
+            for field in CREDENTIAL_FIELDS:
+                value = candidate.get(field)
+                if value and not self._credential_fits(value) and (value != self._saved_config.get(field) or
+                        self._credential_target(candidate, field) != self._credential_target(self._saved_config, field)):
+                    raise RuntimeError(self._tr(
+                        "请输入不超过 1536 字节且不含空字符的凭据",
+                        "Enter a credential of at most 1536 bytes with no NUL characters.",
+                    ))
             try:
                 shared = candidate if self.supports_multi_notebook else self._stored_global
                 notebooks = self.notebook_configs
@@ -1640,7 +1669,7 @@ class SyncPlugin:
                     notebooks = {key: remove_credential(record) for key, record in notebooks.items()}
                     shared = remove_credential(shared)
                     candidate = remove_credential(candidate)
-                self._commit_system_config(bridge, notebooks, shared, candidate)
+                self._commit_system_config(bridge, notebooks, shared, candidate, clear_pending=clear_pending)
             except (RuntimeError, OSError) as exc:
                 self.config = dict(self._saved_config)
                 raise RuntimeError(self._tr(
@@ -1657,6 +1686,9 @@ class SyncPlugin:
         bridge.call_host("host.storage.set", {"key": "notebook_configs", "value": self.notebook_configs})
         if self.supports_multi_notebook:
             bridge.call_host("host.storage.set", {"key": "config", "value": self.config})
+        if clear_pending:
+            self._clear_pending_confirm(bridge)
+            self._remote_preview_cache.clear()
 
     def _save_runtime(self, bridge):
         key = self._result_key()
@@ -3567,22 +3599,34 @@ class SyncPlugin:
 
     def _run_git(self, args, cwd=None, timeout=8, cfg=None):
         c = cfg or self.config
-        cmd = ["git"]
-        auth_mode = c.get("git_auth", "ssh")
+        cmd = ["git", *args]
+        env = self._git_env()
         token = str(c.get("git_token") or "").strip()
         target = str(c.get("git_remote") or "").strip()
-        if auth_mode == "token" and token and target.lower().startswith(("https://", "http://")):
+        encoded = ""
+        if (c.get("git_auth") == "token" and token and target.lower().startswith(("https://", "http://"))
+                and args and args[0] in ("clone", "fetch", "ls-remote", "pull", "push")):
             encoded = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
-            cmd.extend(["-c", f"http.extraHeader=Authorization: Basic {encoded}"])
-        cmd.extend(args)
-        return subprocess.run(
-            cmd,
-            cwd=cwd,
-            env=self._git_env(),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+            env = {key: val for key, val in env.items() if not key.startswith("GIT_TRACE") and key != "GIT_CURL_VERBOSE"}
+            count = int(env.get("GIT_CONFIG_COUNT") or "0")
+            for key, value in (
+                (f"http.{target}.extraHeader", f"Authorization: Basic {encoded}"),
+                (f"http.{target}.followRedirects", "false"),
+            ):
+                env[f"GIT_CONFIG_KEY_{count}"] = key
+                env[f"GIT_CONFIG_VALUE_{count}"] = value
+                count += 1
+            env["GIT_CONFIG_COUNT"] = str(count)
+        try:
+            proc = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if encoded:
+                raise subprocess.TimeoutExpired(cmd, timeout) from None
+            raise
+        if encoded and proc.returncode != 0:
+            proc.stderr = proc.stderr.replace(encoded, "***").replace(token, "***")
+            proc.stdout = proc.stdout.replace(encoded, "***").replace(token, "***")
+        return proc
 
     def _is_managed_git_dir(self, repo_dir):
         if not repo_dir:
@@ -7438,39 +7482,32 @@ class SyncPlugin:
             accepted = {}
             if isinstance(values, dict) and values:
                 cfg = self._normalize_config(values, base=self.config)
-                changed_immediate = False
+                next_config = dict(self.config)
+                clear_pending = False
+                next_status = self.last_status
                 if "selected_notebooks" in values and cfg["selected_notebooks"] != self.config["selected_notebooks"]:
-                    self.config["selected_notebooks"] = list(cfg["selected_notebooks"])
-                    self._clear_pending_confirm(bridge)
-                    self._remote_preview_cache.clear()
-                    self.last_status = ""
-                    changed_immediate = True
-                if cfg["auto_sync"] != self.config["auto_sync"]:
-                    self.config["auto_sync"] = cfg["auto_sync"]
-                    changed_immediate = True
-                if cfg["system_notifications"] != self.config["system_notifications"]:
-                    self.config["system_notifications"] = cfg["system_notifications"]
-                    changed_immediate = True
+                    next_config["selected_notebooks"] = list(cfg["selected_notebooks"])
+                    clear_pending = True
+                    next_status = ""
+                next_config["auto_sync"] = cfg["auto_sync"]
+                next_config["system_notifications"] = cfg["system_notifications"]
                 if cfg["conflict_policy"] != self.config["conflict_policy"]:
-                    self.config["conflict_policy"] = cfg["conflict_policy"]
-                    self._clear_pending_confirm(bridge)
-                    self._remote_preview_cache.clear()
-                    self.last_status = ""
-                    changed_immediate = True
+                    next_config["conflict_policy"] = cfg["conflict_policy"]
+                    clear_pending = True
+                    next_status = ""
                 if cfg["protocol"] == "local_mirror":
                     mirror_err = self._target_error(cfg, require_notebooks=False)
                     if not mirror_err:
                         if self.config["protocol"] != "local_mirror" or self.config["mirror_dir"] != cfg["mirror_dir"]:
-                            self.config["protocol"] = "local_mirror"
-                            self.config["mirror_dir"] = cfg["mirror_dir"]
-                            self._clear_pending_confirm(bridge)
-                            self._remote_preview_cache.clear()
-                            self.last_status = self._tr("已启用本地镜像目录", "Local mirror folder enabled")
-                            changed_immediate = True
+                            next_config["protocol"] = "local_mirror"
+                            next_config["mirror_dir"] = cfg["mirror_dir"]
+                            clear_pending = True
+                            next_status = self._tr("已启用本地镜像目录", "Local mirror folder enabled")
                     elif cfg["mirror_dir"]:
                         render_status = mirror_err
-                if changed_immediate:
-                    self._save_config(bridge)
+                if next_config != self.config:
+                    self._save_config(bridge, next_config, clear_pending=clear_pending)
+                    self.last_status = next_status
                 accepted = {
                     key: self.config[key]
                     for key in ("selected_notebooks", "auto_sync", "system_notifications", "conflict_policy", "protocol", "mirror_dir")
@@ -7502,10 +7539,7 @@ class SyncPlugin:
                         "page": self.build_page(cfg=next_cfg),
                         "status": status,
                     }
-                if next_cfg != self.config:
-                    self._clear_pending_confirm(bridge)
-                    self._remote_preview_cache.clear()
-                self._save_config(bridge, next_cfg)
+                self._save_config(bridge, next_cfg, clear_pending=next_cfg != self.config)
                 status = self._tr("已保存同步目标配置", "Sync destination saved")
                 self.last_status = status
                 ok = True
@@ -7513,9 +7547,7 @@ class SyncPlugin:
             elif action_id == "forget_credential" and self.supports_system:
                 field = {"git": "git_token", "webdav": "webdav_pass"}.get(self.config["protocol"])
                 if field and values.get("protocol", self.config["protocol"]) == self.config["protocol"]:
-                    self._save_config(bridge, forget=field)
-                    self._clear_pending_confirm(bridge)
-                    self._remote_preview_cache.clear()
+                    self._save_config(bridge, forget=field, clear_pending=True)
                     status = self._tr("已清除此目标的同步凭据", "Sync credential cleared for this destination")
                     if self._credential_cleanup:
                         status = self._tr("已取消使用此目标的凭据，系统凭据库中的删除将重试", "Sync will stop using this credential. Deletion from the system store will be retried.")
@@ -7549,9 +7581,7 @@ class SyncPlugin:
                             "status": err,
                         }
                     if next_cfg != self.config:
-                        self._clear_pending_confirm(bridge)
-                        self._remote_preview_cache.clear()
-                        self._save_config(bridge, next_cfg)
+                        self._save_config(bridge, next_cfg, clear_pending=True)
                 err = self._target_error(self.config)
                 if err or not self._selected_notebooks(self.config):
                     status = err or self._tr("请至少选择一个笔记本", "Select at least one notebook")
