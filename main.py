@@ -1402,12 +1402,24 @@ class SyncPlugin:
 
     def _list_dir_assets(self, root_dir, excluded_subdirs=()):
         names = set()
+        if not root_dir or not os.path.isdir(root_dir):
+            return names
+        root_real = os.path.realpath(root_dir)
         for root, dirs, files in os.walk(root_dir):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            dirs[:] = [
+                d for d in dirs
+                if not d.startswith(".")
+                and os.path.realpath(os.path.join(root, d)).startswith(root_real + os.sep)
+            ]
             if root == root_dir:
                 dirs[:] = [d for d in dirs if sync_dir_key(d) not in excluded_subdirs]
             for name in files:
-                rel = os.path.relpath(os.path.join(root, name), root_dir).replace(os.sep, "/")
+                if name.startswith("."):
+                    continue
+                full = os.path.join(root, name)
+                if not os.path.realpath(full).startswith(root_real + os.sep):
+                    continue
+                rel = os.path.relpath(full, root_dir).replace(os.sep, "/")
                 if is_safe_rel_asset(rel):
                     names.add(rel)
         return names
@@ -1448,7 +1460,7 @@ class SyncPlugin:
             return
         lock_root = os.path.join(self.data_dir or tempfile.gettempdir(), "locks")
         os.makedirs(lock_root, exist_ok=True)
-        key = sha256_text(os.path.realpath(target_dir))[:16]
+        key = sha256_text(os.path.normcase(os.path.realpath(target_dir)))[:16]
         lock_path = os.path.join(lock_root, f"{key}.lock")
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
@@ -1463,6 +1475,40 @@ class SyncPlugin:
             except OSError:
                 pass
             os.close(fd)
+
+    def _preserve_external_temp(self, temp_path, dest, hash_hex, default_ext=""):
+        stem, ext = os.path.splitext(dest)
+        use_ext = ext or default_ext
+        short = str(hash_hex or "unknown")[:8]
+        for idx in range(100):
+            suffix = "" if idx == 0 else f"-{idx}"
+            candidate = f"{stem}.conflict-external-{short}{suffix}{use_ext}"
+            try:
+                os.link(temp_path, candidate)
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+                return candidate
+            except FileExistsError:
+                continue
+            except OSError as err:
+                if err.errno not in (
+                    errno.EXDEV,
+                    errno.ENOTSUP,
+                    errno.EOPNOTSUPP,
+                    errno.ENOSYS,
+                    errno.EMLINK,
+                ):
+                    return ""
+                if os.path.exists(candidate):
+                    continue
+                try:
+                    os.replace(temp_path, candidate)
+                    return candidate
+                except OSError:
+                    return ""
+        return ""
 
     def _safe_mirror_dest(self, mirror_dir, rel_path):
         if not is_safe_rel_path(rel_path):
@@ -1636,14 +1682,24 @@ class SyncPlugin:
                         with open(temp_path, "r", encoding="utf-8", errors="replace", newline="") as swapped_fh:
                             swapped_hash = sha256_text(swapped_fh.read())
                         if swapped_hash != expected_hash and swapped_hash != content_hash:
-                            if not atomic_swap_files(temp_path, dest):
-                                stem, ext = os.path.splitext(dest)
-                                backup = f"{stem}.conflict-external-{swapped_hash[:8]}{ext or '.md'}"
-                                try:
-                                    os.replace(temp_path, backup)
-                                    temp_path = None
-                                except OSError:
-                                    pass
+                            if atomic_swap_files(temp_path, dest):
+                                # Verify what came back into temp_path; if a second external save landed at dest
+                                # before rollback, restore that newest save to dest and preserve the other copy.
+                                with open(temp_path, "r", encoding="utf-8", errors="replace", newline="") as rb_fh:
+                                    rollback_hash = sha256_text(rb_fh.read())
+                                if rollback_hash != content_hash:
+                                    if atomic_swap_files(temp_path, dest):
+                                        with open(temp_path, "r", encoding="utf-8", errors="replace", newline="") as fin_fh:
+                                            final_hash = sha256_text(fin_fh.read())
+                                        if final_hash != content_hash:
+                                            self._preserve_external_temp(temp_path, dest, final_hash, default_ext=".md")
+                                            temp_path = None
+                                    else:
+                                        self._preserve_external_temp(temp_path, dest, rollback_hash, default_ext=".md")
+                                        temp_path = None
+                            else:
+                                self._preserve_external_temp(temp_path, dest, swapped_hash, default_ext=".md")
+                                temp_path = None
                             raise RuntimeError(change_err)
                         # Expected old file is in temp_path; finally block cleans it up.
                     else:
@@ -1816,14 +1872,22 @@ class SyncPlugin:
                         with open(temp_path, "rb") as swapped_fh:
                             swapped_hash = sha256_bytes(swapped_fh.read())
                         if swapped_hash != expected_hash and swapped_hash != content_hash:
-                            if not atomic_swap_files(temp_path, dest):
-                                stem, ext = os.path.splitext(dest)
-                                backup = f"{stem}.conflict-external-{swapped_hash[:8]}{ext}"
-                                try:
-                                    os.replace(temp_path, backup)
-                                    temp_path = None
-                                except OSError:
-                                    pass
+                            if atomic_swap_files(temp_path, dest):
+                                with open(temp_path, "rb") as rb_fh:
+                                    rollback_hash = sha256_bytes(rb_fh.read())
+                                if rollback_hash != content_hash:
+                                    if atomic_swap_files(temp_path, dest):
+                                        with open(temp_path, "rb") as fin_fh:
+                                            final_hash = sha256_bytes(fin_fh.read())
+                                        if final_hash != content_hash:
+                                            self._preserve_external_temp(temp_path, dest, final_hash)
+                                            temp_path = None
+                                    else:
+                                        self._preserve_external_temp(temp_path, dest, rollback_hash)
+                                        temp_path = None
+                            else:
+                                self._preserve_external_temp(temp_path, dest, swapped_hash)
+                                temp_path = None
                             raise RuntimeError(change_err)
                     else:
                         os.replace(temp_path, dest)
@@ -2110,7 +2174,7 @@ class SyncPlugin:
                 retries=0,
             )
             if status not in (200, 201):
-                return None
+                return None, status
             token = str(headers.get("lock-token") or "").strip()
             if not token and body:
                 try:
@@ -2126,14 +2190,31 @@ class SyncPlugin:
                 except ET.ParseError:
                     pass
             if not token:
-                return None
+                return None, status
             if not (token.startswith("<") and token.endswith(">")):
                 token = f"<{token}>"
-            return token
+            return token, status
         except urllib.error.HTTPError as exc:
-            if exc.code in (405, 501, 400, 403, 404, 412, 423):
-                return None
+            if exc.code == 423:
+                raise
+            if exc.code in (405, 501, 400, 403, 404, 412):
+                return None, exc.code
             raise
+
+    def _webdav_delete_placeholder(self, file_url, lock_token, cfg=None, timeout=6):
+        if not lock_token:
+            return
+        try:
+            self._webdav_request_full(
+                "DELETE",
+                file_url,
+                extra_headers={"If": f"({lock_token})"},
+                timeout=timeout,
+                cfg=cfg,
+                retries=0,
+            )
+        except Exception:
+            pass
 
     def _webdav_unlock(self, file_url, lock_token, cfg=None, timeout=6):
         if not lock_token:
@@ -2174,35 +2255,50 @@ class SyncPlugin:
         )
         headers = {"Content-Type": content_type}
         lock_token = None
+        created_lock_placeholder = False
         try:
             if create_only:
-                found, cur_bytes, cur_etag = self._webdav_get_bytes_with_etag(file_url, cfg=cfg)
+                found, cur_bytes, _ = self._webdav_get_bytes_with_etag(file_url, cfg=cfg)
                 if found:
                     if sha256_bytes(cur_bytes) == content_hash:
                         return
                     raise RuntimeError(change_err)
-                lock_token = self._webdav_lock(file_url, cfg=cfg)
+                lock_token, lock_status = self._webdav_lock(file_url, cfg=cfg)
                 if lock_token:
                     headers["If"] = f"({lock_token})"
-                    found2, cur_bytes2, _ = self._webdav_get_bytes_with_etag(file_url, cfg=cfg)
-                    if found2:
-                        if sha256_bytes(cur_bytes2) == content_hash:
-                            return
-                        raise RuntimeError(change_err)
-                headers["If-None-Match"] = "*"
-                status, _, put_headers = self._webdav_request_full(
+                    if lock_status == 201:
+                        # RFC 4918 §7.3 / §9.10.6: LOCK on an unmapped URL created an empty locked placeholder for us.
+                        # Do not treat that placeholder as an external write, and omit If-None-Match: * which would 412.
+                        created_lock_placeholder = True
+                    else:
+                        found2, cur_bytes2, _ = self._webdav_get_bytes_with_etag(file_url, cfg=cfg)
+                        if found2:
+                            if sha256_bytes(cur_bytes2) == content_hash:
+                                return
+                            raise RuntimeError(change_err)
+                        # RFC 2518 lock-null resource returns 404 on GET; populate it under the lock without If-None-Match.
+                        created_lock_placeholder = True
+                else:
+                    headers["If-None-Match"] = "*"
+                self._webdav_request_full(
                     "PUT", file_url, body=payload_bytes, extra_headers=headers, cfg=cfg,
                 )
+                created_lock_placeholder = False
                 return
             elif expected_hash is not None:
                 if self._is_strong_etag(expected_etag):
                     headers["If-Match"] = expected_etag
                 else:
-                    lock_token = self._webdav_lock(file_url, cfg=cfg)
+                    lock_token, lock_status = self._webdav_lock(file_url, cfg=cfg)
                     if lock_token:
+                        if lock_status == 201:
+                            # Target was deleted right before LOCK; clean up the empty placeholder and abort.
+                            created_lock_placeholder = True
+                            raise RuntimeError(change_err)
                         headers["If"] = f"({lock_token})"
                         found, cur_bytes, _ = self._webdav_get_bytes_with_etag(file_url, cfg=cfg)
                         if not found:
+                            created_lock_placeholder = True
                             raise RuntimeError(change_err)
                         cur_hash = sha256_bytes(cur_bytes)
                         if cur_hash != expected_hash and cur_hash != content_hash:
@@ -2222,11 +2318,16 @@ class SyncPlugin:
             if exc.code == 412:
                 found, cur_bytes, _ = self._webdav_get_bytes_with_etag(file_url, cfg=cfg)
                 if found and sha256_bytes(cur_bytes) == content_hash:
+                    created_lock_placeholder = False
                     return
+                raise RuntimeError(change_err) from exc
+            if exc.code == 423:
                 raise RuntimeError(change_err) from exc
             raise
         finally:
             if lock_token:
+                if created_lock_placeholder:
+                    self._webdav_delete_placeholder(file_url, lock_token, cfg=cfg)
                 self._webdav_unlock(file_url, lock_token, cfg=cfg)
 
     def _webdav_put_text(self, base_url, rel_path, content, cfg=None, expected_hash=None, expected_etag=None, create_only=False):
@@ -3858,6 +3959,23 @@ class SyncPlugin:
                     "fingerprint": "",
                 }
             prepared_repo_dir = res
+
+        # Reject overlapping or aliased local notebooks in the same batch.
+        for idx_nb, nb in enumerate(notebooks):
+            for prev_nb in notebooks[:idx_nb]:
+                if paths_overlap(prev_nb, nb):
+                    return {
+                        "cfg": dict(cfg),
+                        "protocol": protocol,
+                        "target_display": target_display,
+                        "repo_root": prepared_repo_dir or "",
+                        "plans": [],
+                        "remote_error": self._tr(
+                            f"笔记本「{self._notebook_label(prev_nb)}」与「{self._notebook_label(nb)}」的本地目录重叠，已中止同步",
+                            f"Local folders for {self._notebook_label(prev_nb)} and {self._notebook_label(nb)} overlap; sync aborted",
+                        ),
+                        "fingerprint": "",
+                    }
 
         # Validate physical target directories (catching symlink escapes and cross-notebook target aliasing).
         if protocol in ("local_mirror", "git"):
