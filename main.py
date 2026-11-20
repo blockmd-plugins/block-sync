@@ -1715,6 +1715,12 @@ class SyncPlugin:
                 pass
             os.close(fd)
 
+    def _has_git_marker(self, repo_dir):
+        if not repo_dir:
+            return False
+        g = os.path.join(repo_dir, ".git")
+        return os.path.isdir(g) or os.path.isfile(g)
+
     def _resolve_git_dir(self, start_dir):
         """Return (work_tree_root, actual_git_dir) if start_dir is inside a Git repo (supporting .git pointer files)."""
         cur = os.path.realpath(start_dir)
@@ -2907,13 +2913,13 @@ class SyncPlugin:
         legacy_unbranched = os.path.join(base, f"repo-{sha256_text(target)[:12]}")
         if os.path.isdir(base) and shutil.which("git"):
             candidates = []
-            if legacy_unbranched != canonical and os.path.isdir(os.path.join(legacy_unbranched, ".git")):
+            if legacy_unbranched != canonical and self._has_git_marker(legacy_unbranched):
                 candidates.append(legacy_unbranched)
             for name in sorted(os.listdir(base)):
                 path = os.path.join(base, name)
                 if path in (canonical, legacy_unbranched) or not re.search(r"-[0-9a-f]{8}$", name):
                     continue
-                if os.path.isdir(os.path.join(path, ".git")):
+                if self._has_git_marker(path):
                     candidates.append(path)
             for path in candidates:
                 result = self._run_git(["config", "--local", "--get", "remote.origin.url"], cwd=path, cfg=cfg)
@@ -2925,7 +2931,7 @@ class SyncPlugin:
 
     def _resolve_local_git_dir(self, cfg=None):
         dirs = self._git_repo_dirs(cfg or self.config)
-        return next((path for path in dirs if os.path.isdir(os.path.join(path, ".git"))), dirs[0])
+        return next((path for path in dirs if self._has_git_marker(path)), dirs[0])
 
     def _sync_target_base(self, cfg):
         protocol = cfg["protocol"]
@@ -3191,7 +3197,7 @@ class SyncPlugin:
 
             if not heads:
                 # Empty remote repository: initialize cleanly on the configured branch without pulling any other branch.
-                if not os.path.isdir(os.path.join(repo_dir, ".git")):
+                if not self._has_git_marker(repo_dir):
                     if not allow_init_or_clone:
                         return False, None
                     os.makedirs(repo_dir, exist_ok=True)
@@ -3227,7 +3233,7 @@ class SyncPlugin:
                 return True, repo_dir
 
             # Remote has the requested branch.
-            if not os.path.isdir(os.path.join(repo_dir, ".git")):
+            if not self._has_git_marker(repo_dir):
                 if not allow_init_or_clone:
                     return False, None
                 os.makedirs(os.path.dirname(repo_dir), exist_ok=True)
@@ -3282,7 +3288,7 @@ class SyncPlugin:
                     clean_flags = "-fdx" if self._is_managed_git_dir(repo_dir) else "-fd"
                     self._run_git(["clean", clean_flags], cwd=repo_dir, cfg=cfg)
         else:
-            if not os.path.isdir(os.path.join(repo_dir, ".git")):
+            if not self._has_git_marker(repo_dir):
                 if not allow_init_or_clone:
                     return False, None
                 os.makedirs(repo_dir, exist_ok=True)
@@ -3421,9 +3427,15 @@ class SyncPlugin:
                 return True
         return False
 
-    def _git_tracked_rel_paths(self, repo_root, subdir="", cfg=None):
-        """Return set of git-tracked paths relative to subdir (or repo_root), or None if not a git repo."""
-        if not repo_root or not os.path.exists(os.path.join(repo_root, ".git")):
+    def _git_tracked_rel_paths(self, repo_root, subdir="", cfg=None, strict=False):
+        """Return set of git-tracked paths relative to subdir (or repo_root).
+
+        When strict=True (plugin-managed remote clones), raises RuntimeError if git ls-files fails
+        so a corrupted index never falls back to scanning untracked/ignored leftover files.
+        """
+        if not repo_root or not self._has_git_marker(repo_root):
+            if strict:
+                raise RuntimeError(self._tr("Git 托管副本缺少仓库元数据，已中止同步", "Managed Git clone is missing repository metadata; sync aborted"))
             return None
         proc = subprocess.run(
             ["git", "ls-files", "-z"],
@@ -3435,6 +3447,10 @@ class SyncPlugin:
             timeout=8,
         )
         if proc.returncode != 0:
+            if strict:
+                stderr_txt = (proc.stderr or proc.stdout or b"").decode("utf-8", errors="replace")
+                err = self._error_detail(stderr_txt or self._tr("git ls-files 失败", "git ls-files failed"))
+                raise RuntimeError(self._tr(f"无法读取 Git 托管副本的跟踪文件清单: {err}", f"Could not read tracked file list for managed Git clone: {err}"))
             return None
         sub = subdir.strip("/")
         prefix = f"{sub}/" if sub else ""
@@ -3698,15 +3714,18 @@ class SyncPlugin:
                 else:
                     remote_inspected = False
                     remote_error = res
-            elif os.path.isdir(os.path.join(repo_dir, ".git")):
+            elif self._has_git_marker(repo_dir):
                 remote_notes = self._scan_mirror_files(target_dir, only_path=only_path, scope=scope, excluded_subdirs=excluded_subdirs)
             else:
                 remote_inspected = False
             tracked_remote_paths = None
             if remote_inspected and self._is_managed_git_dir(repo_root):
-                tracked_remote_paths = self._git_tracked_rel_paths(repo_root, subdir=subdir, cfg=cfg)
-                if tracked_remote_paths is not None:
+                try:
+                    tracked_remote_paths = self._git_tracked_rel_paths(repo_root, subdir=subdir, cfg=cfg, strict=True)
                     remote_notes = {k: v for k, v in remote_notes.items() if k in tracked_remote_paths}
+                except Exception as exc:
+                    remote_inspected = False
+                    remote_error = self._error_detail(exc)
 
         aliases = [
             self._meta_key(protocol, f"{base}::{subdir}" if subdir else base, nb_key=nb_key)
@@ -4551,7 +4570,7 @@ class SyncPlugin:
         repo_dir = None
         if protocol == "git":
             repo_dirs = self._git_repo_dirs(cfg)
-            repo_dir = next((path for path in repo_dirs if os.path.isdir(os.path.join(path, ".git"))), repo_dirs[0])
+            repo_dir = next((path for path in repo_dirs if self._has_git_marker(path)), repo_dirs[0])
             target_bases = [f"{path}:{self._git_branch(cfg)}" for path in repo_dirs]
         else:
             target_bases = [self._sync_target_base(cfg)]
