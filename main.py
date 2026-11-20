@@ -3,6 +3,11 @@
 
 import base64
 from datetime import datetime
+import errno
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import hashlib
 import html
 import json
@@ -70,6 +75,23 @@ class HostBridge:
         sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
         sys.stdout.flush()
 
+    def notify_progress(self, done=None, total=None, progress=None, label=None):
+        params = {}
+        if done is not None:
+            params["done"] = int(done)
+        if total is not None:
+            params["total"] = int(total)
+        if progress is not None:
+            params["progress"] = float(progress)
+        if label:
+            params["label"] = str(label)
+        if not params:
+            return
+        try:
+            self.send({"jsonrpc": "2.0", "method": "host.action.progress", "params": params})
+        except Exception:
+            pass
+
     def call_host(self, method, params=None):
         self._seq += 1
         req_id = f"p-{self._seq}"
@@ -121,6 +143,12 @@ def sha256_text(text):
 
 def now_hms():
     return datetime.now().strftime("%H:%M:%S")
+
+
+def format_hm(time_str):
+    raw = str(time_str or "").strip()
+    m = re.match(r"^(\d{1,2}:\d{2})(?::\d{2})?$", raw)
+    return m.group(1) if m else raw
 
 
 def conflict_stamp():
@@ -237,6 +265,28 @@ class SyncPlugin:
 
     def _tr(self, zh, en):
         return en if self._is_en() else zh
+
+    def _emit_progress(self, bridge, done=None, total=None, progress=None, label=None):
+        if not getattr(self, "supports_action_progress", False):
+            return
+        params = {}
+        if done is not None:
+            params["done"] = int(done)
+        if total is not None:
+            params["total"] = int(total)
+        if progress is not None:
+            params["progress"] = float(progress)
+        if label:
+            params["label"] = str(label)
+        if not params:
+            return
+        try:
+            if hasattr(bridge, "notify_progress"):
+                bridge.notify_progress(**params)
+            elif hasattr(bridge, "send"):
+                bridge.send({"jsonrpc": "2.0", "method": "host.action.progress", "params": params})
+        except Exception:
+            pass
 
     def _localize_error(self, detail):
         if self._is_en() and CHINESE_TEXT.search(detail):
@@ -1119,13 +1169,175 @@ class SyncPlugin:
                     remote_files[rel] = fh.read()
         return remote_files
 
-    def _write_mirror_file(self, mirror_dir, rel_path, content):
+    def _write_mirror_file(self, mirror_dir, rel_path, content, expected_hash=None, create_only=False):
         dest = os.path.join(mirror_dir, *rel_path.split("/"))
         parent = os.path.dirname(dest)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        with open(dest, "w", encoding="utf-8") as fh:
-            fh.write(content)
+        content_hash = sha256_text(content)
+        change_err = self._tr(
+            f"目标文件已变更，已中止覆盖以避免数据丢失：{rel_path}",
+            f"Destination file changed during sync; aborted overwrite to protect data: {rel_path}",
+        )
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=parent or mirror_dir,
+                prefix=".block-sync-",
+                suffix=".tmp",
+                delete=False,
+            ) as fh:
+                temp_path = fh.name
+                fh.write(content)
+                fh.flush()
+                os.fsync(fh.fileno())
+            # Verify destination right before committing so edits or deletions after planning are never clobbered.
+            if create_only:
+                try:
+                    os.link(temp_path, dest)
+                    return
+                except FileExistsError:
+                    with open(dest, "r", encoding="utf-8", errors="replace") as existing_fh:
+                        if sha256_text(existing_fh.read()) == content_hash:
+                            return
+                    raise RuntimeError(change_err)
+                except OSError as err:
+                    # Only fall back to O_CREAT|O_EXCL when the filesystem lacks hardlink support.
+                    if err.errno not in (
+                        errno.EXDEV,
+                        errno.ENOTSUP,
+                        errno.EOPNOTSUPP,
+                        errno.ENOSYS,
+                        errno.EMLINK,
+                    ):
+                        raise
+                    try:
+                        excl_fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                    except FileExistsError:
+                        with open(dest, "r", encoding="utf-8", errors="replace") as existing_fh:
+                            if sha256_text(existing_fh.read()) == content_hash:
+                                return
+                        raise RuntimeError(change_err)
+                    try:
+                        with os.fdopen(excl_fd, "w", encoding="utf-8") as out_fh:
+                            out_fh.write(content)
+                            out_fh.flush()
+                            os.fsync(out_fh.fileno())
+                    except BaseException:
+                        try:
+                            os.unlink(dest)
+                        except OSError:
+                            pass
+                        raise
+                    return
+            elif expected_hash is not None:
+                try:
+                    existing_fd = os.open(dest, os.O_RDONLY)
+                except FileNotFoundError:
+                    raise RuntimeError(change_err)
+                try:
+                    if fcntl is not None:
+                        try:
+                            fcntl.flock(existing_fd, fcntl.LOCK_EX)
+                        except OSError as err:
+                            if err.errno not in (
+                                errno.ENOTSUP,
+                                errno.EOPNOTSUPP,
+                                errno.ENOSYS,
+                                errno.ENOLCK,
+                                errno.EINVAL,
+                            ):
+                                raise
+                    st_before = os.fstat(existing_fd)
+                    chunks = []
+                    while True:
+                        buf = os.read(existing_fd, 65536)
+                        if not buf:
+                            break
+                        chunks.append(buf)
+                    cur_hash = sha256_text(b"".join(chunks).decode("utf-8", errors="replace"))
+                    if cur_hash != expected_hash and cur_hash != content_hash:
+                        raise RuntimeError(change_err)
+                    try:
+                        st_now = os.lstat(dest)
+                    except FileNotFoundError:
+                        raise RuntimeError(change_err)
+                    if (
+                        st_now.st_dev != st_before.st_dev
+                        or st_now.st_ino != st_before.st_ino
+                        or st_now.st_size != st_before.st_size
+                        or st_now.st_mtime_ns != st_before.st_mtime_ns
+                    ):
+                        raise RuntimeError(change_err)
+                    if os.name == "nt":
+                        os.close(existing_fd)
+                        existing_fd = -1
+                    os.replace(temp_path, dest)
+                    temp_path = None
+                finally:
+                    if existing_fd >= 0:
+                        os.close(existing_fd)
+                return
+            os.replace(temp_path, dest)
+            temp_path = None
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+
+    def _cleanup_stale_temp_files(self, root_dir, cfg=None):
+        if not root_dir or not os.path.isdir(root_dir):
+            return
+        tracked_paths = set()
+        if os.path.isdir(os.path.join(root_dir, ".git")):
+            # Read git ls-files -z in binary mode so filenames containing '\r' are preserved verbatim.
+            ls_proc = subprocess.run(
+                ["git", "ls-files", "-z"],
+                cwd=root_dir,
+                env=self._git_env(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=False,
+                timeout=8,
+            )
+            if ls_proc.returncode != 0:
+                stderr_txt = (ls_proc.stderr or ls_proc.stdout or b"").decode("utf-8", errors="replace")
+                err = self._error_detail(stderr_txt or self._tr("git ls-files 失败", "git ls-files failed"))
+                raise RuntimeError(self._tr(f"Git 文件列表检查失败: {err}", f"Git file list check failed: {err}"))
+            for raw_entry in (ls_proc.stdout or b"").split(b"\0"):
+                if raw_entry:
+                    tracked_paths.add(os.fsdecode(raw_entry).replace(os.sep, "/"))
+
+        def on_walk_error(err):
+            detail = f"{err.filename or root_dir} ({err})"
+            raise RuntimeError(self._tr(
+                f"无法扫描目录，已中止提交：{detail}",
+                f"Could not scan directory; aborted commit: {detail}",
+            ))
+
+        for cur_root, dirs, file_names in os.walk(root_dir, onerror=on_walk_error):
+            dirs[:] = [d for d in dirs if d != ".git"]
+            for name in file_names:
+                if name.startswith(".block-sync-") and name.endswith(".tmp"):
+                    full = os.path.join(cur_root, name)
+                    rel = os.path.relpath(full, root_dir).replace(os.sep, "/")
+                    if rel in tracked_paths:
+                        continue
+                    try:
+                        os.unlink(full)
+                    except FileNotFoundError:
+                        # Already removed concurrently; nothing left to stage.
+                        pass
+                    except OSError as err:
+                        detail = f"{rel} ({err})"
+                        raise RuntimeError(self._tr(
+                            f"无法清理残留临时文件，已中止提交：{detail}",
+                            f"Could not clean up stale temporary files; aborted commit: {detail}",
+                        ))
 
     def _write_mirror_bytes(self, mirror_dir, rel_path, data):
         dest = self._asset_file(mirror_dir, rel_path)
@@ -1133,13 +1345,24 @@ class SyncPlugin:
         os.makedirs(parent, exist_ok=True)
         temp_path = None
         try:
-            with tempfile.NamedTemporaryFile(dir=parent, prefix=".block-sync-", delete=False) as fh:
+            with tempfile.NamedTemporaryFile(
+                dir=parent,
+                prefix=".block-sync-",
+                suffix=".tmp",
+                delete=False,
+            ) as fh:
                 temp_path = fh.name
                 fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(temp_path, dest)
+            temp_path = None
         finally:
             if temp_path and os.path.exists(temp_path):
-                os.unlink(temp_path)
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
 
     def _sync_local_mirror(self, bridge, only_path=None):
         mirror_dir = self._resolve_mirror_dir()
@@ -1163,7 +1386,7 @@ class SyncPlugin:
             in_remote = rel_path in remote_notes
             if in_local and not in_remote:
                 text = local_notes[rel_path]
-                self._write_mirror_file(mirror_dir, rel_path, text)
+                self._write_mirror_file(mirror_dir, rel_path, text, create_only=True)
                 base_map[rel_path] = sha256_text(text)
                 synced_count += 1
                 self._append_log(self._tr(f"推送 {rel_path}", f"Push {rel_path}"), "成功", tone="success", tooltip=self._tr(
@@ -1186,7 +1409,9 @@ class SyncPlugin:
                 if action == "skip":
                     base_map[rel_path] = new_hash
                 elif action == "push":
-                    self._write_mirror_file(mirror_dir, rel_path, chosen_text)
+                    self._write_mirror_file(
+                        mirror_dir, rel_path, chosen_text, expected_hash=sha256_text(remote_notes[rel_path])
+                    )
                     base_map[rel_path] = new_hash
                     synced_count += 1
                     self._append_log(self._tr(f"本地覆盖 {rel_path}", f"Overwrite remote: {rel_path}"), "成功", tone="success", tooltip=self._tr(
@@ -1204,8 +1429,10 @@ class SyncPlugin:
                 elif action == "keep_both":
                     conflict_rel, conflict_text = conflict_extra
                     bridge.call_host("host.notes.write", {"path": conflict_rel, "content": conflict_text})
-                    self._write_mirror_file(mirror_dir, conflict_rel, conflict_text)
-                    self._write_mirror_file(mirror_dir, rel_path, chosen_text)
+                    self._write_mirror_file(mirror_dir, conflict_rel, conflict_text, create_only=True)
+                    self._write_mirror_file(
+                        mirror_dir, rel_path, chosen_text, expected_hash=sha256_text(remote_notes[rel_path])
+                    )
                     base_map[rel_path] = new_hash
                     base_map[conflict_rel] = sha256_text(conflict_text)
                     synced_count += 1
@@ -2237,6 +2464,9 @@ class SyncPlugin:
         return reasons
 
     def _commit_and_push_git(self, repo_root, cfg):
+        # Remove any stale untracked atomic-write temp files left behind by a prior SIGKILL cancellation
+        # so they can never be staged or pushed to the remote repository.
+        self._cleanup_stale_temp_files(repo_root, cfg=cfg)
         branch = self._git_branch(cfg)
         status_proc = self._run_git(["status", "--porcelain"], cwd=repo_root, cfg=cfg)
         if status_proc.returncode != 0:
@@ -2305,7 +2535,7 @@ class SyncPlugin:
                     return True
         return False
 
-    def _apply_notebook_plan(self, bridge, plan, only_path=None):
+    def _apply_notebook_plan(self, bridge, plan, only_path=None, progress_state=None):
         protocol = plan["protocol"]
         cfg = plan["cfg"]
         nb_root = plan.get("nb_root") or self.notebook_root
@@ -2318,22 +2548,33 @@ class SyncPlugin:
 
         if protocol == "local_mirror":
             os.makedirs(target_dir, exist_ok=True)
-            write_remote = lambda rel, text: self._write_mirror_file(target_dir, rel, text)
+            write_remote = lambda rel, text, expected_hash=None, create_only=False: self._write_mirror_file(
+                target_dir, rel, text, expected_hash=expected_hash, create_only=create_only,
+            )
         elif protocol == "webdav":
             root_url = self._webdav_root_url(cfg)
             sub_dir = self._resolve_webdav_dir(cfg).strip().strip("/")
             full_sub = "/".join(p for p in (sub_dir, subdir.strip("/")) if p)
             if full_sub:
                 self._webdav_ensure_dir(root_url, full_sub, cfg=cfg)
-            write_remote = lambda rel, text: self._webdav_put_text(base_url, rel, text, cfg=cfg)
+            write_remote = lambda rel, text, expected_hash=None, create_only=False: self._webdav_put_text(
+                base_url, rel, text, cfg=cfg,
+            )
         else:
             os.makedirs(target_dir, exist_ok=True)
-            write_remote = lambda rel, text: self._write_mirror_file(target_dir, rel, text)
+            write_remote = lambda rel, text, expected_hash=None, create_only=False: self._write_mirror_file(
+                target_dir, rel, text, expected_hash=expected_hash, create_only=create_only,
+            )
 
         pushed = 0
         pulled = 0
         conflict_count = 0
         prefix = f"{plan.get('nb_label')}/" if subdir else ""
+
+        def step_progress():
+            if progress_state is not None and progress_state.get("total", 0) > 0:
+                progress_state["done"] += 1
+                self._emit_progress(bridge, done=progress_state["done"], total=progress_state["total"])
 
         asset_count = 0
         if cfg.get("sync_assets", True):
@@ -2360,23 +2601,26 @@ class SyncPlugin:
 
         for rel_path in plan["to_push_new"]:
             text = local_notes[rel_path]
-            write_remote(rel_path, text)
+            write_remote(rel_path, text, create_only=True)
             base_map[rel_path] = sha256_text(text)
             pushed += 1
             self._append_log(self._tr(f"推送 {prefix}{rel_path}", f"Push {prefix}{rel_path}"), "成功", tone="success", tooltip=self._tr(
                 f"已推送到{self._protocol_label(protocol)}",
                 f"Pushed to {self._protocol_label(protocol)}",
             ))
+            step_progress()
 
         for rel_path in plan["to_push_overwrite"]:
             text = local_notes[rel_path]
-            write_remote(rel_path, text)
+            exp_hash = sha256_text(remote_notes[rel_path]) if rel_path in remote_notes else None
+            write_remote(rel_path, text, expected_hash=exp_hash)
             base_map[rel_path] = sha256_text(text)
             pushed += 1
             self._append_log(self._tr(f"本地覆盖 {prefix}{rel_path}", f"Overwrite remote: {prefix}{rel_path}"), "成功", tone="success", tooltip=self._tr(
                 f"本地优先覆盖{self._protocol_label(protocol)}",
                 f"Local version took precedence on {self._protocol_label(protocol)}",
             ))
+            step_progress()
 
         for rel_path in plan["to_pull_new"]:
             text = remote_notes[rel_path]
@@ -2387,6 +2631,7 @@ class SyncPlugin:
                 f"已从{self._protocol_label(protocol)}拉取",
                 f"Pulled from {self._protocol_label(protocol)}",
             ))
+            step_progress()
 
         for rel_path in plan["to_pull_overwrite"]:
             text = remote_notes[rel_path]
@@ -2399,12 +2644,13 @@ class SyncPlugin:
                 f"{self._protocol_label(protocol)}优先更新本地",
                 f"Version from {self._protocol_label(protocol)} replaced the local copy",
             ))
+            step_progress()
 
         for rel_path, conflict_rel, remote_text in plan["conflicts"]:
             local_text = local_notes[rel_path]
             self._write_local_note(bridge, conflict_rel, remote_text, nb_root=nb_root)
-            write_remote(conflict_rel, remote_text)
-            write_remote(rel_path, local_text)
+            write_remote(conflict_rel, remote_text, create_only=True)
+            write_remote(rel_path, local_text, expected_hash=sha256_text(remote_text))
             base_map[rel_path] = sha256_text(local_text)
             base_map[conflict_rel] = sha256_text(remote_text)
             conflict_count += 1
@@ -2412,6 +2658,7 @@ class SyncPlugin:
                 f"已保留副本 {conflict_rel}",
                 f"Saved a copy at {conflict_rel}",
             ))
+            step_progress()
 
         self.sync_meta[plan["meta_key"]] = base_map
         return pushed, pulled, conflict_count, asset_count
@@ -2486,7 +2733,7 @@ class SyncPlugin:
             "fingerprint": fp,
         }
 
-    def _execute_batch_plan(self, bridge, batch, only_path=None):
+    def _execute_batch_plan(self, bridge, batch, only_path=None, report_progress=False):
         protocol = batch["protocol"]
         cfg = batch["cfg"]
         total_pushed = 0
@@ -2502,8 +2749,22 @@ class SyncPlugin:
             bridge.call_host("host.storage.set", {"key": "sync_meta", "value": updated_meta})
             self.sync_meta = updated_meta
 
+        total_items = sum(
+            len(p["to_push_new"])
+            + len(p["to_push_overwrite"])
+            + len(p["to_pull_new"])
+            + len(p["to_pull_overwrite"])
+            + len(p["conflicts"])
+            for p in batch["plans"]
+        )
+        progress_state = {"done": 0, "total": total_items} if (report_progress and total_items > 0) else None
+        if progress_state is not None:
+            self._emit_progress(bridge, done=0, total=total_items)
+
         for plan in batch["plans"]:
-            pushed, pulled, conflicts, assets = self._apply_notebook_plan(bridge, plan, only_path=only_path)
+            pushed, pulled, conflicts, assets = self._apply_notebook_plan(
+                bridge, plan, only_path=only_path, progress_state=progress_state
+            )
             total_pushed += pushed
             total_pulled += pulled
             total_conflicts += conflicts
@@ -2511,6 +2772,13 @@ class SyncPlugin:
 
         did_push = False
         if protocol == "git" and batch.get("repo_root"):
+            if report_progress:
+                self._emit_progress(
+                    bridge,
+                    done=total_items if total_items > 0 else None,
+                    total=total_items if total_items > 0 else None,
+                    label=self._tr("推送 Git…", "Pushing Git…"),
+                )
             did_push = self._commit_and_push_git(batch["repo_root"], cfg)
 
         self._remote_preview_cache.clear()
@@ -2592,7 +2860,7 @@ class SyncPlugin:
                 reasons.append(f"{plan['nb_label']}: {r}" if multi else r)
         return reasons
 
-    def _run_sync(self, bridge, only_path=None, only_nb_root=None, confirmed=False, approved_batch=None):
+    def _run_sync(self, bridge, only_path=None, only_nb_root=None, confirmed=False, approved_batch=None, report_progress=False):
         self._refresh_known_notebooks(bridge)
         protocol = self.config.get("protocol", "local_mirror")
         target_error = self._target_error(self.config)
@@ -2664,7 +2932,7 @@ class SyncPlugin:
                 return msg
 
         try:
-            msg = self._execute_batch_plan(bridge, batch, only_path=only_path)
+            msg = self._execute_batch_plan(bridge, batch, only_path=only_path, report_progress=report_progress)
         except Exception as exc:
             msg = self._error_detail(exc)
             if not msg.startswith(self._protocol_label(protocol)) and "Git" not in msg:
@@ -3045,7 +3313,8 @@ class SyncPlugin:
         status = self.last_status
         if not status and configured and c == self.config:
             if isinstance(last_ok, dict) and last_ok.get("time"):
-                status = self._tr(f"上次同步 {last_ok['time']}", f"Last sync: {last_ok['time']}")
+                sync_hm = format_hm(last_ok["time"])
+                status = self._tr(f"上次同步 {sync_hm}", f"Last sync {sync_hm}")
             elif last_result.get("summary"):
                 status = str(last_result["summary"])
                 if self._is_en() and last_result.get("locale") != "en" and CHINESE_TEXT.search(status):
@@ -3072,6 +3341,7 @@ class SyncPlugin:
             self.supports_checklist = "checklist" in caps
             self.supports_form_layout = "form_layout" in caps
             self.supports_multi_notebook = "multi_notebook" in caps
+            self.supports_action_progress = "action_progress" in caps
             raw_nbs = params.get("notebooks")
             if isinstance(raw_nbs, list):
                 self.known_notebooks = [str(p) for p in raw_nbs if str(p or "").strip()]
@@ -3192,7 +3462,7 @@ class SyncPlugin:
                     tone = "danger"
                 else:
                     self.pending_confirm = None
-                    status = self._run_sync(bridge)
+                    status = self._run_sync(bridge, report_progress=True)
                     if self.pending_confirm:
                         ok = True
                         tone = "warning"
@@ -3202,10 +3472,17 @@ class SyncPlugin:
             elif action_id == "confirm_sync":
                 pc = self.pending_confirm
                 if not pc or pc.get("scope_key") != self._result_key():
-                    status = self._tr("当前没有待确认的同步计划", "No sync plan is awaiting confirmation")
-                    self.last_status = status
-                    ok = False
-                    tone = "warning"
+                    err = self._target_error(self.config)
+                    if err or not self._selected_notebooks(self.config):
+                        status = err or self._tr("请至少选择一个笔记本", "Select at least one notebook")
+                        self.last_status = status
+                        ok = False
+                        tone = "danger"
+                    else:
+                        self.pending_confirm = None
+                        status = self._run_sync(bridge, report_progress=True)
+                        ok = True
+                        tone = "warning" if self.pending_confirm else "success"
                 else:
                     protocol = self.config.get("protocol", "local_mirror")
                     notebooks = self._selected_notebooks(self.config)
@@ -3277,7 +3554,7 @@ class SyncPlugin:
                             ok = False
                             tone = "danger"
                         else:
-                            status = self._run_sync(bridge, confirmed=True, approved_batch=batch)
+                            status = self._run_sync(bridge, confirmed=True, approved_batch=batch, report_progress=True)
                             ok = True
                             tone = "success"
             elif action_id == "cancel_confirm":
