@@ -3596,7 +3596,37 @@ class SyncPlugin:
                     elif url_proc.stdout.strip() != target:
                         self._run_git(["remote", "set-url", "origin", target], cwd=repo_dir, cfg=cfg)
                     if self._is_managed_git_dir(repo_dir):
-                        # Reset unborn/stale managed cache so an empty remote never inherits old commits.
+                        # Before resetting a managed cache against an empty remote, check if our target branch
+                        # already has unpushed local commits (e.g. first push rejected by a receive hook).
+                        local_ref = f"refs/heads/{branch}"
+                        if self._run_git(["rev-parse", "--verify", local_ref], cwd=repo_dir, cfg=cfg).returncode == 0:
+                            retry_push = self._run_git_network(
+                                ["push", "-u", "origin", f"{local_ref}:{local_ref}"],
+                                cwd=repo_dir,
+                                timeout=12,
+                                cfg=cfg,
+                                retries=2,
+                                total_budget=22.0,
+                            )
+                            if retry_push.returncode == 0:
+                                self._run_git_network(
+                                    ["fetch", "origin", f"refs/heads/{branch}:refs/remotes/origin/{branch}"],
+                                    cwd=repo_dir,
+                                    timeout=12,
+                                    cfg=cfg,
+                                    retries=1,
+                                    total_budget=15.0,
+                                )
+                                return True, repo_dir
+                            backup_ref = f"pending-push-{branch}-{int(time.time())}"
+                            self._run_git(["branch", "-f", backup_ref, local_ref], cwd=repo_dir, cfg=cfg)
+                            err = self._git_error_message(retry_push.stderr or retry_push.stdout, self._tr("push 失败", "Push failed"))
+                            return False, self._tr(
+                                f"上次未推送的 Git 首次提交重试推送失败（已保留于分支 {backup_ref}）: {err}",
+                                f"Retry push of pending initial Git commit failed (preserved on branch {backup_ref}): {err}",
+                            )
+                        # Reset unborn/stale managed cache (no commits on target branch) so an empty remote
+                        # never inherits commits from another branch.
                         head_chk = self._run_git(["rev-parse", "--verify", "HEAD"], cwd=repo_dir, cfg=cfg)
                         if head_chk.returncode == 0:
                             shutil.rmtree(repo_dir, ignore_errors=True)
@@ -5325,6 +5355,33 @@ class SyncPlugin:
         pending_base_maps = []
         staged_git_paths = []
         tracked_git_paths = []
+        # For Git batches, check ALL planned write paths across ALL notebooks against the Git index
+        # BEFORE writing any notebook so a staged-index conflict on notebook B never leaves notebook A mutated.
+        if protocol == "git" and batch.get("repo_root"):
+            all_planned_git_writes = []
+            for plan in batch["plans"]:
+                sub = (plan.get("subdir") or "").strip("/")
+                sub_prefix = f"{sub}/" if sub else ""
+                for p in plan["to_push_new"]:
+                    all_planned_git_writes.append(f"{sub_prefix}{p}")
+                for p in plan["to_push_overwrite"]:
+                    all_planned_git_writes.append(f"{sub_prefix}{p}")
+                for p, cp, _ in plan["conflicts"]:
+                    all_planned_git_writes.append(f"{sub_prefix}{p}")
+                    all_planned_git_writes.append(f"{sub_prefix}{cp}")
+                for _, cp, _ in (plan.get("asset_view_copies") or ()):
+                    all_planned_git_writes.append(f"{sub_prefix}{cp}")
+                for p in (plan.get("assets_to_push_new") or ()):
+                    all_planned_git_writes.append(f"{sub_prefix}{p}")
+                for p, _ in (plan.get("assets_to_push_overwrite") or ()):
+                    all_planned_git_writes.append(f"{sub_prefix}{p}")
+                for p, cp in (plan.get("asset_conflicts") or ()):
+                    all_planned_git_writes.append(f"{sub_prefix}{p}")
+                    all_planned_git_writes.append(f"{sub_prefix}{cp}")
+            if all_planned_git_writes:
+                with self._target_lock(batch["repo_root"]):
+                    self._check_git_staged_conflicts(batch["repo_root"], all_planned_git_writes, cfg=cfg)
+
         for plan in batch["plans"]:
             pushed, pulled, conflicts, assets, updated_base, written_paths, synced_paths = self._apply_notebook_plan(
                 bridge, plan, only_path=only_path, progress_state=progress_state
