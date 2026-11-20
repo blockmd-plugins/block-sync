@@ -850,6 +850,7 @@ class SyncPlugin:
         self._webdav_deadline = 0.0
         self._saved_config = dict(self.config)
         self._result_notice = None
+        self._pending_notices = {}
         self._result_notified = False
         self._background_notice_deadline = 0.0
         self._git_background_deadline = 0.0
@@ -1201,6 +1202,8 @@ class SyncPlugin:
         self.last_status = ""
         self._saved_config = dict(self.config)
         if self.supports_system:
+            notices = bridge.call_host("host.storage.get", {"key": "pending_notices"}).get("value")
+            self._pending_notices = notices if isinstance(notices, dict) else {}
             journal = bridge.call_host("host.storage.get", {"key": "credential_cleanup"}).get("value")
             if isinstance(journal, list):
                 self._credential_cleanup = {ref for ref in journal if isinstance(ref, str) and CREDENTIAL_REF.fullmatch(ref)}
@@ -1765,6 +1768,18 @@ class SyncPlugin:
             "notebook_results": self.notebook_results, "pending_confirms": self.pending_confirms,
             "pending_confirm": None,
         }
+        notice = self._result_notice
+        queue_notice = self.supports_system and self.config["system_notifications"] and notice and (
+            notice[0] == "待确认" or (notice[1] > 0 and notice[0] != "失败")
+        )
+        if queue_notice:
+            queued = dict(self._pending_notices)
+            queued.pop(key, None)
+            queued[key] = {
+                "params": self._result_notice_params(*notice),
+                "fingerprint": self.pending_confirm.get("fingerprint", "") if notice[0] == "待确认" and self.pending_confirm else "",
+            }
+            values["pending_notices"] = dict(list(queued.items())[-32:])
         try:
             if self.supports_system:
                 bridge.call_host("host.storage.set_many", {"values": values})
@@ -1781,7 +1796,11 @@ class SyncPlugin:
             self.last_status = self._tr("同步状态未保存，请检查后重试", "Sync state could not be saved. Check settings and retry.")
             self._send_result_notice(bridge)
             raise SyncStateError(self.last_status, self._result_notified) from exc
+        if queue_notice:
+            self._pending_notices = values["pending_notices"]
         self._send_result_notice(bridge)
+        if queue_notice and self._result_notified:
+            self._ack_result_notices(bridge, [key])
 
     def _result_key(self):
         if self.supports_multi_notebook and (
@@ -1843,7 +1862,15 @@ class SyncPlugin:
         self._result_notified = False
         if not notice or not self.supports_system or not self.config["system_notifications"]:
             return
-        status, conflicts = notice
+        params = self._result_notice_params(*notice)
+        if params is None:
+            return
+        if self._background_notice_deadline:
+            remaining = self._background_notice_deadline - time.monotonic()
+            params["timeout_ms"] = max(1, min(15000, int(remaining * 1000)))
+        self._result_notified = self._deliver_result_notice(bridge, params)
+
+    def _result_notice_params(self, status, conflicts):
         if status in ("失败", "状态未保存"):
             title = self._tr("同步失败", "Sync failed")
             if status == "状态未保存":
@@ -1859,7 +1886,7 @@ class SyncPlugin:
             body = self._tr("同步已暂停。打开 Block 同步设置查看待确认的变更。", "Sync is paused. Open Block Sync settings to review the changes.")
             tone = "warning"
         else:
-            return
+            return None
         params = {"title": title, "body": body, "tone": tone}
         if self.notebook_root and self._result_key() != "__multi__":
             root_key = self._notebook_key()
@@ -1867,14 +1894,44 @@ class SyncPlugin:
                 (nb["path"] for nb in self.known_notebooks if self._notebook_key(nb["path"]) == root_key),
                 self.notebook_root,
             )
-        if self._background_notice_deadline:
-            remaining = self._background_notice_deadline - time.monotonic()
-            params["timeout_ms"] = max(1, min(15000, int(remaining * 1000)))
+        return params
+
+    def _deliver_result_notice(self, bridge, params):
         try:
             result = bridge.call_host("host.system.notify", params)
-            self._result_notified = result.get("ok") is True
+            return result.get("ok") is True
         except (AttributeError, RuntimeError, OSError):
+            return False
+
+    def _ack_result_notices(self, bridge, keys):
+        if not keys:
+            return
+        for key in keys:
+            self._pending_notices.pop(key, None)
+        try:
+            bridge.call_host("host.storage.set", {"key": "pending_notices", "value": self._pending_notices})
+        except (RuntimeError, OSError):
             pass
+
+    def _retry_result_notices(self, bridge):
+        deadline = time.monotonic() + 2
+        done = []
+        for key, notice in self._pending_notices.items():
+            config = self._stored_global if key == "__multi__" else self.notebook_configs.get(key)
+            if config is None and key == self._result_key():
+                config = self.config
+            params = notice.get("params") if isinstance(notice, dict) else None
+            fingerprint = notice.get("fingerprint") if isinstance(notice, dict) else None
+            plan = self.pending_confirms.get(key) or {}
+            if not isinstance(params, dict) or (fingerprint and fingerprint != plan.get("fingerprint")) or not config or not config["system_notifications"]:
+                done.append(key)
+                continue
+            remaining = int((deadline - time.monotonic()) * 1000)
+            if remaining <= 0:
+                break
+            if self._deliver_result_notice(bridge, dict(params, timeout_ms=min(remaining, 500))):
+                done.append(key)
+        self._ack_result_notices(bridge, done)
 
     def _get_last_result(self):
         return self.notebook_results.get(self._result_key()) or self.notebook_results.get(self._notebook_key())
@@ -7876,6 +7933,10 @@ class SyncPlugin:
             event_name = str(params.get("event") or "")
             if event_name == "plugin.credentials_migrate":
                 return {"handled": True, "outcome": self._migrate_credentials(bridge)}
+            if event_name in ("app.focus", "system.wake", "network.changed") and self._pending_notices:
+                self._retry_result_notices(bridge)
+            if event_name == "app.focus":
+                return {"handled": True, "outcome": "skipped"}
             if event_name in ("system.wake", "network.changed"):
                 return self._sync_after_system_event(bridge, event_name, params)
             if event_name != "note.saved":
