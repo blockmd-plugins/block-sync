@@ -4669,6 +4669,40 @@ class SyncPlugin:
                 f"Git index already has staged changes for planned sync files; commit or unstage them first: {sample}",
             ))
 
+    def _check_git_ignored(self, repo_root, rel_paths, cfg=None):
+        norm_paths = sorted({p.replace("\\", "/").lstrip("/") for p in (rel_paths or []) if p})
+        if not norm_paths:
+            return
+        # Note: Apple Git rejects `--literal-pathspecs` with `check-ignore`; prefixing each NUL-delimited
+        # relative path with `./` disables pathspec magic (e.g. `:(glob)literal.md`) portably.
+        chk_input = b"\0".join(os.fsencode("./" + p) for p in norm_paths) + b"\0"
+        chk = subprocess.run(
+            ["git", "check-ignore", "-z", "--stdin"],
+            cwd=repo_root,
+            env=self._git_env(),
+            input=chk_input,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=8,
+        )
+        if chk.returncode not in (0, 1):
+            err_txt = (chk.stderr or chk.stdout or b"").decode("utf-8", errors="replace")
+            err = self._error_detail(err_txt or self._tr("git check-ignore 失败", "git check-ignore failed"))
+            raise RuntimeError(self._tr(f"Git 忽略规则检查失败: {err}", f"Git ignore check failed: {err}"))
+        ignored = []
+        for raw in (chk.stdout or b"").split(b"\0"):
+            if raw:
+                dec = os.fsdecode(raw)
+                if dec.startswith("./"):
+                    dec = dec[2:]
+                ignored.append(dec)
+        if ignored:
+            sample = ", ".join(ignored[:3]) + ("..." if len(ignored) > 3 else "")
+            raise RuntimeError(self._tr(
+                f"Git 仓库的忽略规则阻止了待同步文件，无法上传：{sample}",
+                f"Files planned for sync are ignored by Git ignore rules: {sample}",
+            ))
+
     def _commit_and_push_git(self, repo_root, cfg, staged_rel_paths=None, tracked_plan_paths=None):
         # Remove any stale untracked atomic-write temp files left behind by a prior SIGKILL cancellation
         # so they can never be staged or pushed to the remote repository.
@@ -4687,36 +4721,7 @@ class SyncPlugin:
         all_check_paths = sorted(written | candidate_tracked)
 
         # Fail loudly if .gitignore / .git/info/exclude blocks any file in the sync plan.
-        # Note: Apple Git rejects `--literal-pathspecs` with `check-ignore`; prefixing each NUL-delimited
-        # relative path with `./` disables pathspec magic (e.g. `:(glob)literal.md`) portably.
-        if all_check_paths:
-            chk_input = b"\0".join(os.fsencode("./" + p) for p in all_check_paths) + b"\0"
-            chk = subprocess.run(
-                ["git", "check-ignore", "-z", "--stdin"],
-                cwd=repo_root,
-                env=self._git_env(),
-                input=chk_input,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=8,
-            )
-            if chk.returncode not in (0, 1):
-                err_txt = (chk.stderr or chk.stdout or b"").decode("utf-8", errors="replace")
-                err = self._error_detail(err_txt or self._tr("git check-ignore 失败", "git check-ignore failed"))
-                raise RuntimeError(self._tr(f"Git 忽略规则检查失败: {err}", f"Git ignore check failed: {err}"))
-            ignored = []
-            for raw in (chk.stdout or b"").split(b"\0"):
-                if raw:
-                    dec = os.fsdecode(raw)
-                    if dec.startswith("./"):
-                        dec = dec[2:]
-                    ignored.append(dec)
-            if ignored:
-                sample = ", ".join(ignored[:3]) + ("..." if len(ignored) > 3 else "")
-                raise RuntimeError(self._tr(
-                    f"Git 仓库的忽略规则阻止了待同步文件，无法上传：{sample}",
-                    f"Files planned for sync are ignored by Git ignore rules: {sample}",
-                ))
+        self._check_git_ignored(repo_root, all_check_paths, cfg=cfg)
 
         # Also include any previously-written synced files that remain untracked/modified in the working tree
         # (e.g., retrying after removing a .gitignore / .git/info/exclude rule).
@@ -5504,6 +5509,7 @@ class SyncPlugin:
                     all_planned_git_writes.append(f"{sub_prefix}{p}")
             if all_planned_git_writes:
                 with self._target_lock(batch["repo_root"]):
+                    self._check_git_ignored(batch["repo_root"], all_planned_git_writes, cfg=cfg)
                     self._check_git_staged_conflicts(batch["repo_root"], all_planned_git_writes, cfg=cfg)
 
         for plan in batch["plans"]:
