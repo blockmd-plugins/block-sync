@@ -4258,8 +4258,8 @@ class SyncPlugin:
             remote_candidates.update(explicit_paths)
 
         candidates = local_candidates | remote_candidates
+        referenced = set()
         if explicit_paths is None and scope and scope != "all":
-            referenced = set()
             for np, txt in local_notes.items():
                 referenced.update(note_asset_paths(np, txt))
             for np, txt in remote_notes.items():
@@ -4281,9 +4281,13 @@ class SyncPlugin:
         for rel in sorted(candidates):
             if excluded_subdirs and in_sync_subdir(rel, excluded_subdirs):
                 continue
-            ldata = self._read_asset_file(nb_root, rel)
-            if ldata is not None:
-                local_assets[rel] = ldata
+            if rel in local_candidates or rel in referenced:
+                ldata = self._read_asset_file(nb_root, rel)
+                if ldata is not None:
+                    actual_lrel = self._resolve_actual_rel_casing(nb_root, rel)
+                    local_assets[actual_lrel] = ldata
+            if explicit_paths is None and rel not in remote_candidates and rel not in referenced:
+                continue
             if protocol == "webdav":
                 file_url = base_url + "/".join(urllib.parse.quote(p, safe="") for p in rel.split("/"))
                 found, rdata, etag = self._webdav_get_bytes_with_etag(file_url, cfg=cfg)
@@ -4291,7 +4295,7 @@ class SyncPlugin:
                     remote_assets[rel] = rdata
                     if etag:
                         remote_asset_etags[rel] = etag
-                elif explicit_paths is not None:
+                elif explicit_paths is not None or rel in referenced:
                     for alt_rel in self._webdav_find_case_variants(
                         base_url, rel, scope=scope, cfg=cfg, excluded_subdirs=excluded_subdirs, filter_fn=is_safe_rel_asset
                     ):
