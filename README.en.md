@@ -10,9 +10,9 @@
 - **Sync alerts** — Get an alert when sync fails, encounters a conflict, or needs approval. Block uses an in-app alert in the foreground and a system notification in the background. If delivery fails, Sync retries on a later system event. You can turn alerts off in sync settings.
 - **Resume sync** — With automatic sync enabled, sync runs after the computer wakes or reconnects, using the existing safety checks.
 - **Git pushes** — Sync pushes commits it can identify as its own. Review and handle any other unpushed commits in Git before retrying sync.
-- **Local Git worktrees** — Switch to the configured branch before syncing. If the remote branch can be fast-forwarded, confirm the worktree update before continuing notebook sync.
+- **Local Git worktrees** — Switch to the configured branch before syncing. If the remote branch has new commits, update the worktree in your Git client before resuming notebook sync.
 - **System credentials** — Git tokens and WebDAV passwords go in the system credential store. Existing credentials migrate after a verified write. Migration retries if the store is locked. Replace or clear old credentials that exceed 1536 bytes or contain NUL characters. Re-enter credentials when changing the server, WebDAV username, or Git repository. Clear Credential applies to settings for the current destination and account. Linux uses Secret Service.
 
-**Install**: Open Block Settings -> App Store and search **Sync**, or enter `blockmd-plugins/block-sync`.
+**Install**: Open Block Settings → App Store and search **Sync**. If your version of Block supports system permissions for plugins, you can also enter `blockmd-plugins/block-sync`.
 
-Older Block versions can install the compatible version from the App Store or use the [v1.3.44 release package](https://github.com/blockmd-plugins/block-sync/releases/tag/v1.3.44). Upgrade Block to use notifications, system credentials, and resume sync.
+Older Block versions can install the compatible version from the App Store or use the [v1.3.44 archive](https://github.com/blockmd-plugins/block-sync/releases/download/v1.3.44/block-sync-v1.3.44.tar.gz). Upgrade Block to use notifications, system credentials, and resume sync.
