@@ -854,6 +854,7 @@ class SyncPlugin:
         self._saved_config = dict(self.config)
         self._result_notice = None
         self._pending_notices = {}
+        self._legacy_notice_receipts = {}
         self._result_notified = False
         self._background_notice_deadline = 0.0
         self._git_background_deadline = 0.0
@@ -1846,8 +1847,8 @@ class SyncPlugin:
             raise SyncStateError(self.last_status, self._result_notified) from exc
         if "pending_notices" in values:
             self._pending_notices = values["pending_notices"]
-        self._send_result_notice(bridge)
-        if queue_notice and self._result_notified:
+        delivered = self._send_result_notice(bridge)
+        if queue_notice and delivered:
             self._ack_result_notices(bridge, [notice_key])
 
     def _result_key(self):
@@ -1916,7 +1917,9 @@ class SyncPlugin:
         if self._background_notice_deadline:
             remaining = self._background_notice_deadline - time.monotonic()
             params["timeout_ms"] = max(1, min(15000, int(remaining * 1000)))
-        self._result_notified = self._deliver_result_notice(bridge, params)
+        delivered, queued = self._deliver_result_notice(bridge, params)
+        self._result_notified = delivered or queued
+        return delivered
 
     def _result_notice_params(self, status, conflicts, notice_key=""):
         if status in ("失败", "状态未保存"):
@@ -1951,11 +1954,23 @@ class SyncPlugin:
         return params
 
     def _deliver_result_notice(self, bridge, params):
+        key = tuple(params.get(field, "") for field in ("notebook_root", "dedup_key", "title", "body"))
+        if key in self._legacy_notice_receipts:
+            return False, True
         try:
             result = bridge.call_host("host.system.notify", params)
-            return result.get("ok") is True
         except (AttributeError, RuntimeError, OSError):
-            return False
+            return False, False
+        if result.get("delivered") is True:
+            return True, False
+        if result.get("queued") is True:
+            return False, True
+        if result.get("ok") is True and "delivered" not in result:
+            if len(self._legacy_notice_receipts) >= 32:
+                del self._legacy_notice_receipts[next(iter(self._legacy_notice_receipts))]
+            self._legacy_notice_receipts[key] = True
+            return False, True
+        return False, False
 
     def _ack_result_notices(self, bridge, keys):
         if not keys:
@@ -1968,6 +1983,8 @@ class SyncPlugin:
             pass
 
     def _retry_result_notices(self, bridge):
+        self._refresh_known_notebooks(bridge)
+        known_scopes = {self._notebook_key(nb["path"]) for nb in self.known_notebooks}
         deadline = time.monotonic() + 2
         done = []
         for key, notice in sorted(self._pending_notices.items(), key=lambda entry: self._notice_order(entry[1])):
@@ -1977,9 +1994,14 @@ class SyncPlugin:
             if not isinstance(scope, str):
                 done.append(key)
                 continue
+            if self.supports_multi_notebook and scope != "__multi__" and scope not in known_scopes:
+                done.append(key)
+                continue
             config = self._stored_global if scope == "__multi__" else self.notebook_configs.get(scope)
             if config is None and scope == self._result_key():
                 config = self.config
+            if config is None and self._stored_global is not None and "selected_notebooks" not in self._stored_global:
+                config = self._stored_global
             plan = self.pending_confirms.get(scope) or {}
             if not isinstance(params, dict) or (fingerprint and fingerprint != plan.get("fingerprint")) or not config or not config["system_notifications"]:
                 done.append(key)
@@ -1992,7 +2014,8 @@ class SyncPlugin:
                 params["dedup_key"] = fingerprint
             elif notice.get("status") == "失败" and not params.get("dedup_key"):
                 params["dedup_key"] = "legacy-failure:" + sha256_text(key)
-            if self._deliver_result_notice(bridge, params):
+            delivered, _ = self._deliver_result_notice(bridge, params)
+            if delivered:
                 done.append(key)
         self._ack_result_notices(bridge, done)
 
