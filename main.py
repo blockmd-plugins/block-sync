@@ -4338,13 +4338,44 @@ class SyncPlugin:
             else:
                 remote_inspected = False
             tracked_remote_paths = None
+            git_tree_paths = None
             if remote_inspected and self._is_managed_git_dir(repo_root):
                 try:
                     tracked_remote_paths = self._git_tracked_rel_paths(repo_root, subdir=subdir, cfg=cfg, strict=True)
+                    git_tree_paths = tracked_remote_paths
                     remote_notes = {k: v for k, v in remote_notes.items() if k in tracked_remote_paths}
                 except Exception as exc:
                     remote_inspected = False
                     remote_error = self._error_detail(exc)
+            elif remote_inspected and self._has_git_marker(repo_root):
+                try:
+                    git_tree_paths = self._git_tracked_rel_paths(repo_root, subdir=subdir, cfg=cfg, strict=False)
+                except Exception:
+                    git_tree_paths = None
+
+            if remote_inspected and not remote_error and git_tree_paths:
+                local_base_dir = nb_root or self.notebook_root
+                tracked_folded = {}
+                only_cf = only_path.casefold() if only_path else None
+                for tp in sorted(git_tree_paths):
+                    if not is_safe_rel_md(tp) or is_safe_rel_asset(tp) or in_sync_subdir(tp, excluded_subdirs):
+                        continue
+                    if not self._matches_scope(tp, scope):
+                        continue
+                    if only_cf is not None and tp.casefold() != only_cf:
+                        continue
+                    tracked_folded.setdefault(tp.casefold(), []).append(tp)
+                multi_tracked = [grp for grp in tracked_folded.values() if len(grp) > 1]
+                if multi_tracked and (
+                    self._dir_is_case_insensitive(local_base_dir, local_notes.keys())
+                    or self._dir_is_case_insensitive(target_dir, remote_notes.keys())
+                ):
+                    pair = " / ".join(multi_tracked[0][:2])
+                    remote_inspected = False
+                    remote_error = self._tr(
+                        f"Git 远端分支存在仅大小写不同的同名笔记（{pair}），当前磁盘不区分大小写，请先在 Git 仓库中重命名其中一个",
+                        f"Git remote branch contains notes differing only in letter case ({pair}) on a case-insensitive disk; rename one in Git first",
+                    )
 
         aliases = [
             self._meta_key(protocol, f"{base}::{subdir}" if subdir else base, nb_key=nb_key)
