@@ -571,9 +571,40 @@ class SyncPlugin:
         if meta_res.get("found") and isinstance(meta_res.get("value"), dict):
             self.sync_meta = meta_res["value"]
 
-        self.pending_confirm = None
+        pc_res = bridge.call_host("host.storage.get", {"key": "pending_confirm"})
+        self.pending_confirm = (
+            self._normalize_pending_confirm(pc_res.get("value"))
+            if pc_res.get("found")
+            else None
+        )
         self._remote_preview_cache = {}
         self.last_status = ""
+
+    def _normalize_pending_confirm(self, raw):
+        if not isinstance(raw, dict):
+            return None
+        scope_key = str(raw.get("scope_key") or "").strip()
+        fingerprint = str(raw.get("fingerprint") or "").strip()
+        protocol = str(raw.get("protocol") or "").strip()
+        reasons = [str(r).strip() for r in (raw.get("reasons") or []) if str(r or "").strip()]
+        if not scope_key or not fingerprint or protocol not in VALID_PROTOCOLS or not reasons:
+            return None
+        sample_lines = [str(s).strip() for s in (raw.get("sample_lines") or []) if str(s or "").strip()]
+        return {
+            "scope_key": scope_key,
+            "fingerprint": fingerprint,
+            "protocol": protocol,
+            "target_display": str(raw.get("target_display") or "").strip(),
+            "reasons": reasons,
+            "badge": str(raw.get("badge") or "").strip(),
+            "sample_lines": sample_lines,
+        }
+
+    def _clear_pending_confirm(self, bridge=None):
+        had = self.pending_confirm is not None
+        self.pending_confirm = None
+        if had and bridge is not None:
+            bridge.call_host("host.storage.set", {"key": "pending_confirm", "value": None})
 
     def _normalize_log(self, entry):
         title = str(entry.get("title") or "同步事件").strip() or "同步事件"
@@ -757,6 +788,7 @@ class SyncPlugin:
         bridge.call_host("host.storage.set", {"key": "logs", "value": self.logs[:MAX_LOG_ENTRIES]})
         bridge.call_host("host.storage.set", {"key": "sync_meta", "value": self.sync_meta})
         bridge.call_host("host.storage.set", {"key": "notebook_results", "value": self.notebook_results})
+        bridge.call_host("host.storage.set", {"key": "pending_confirm", "value": self.pending_confirm})
 
     def _result_key(self):
         return "__multi__" if self.supports_multi_notebook else self._notebook_key()
@@ -2425,30 +2457,45 @@ class SyncPlugin:
         if not plan.get("remote_inspected"):
             return []
         reasons = []
+        policy = plan.get("policy") or cfg.get("conflict_policy", "keep_both")
+        base_map = plan["base_map"]
+        local_notes = plan["local_notes"]
+        remote_notes = plan["remote_notes"]
+
         n_pull_new = len(plan["to_pull_new"])
-        n_pull_ow = len(plan["to_pull_overwrite"])
-        overwrites = plan["to_push_overwrite"]
-        n_push_ow = sum(
-            path != saved_path or plan["base_map"].get(path) != sha256_text(plan["remote_notes"][path])
-            for path in overwrites
+        n_pull_total = len(plan["to_pull_overwrite"])
+        n_pull_conflict = sum(
+            base_map.get(path) != sha256_text(local_notes[path])
+            for path in plan["to_pull_overwrite"]
+        )
+        n_push_conflict = sum(
+            base_map.get(path) != sha256_text(remote_notes[path])
+            for path in plan["to_push_overwrite"]
         )
         n_conf = len(plan["conflicts"])
         n_rm_miss = len(plan["remote_missing"])
         n_loc_miss = len(plan["local_missing"])
 
-        if plan["is_first_sync"] and (n_pull_new > 0 or n_pull_ow > 0 or n_push_ow > 0 or n_conf > 0):
+        if plan["is_first_sync"] and (n_pull_new > 0 or n_pull_conflict > 0 or n_push_conflict > 0 or n_conf > 0):
             reasons.append(
                 self._tr(
-                    f"首次同步且远端已有内容（拉取 {n_pull_new} · 覆盖本地 {n_pull_ow} · 覆盖远端 {n_push_ow} · 冲突 {n_conf}）",
-                    f"The remote already contains notes on first sync (pull: {n_pull_new}, overwrite local: {n_pull_ow}, overwrite remote: {n_push_ow}, conflicts: {n_conf})",
+                    f"首次同步且远端已有内容（拉取 {n_pull_new} · 覆盖本地 {n_pull_conflict} · 覆盖远端 {n_push_conflict} · 冲突 {n_conf}）",
+                    f"The remote already contains notes on first sync (pull: {n_pull_new}, overwrite local: {n_pull_conflict}, overwrite remote: {n_push_conflict}, conflicts: {n_conf})",
                 )
             )
-        if n_pull_ow > 0:
-            reasons.append(self._tr(f"远端内容将覆盖本地 {n_pull_ow} 篇笔记", f"Remote content will overwrite local notes: {n_pull_ow}"))
-        if n_push_ow > 0:
-            reasons.append(self._tr(f"本地内容将覆盖远端 {n_push_ow} 篇笔记", f"Local content will overwrite remote notes: {n_push_ow}"))
-        if n_conf > 0:
-            reasons.append(self._tr(f"存在 {n_conf} 篇双向冲突（将生成 .conflict 副本）", f"Conflicting notes: {n_conf} (.conflict copies will be created)"))
+        elif not plan["is_first_sync"]:
+            # Clean fast-forward updates (only one side changed since base) never require confirmation.
+            # Genuine conflicts follow the user's explicit conflict_policy unless they hit the bulk threshold.
+            if n_pull_conflict > 0 and (policy != "remote_first" or n_pull_conflict > DELETE_GUARD_THRESHOLD):
+                reasons.append(self._tr(
+                    f"远端内容将覆盖本地 {n_pull_conflict} 篇冲突笔记",
+                    f"Remote content will overwrite {n_pull_conflict} conflicting local notes",
+                ))
+            if n_push_conflict > 0 and (policy != "local_first" or n_push_conflict > DELETE_GUARD_THRESHOLD):
+                reasons.append(self._tr(
+                    f"本地内容将覆盖远端 {n_push_conflict} 篇冲突笔记",
+                    f"Local content will overwrite {n_push_conflict} conflicting remote notes",
+                ))
         if cfg.get("delete_guard", True) and (n_rm_miss > DELETE_GUARD_THRESHOLD or n_loc_miss > DELETE_GUARD_THRESHOLD):
             reasons.append(
                 self._tr(
@@ -2456,10 +2503,10 @@ class SyncPlugin:
                     f"Deletion protection triggered (missing remotely: {n_rm_miss}, missing locally: {n_loc_miss}, limit: {DELETE_GUARD_THRESHOLD})",
                 )
             )
-        elif n_pull_new + n_pull_ow > DELETE_GUARD_THRESHOLD:
+        elif n_pull_new + n_pull_total > DELETE_GUARD_THRESHOLD:
             reasons.append(self._tr(
-                f"将向本地批量写入 {n_pull_new + n_pull_ow} 篇笔记（超 {DELETE_GUARD_THRESHOLD} 篇）",
-                f"Bulk write to local notes: {n_pull_new + n_pull_ow} (limit: {DELETE_GUARD_THRESHOLD})",
+                f"将向本地批量写入 {n_pull_new + n_pull_total} 篇笔记（超 {DELETE_GUARD_THRESHOLD} 篇）",
+                f"Bulk write to local notes: {n_pull_new + n_pull_total} (limit: {DELETE_GUARD_THRESHOLD})",
             ))
         return reasons
 
@@ -2613,13 +2660,20 @@ class SyncPlugin:
         for rel_path in plan["to_push_overwrite"]:
             text = local_notes[rel_path]
             exp_hash = sha256_text(remote_notes[rel_path]) if rel_path in remote_notes else None
+            is_conflict = exp_hash is not None and base_map.get(rel_path) != exp_hash
             write_remote(rel_path, text, expected_hash=exp_hash)
             base_map[rel_path] = sha256_text(text)
             pushed += 1
-            self._append_log(self._tr(f"本地覆盖 {prefix}{rel_path}", f"Overwrite remote: {prefix}{rel_path}"), "成功", tone="success", tooltip=self._tr(
-                f"本地优先覆盖{self._protocol_label(protocol)}",
-                f"Local version took precedence on {self._protocol_label(protocol)}",
-            ))
+            if is_conflict:
+                self._append_log(self._tr(f"本地覆盖 {prefix}{rel_path}", f"Overwrite remote: {prefix}{rel_path}"), "成功", tone="success", tooltip=self._tr(
+                    f"本地优先覆盖{self._protocol_label(protocol)}",
+                    f"Local version took precedence on {self._protocol_label(protocol)}",
+                ))
+            else:
+                self._append_log(self._tr(f"更新 {prefix}{rel_path}", f"Update {prefix}{rel_path}"), "成功", tone="success", tooltip=self._tr(
+                    f"已同步修改到{self._protocol_label(protocol)}",
+                    f"Synced changes to {self._protocol_label(protocol)}",
+                ))
             step_progress()
 
         for rel_path in plan["to_pull_new"]:
@@ -2635,15 +2689,23 @@ class SyncPlugin:
 
         for rel_path in plan["to_pull_overwrite"]:
             text = remote_notes[rel_path]
+            local_hash = sha256_text(local_notes[rel_path])
+            is_conflict = base_map.get(rel_path) != local_hash
             self._write_local_note(
-                bridge, rel_path, text, nb_root=nb_root, expected_revision=sha256_text(local_notes[rel_path])
+                bridge, rel_path, text, nb_root=nb_root, expected_revision=local_hash
             )
             base_map[rel_path] = sha256_text(text)
             pulled += 1
-            self._append_log(self._tr(f"远端覆盖 {prefix}{rel_path}", f"Overwrite local: {prefix}{rel_path}"), "成功", tone="success", tooltip=self._tr(
-                f"{self._protocol_label(protocol)}优先更新本地",
-                f"Version from {self._protocol_label(protocol)} replaced the local copy",
-            ))
+            if is_conflict:
+                self._append_log(self._tr(f"远端覆盖 {prefix}{rel_path}", f"Overwrite local: {prefix}{rel_path}"), "成功", tone="success", tooltip=self._tr(
+                    f"{self._protocol_label(protocol)}优先更新本地",
+                    f"Version from {self._protocol_label(protocol)} replaced the local copy",
+                ))
+            else:
+                self._append_log(self._tr(f"拉取更新 {prefix}{rel_path}", f"Pull update: {prefix}{rel_path}"), "成功", tone="success", tooltip=self._tr(
+                    f"已从{self._protocol_label(protocol)}拉取更新",
+                    f"Pulled update from {self._protocol_label(protocol)}",
+                ))
             step_progress()
 
         for rel_path, conflict_rel, remote_text in plan["conflicts"]:
@@ -2832,9 +2894,24 @@ class SyncPlugin:
         multi = len(batch["plans"]) > 1
         for plan in batch["plans"]:
             prefix = f"{plan['nb_label']}/" if multi else ""
+            base_map = plan["base_map"]
+            local_notes = plan["local_notes"]
+            remote_notes = plan["remote_notes"]
+            pull_ow_lines = [
+                self._tr(f"[覆盖本地] {prefix}{p}", f"[Overwrite local] {prefix}{p}")
+                if base_map.get(p) != sha256_text(local_notes[p])
+                else self._tr(f"[更新本地] {prefix}{p}", f"[Update local] {prefix}{p}")
+                for p in plan["to_pull_overwrite"]
+            ]
+            push_ow_lines = [
+                self._tr(f"[覆盖远端] {prefix}{p}", f"[Overwrite remote] {prefix}{p}")
+                if base_map.get(p) != sha256_text(remote_notes[p])
+                else self._tr(f"[更新远端] {prefix}{p}", f"[Update remote] {prefix}{p}")
+                for p in plan["to_push_overwrite"]
+            ]
             sample_lines.extend(
-                [self._tr(f"[覆盖本地] {prefix}{p}", f"[Overwrite local] {prefix}{p}") for p in plan["to_pull_overwrite"]]
-                + [self._tr(f"[覆盖远端] {prefix}{p}", f"[Overwrite remote] {prefix}{p}") for p in plan["to_push_overwrite"]]
+                pull_ow_lines
+                + push_ow_lines
                 + [self._tr(f"[冲突副本] {prefix}{p} -> {cr}", f"[Conflict copy] {prefix}{p} -> {cr}") for p, cr, _ in plan["conflicts"]]
                 + [self._tr(f"[拉取] {prefix}{p}", f"[Pull] {prefix}{p}") for p in plan["to_pull_new"]]
                 + [self._tr(f"[推送] {prefix}{p}", f"[Push] {prefix}{p}") for p in plan["to_push_new"]]
@@ -2978,27 +3055,32 @@ class SyncPlugin:
         pending = self.pending_confirm
         lines = [self._tr(f"[风险] {reason}", f"[Risk] {reason}") for reason in pending["reasons"]]
         samples = pending["sample_lines"]
-        remaining = 9 - len(lines)
+        remaining = max(0, 9 - len(lines))
         lines.extend(samples[:remaining])
         if len(samples) > remaining:
             lines.append(self._tr(f"… 其余 {len(samples) - remaining} 项变更", f"… {len(samples) - remaining} more changes"))
+        preview = {
+            "variant": "plan",
+            "palette": "warm",
+            "title": self._protocol_label(pending["protocol"]),
+            "body": "\n".join(lines),
+        }
+        if pending.get("badge"):
+            preview["badge"] = pending["badge"]
+        if pending.get("target_display"):
+            preview["subtitle"] = pending["target_display"]
         return {
             "id": "preview-card",
             "title": self._tr("确认同步变更", "Review Sync Changes"),
             "items": [
                 {
                     "kind": "preview",
-                    "preview": {
-                        "variant": "plan",
-                        "palette": "warm",
-                        "title": self._protocol_label(pending["protocol"]),
-                        "body": "\n".join(lines),
-                    },
+                    "preview": preview,
                 },
                 {
                     "kind": "actions",
                     "buttons": [
-                        {"id": "confirm_sync", "label": self._tr("确认同步", "Confirm Sync"), "variant": "danger"},
+                        {"id": "confirm_sync_card", "label": self._tr("确认同步", "Confirm Sync"), "variant": "danger"},
                         {"id": "cancel_confirm", "label": self._tr("取消", "Cancel"), "variant": "secondary"},
                     ],
                 },
@@ -3280,8 +3362,13 @@ class SyncPlugin:
         else:
             cards = self._build_legacy_page(c)
 
-        if self.pending_confirm and self.pending_confirm.get("scope_key") == self._result_key() and c == self.config:
-            cards.append(self._confirmation_card())
+        has_pending_confirm = bool(
+            self.pending_confirm
+            and self.pending_confirm.get("scope_key") == self._result_key()
+            and c == self.config
+        )
+        if has_pending_confirm:
+            cards.insert(0, self._confirmation_card())
 
         configured = not self._target_error(c)
         last_result = self._get_last_result() or {}
@@ -3312,19 +3399,28 @@ class SyncPlugin:
 
         status = self.last_status
         if not status and configured and c == self.config:
-            if isinstance(last_ok, dict) and last_ok.get("time"):
+            if has_pending_confirm:
+                status = self._tr("检测到危险变更，请确认后同步", "Risky changes detected. Confirm to sync.")
+            elif isinstance(last_ok, dict) and last_ok.get("time"):
                 sync_hm = format_hm(last_ok["time"])
                 status = self._tr(f"上次同步 {sync_hm}", f"Last sync {sync_hm}")
             elif last_result.get("summary"):
                 status = str(last_result["summary"])
                 if self._is_en() and last_result.get("locale") != "en" and CHINESE_TEXT.search(status):
                     status = LOG_STATUS_EN.get(str(last_result.get("status")), "See recent sync activity for the last result")
+        header_actions = []
+        if has_pending_confirm:
+            header_actions = [
+                {"id": "confirm_sync", "label": self._tr("确认同步", "Confirm Sync"), "variant": "danger"},
+            ]
+        elif configured:
+            header_actions = [
+                {"id": "sync_now", "label": self._tr("立即同步", "Sync Now"), "variant": "primary"},
+            ]
         return {
             "title": self._tr("同步", "Sync"),
             "status": status,
-            "header_actions": [
-                {"id": "sync_now", "label": self._tr("立即同步", "Sync Now"), "variant": "primary"},
-            ] if configured else [],
+            "header_actions": header_actions,
             "cards": cards,
         }
 
@@ -3358,7 +3454,7 @@ class SyncPlugin:
                 changed_immediate = False
                 if "selected_notebooks" in values and cfg["selected_notebooks"] != self.config["selected_notebooks"]:
                     self.config["selected_notebooks"] = list(cfg["selected_notebooks"])
-                    self.pending_confirm = None
+                    self._clear_pending_confirm(bridge)
                     self._remote_preview_cache.clear()
                     self.last_status = ""
                     changed_immediate = True
@@ -3367,7 +3463,7 @@ class SyncPlugin:
                     changed_immediate = True
                 if cfg["conflict_policy"] != self.config["conflict_policy"]:
                     self.config["conflict_policy"] = cfg["conflict_policy"]
-                    self.pending_confirm = None
+                    self._clear_pending_confirm(bridge)
                     self._remote_preview_cache.clear()
                     self.last_status = ""
                     changed_immediate = True
@@ -3377,7 +3473,7 @@ class SyncPlugin:
                         if self.config["protocol"] != "local_mirror" or self.config["mirror_dir"] != cfg["mirror_dir"]:
                             self.config["protocol"] = "local_mirror"
                             self.config["mirror_dir"] = cfg["mirror_dir"]
-                            self.pending_confirm = None
+                            self._clear_pending_confirm(bridge)
                             self._remote_preview_cache.clear()
                             self.last_status = self._tr("已启用本地镜像目录", "Local mirror folder enabled")
                             changed_immediate = True
@@ -3417,7 +3513,7 @@ class SyncPlugin:
                         "status": status,
                     }
                 if next_cfg != self.config:
-                    self.pending_confirm = None
+                    self._clear_pending_confirm(bridge)
                     self._remote_preview_cache.clear()
                 self.config = next_cfg
                 self._save_config(bridge)
@@ -3450,7 +3546,7 @@ class SyncPlugin:
                             "status": err,
                         }
                     if next_cfg != self.config:
-                        self.pending_confirm = None
+                        self._clear_pending_confirm(bridge)
                         self._remote_preview_cache.clear()
                         self.config = next_cfg
                         self._save_config(bridge)
@@ -3461,7 +3557,7 @@ class SyncPlugin:
                     ok = False
                     tone = "danger"
                 else:
-                    self.pending_confirm = None
+                    self._clear_pending_confirm(bridge)
                     status = self._run_sync(bridge, report_progress=True)
                     if self.pending_confirm:
                         ok = True
@@ -3469,7 +3565,7 @@ class SyncPlugin:
                     else:
                         ok = True
                         tone = "success"
-            elif action_id == "confirm_sync":
+            elif action_id in ("confirm_sync", "confirm_sync_card"):
                 pc = self.pending_confirm
                 if not pc or pc.get("scope_key") != self._result_key():
                     err = self._target_error(self.config)
@@ -3546,7 +3642,7 @@ class SyncPlugin:
                             ok = False
                             tone = "warning"
                     else:
-                        self.pending_confirm = None
+                        self._clear_pending_confirm(bridge)
                         err = self._target_error(self.config)
                         if err or not self._selected_notebooks(self.config):
                             status = err or self._tr("请至少选择一个笔记本", "Select at least one notebook")
