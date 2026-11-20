@@ -3990,46 +3990,23 @@ class SyncPlugin:
 
         return True, repo_dir
 
-    def _webdav_list_scoped(self, base_url, filter_fn, scope="all", cfg=None, timeout=6, excluded_subdirs=(), skip_assets=False):
-        sc = str(scope or "all").strip().strip("/")
-        if not sc or sc == "all":
-            return self._webdav_list_files(
-                base_url, filter_fn, cfg=cfg, timeout=timeout, excluded_subdirs=excluded_subdirs, skip_assets=skip_assets,
-            )
-        scope_prefix = "/".join(urllib.parse.quote(p, safe="") for p in sc.split("/") if p)
-        scope_url = base_url + scope_prefix + "/"
-        sub_items = self._webdav_list_files(
-            scope_url, lambda rel: filter_fn(f"{sc}/{rel}"), cfg=cfg, timeout=timeout, skip_assets=skip_assets,
-        )
-        return [f"{sc}/{rel}" for rel in sub_items if not in_sync_subdir(f"{sc}/{rel}", excluded_subdirs)]
-
-    def _webdav_find_case_variants(self, base_url, only_path, scope="all", cfg=None, timeout=6, excluded_subdirs=()):
-        """Locate remote WebDAV notes differing from only_path only in letter case."""
-        target_cf = only_path.casefold()
-        parts = [p for p in only_path.split("/") if p]
-        parent_parts = parts[:-1]
-        parent_prefix = "/".join(parent_parts)
-        dir_url = base_url + ("/".join(urllib.parse.quote(p, safe="") for p in parent_parts) + "/" if parent_parts else "")
+    def _webdav_list_dir_entries(self, base_url, dir_parts, cfg=None, timeout=6):
+        """Return (rel_path, is_collection) direct children of base_url/dir_parts via one Depth: 1 PROPFIND."""
+        dir_url = base_url + ("/".join(urllib.parse.quote(p, safe="") for p in dir_parts) + "/" if dir_parts else "")
         root_path = urllib.parse.unquote(urllib.parse.urlparse(base_url).path).rstrip("/") + "/"
         if not root_path.startswith("/"):
             root_path = "/" + root_path
+        dir_path = urllib.parse.unquote(urllib.parse.urlparse(dir_url).path).rstrip("/") + "/"
         dav_ns = "{DAV:}"
         try:
             status, body = self._webdav_request("PROPFIND", dir_url, extra_headers={"Depth": "1"}, timeout=timeout, cfg=cfg)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
-                if parent_parts:
-                    all_items = self._webdav_list_scoped(
-                        base_url, is_safe_rel_md, scope=scope, cfg=cfg, timeout=timeout,
-                        excluded_subdirs=excluded_subdirs, skip_assets=True,
-                    )
-                    return [rel for rel in all_items if rel != only_path and rel.casefold() == target_cf]
                 return []
             raise
         if status not in (200, 207):
             return []
-        dir_path = urllib.parse.unquote(urllib.parse.urlparse(dir_url).path).rstrip("/") + "/"
-        matches = []
+        entries = []
         root = ET.fromstring(body)
         for resp in (elem for elem in root.iter() if elem.tag in (f"{dav_ns}response", "response")):
             href_text = ""
@@ -4037,15 +4014,86 @@ class SyncPlugin:
                 if child.tag in (f"{dav_ns}href", "href") and child.text:
                     href_text = child.text.strip()
                     break
-            if not href_text or self._webdav_resp_is_collection(resp, href_text):
+            if not href_text:
                 continue
+            is_col = self._webdav_resp_is_collection(resp, href_text)
             abs_href = urllib.parse.urljoin(dir_url, href_text)
             href_path = urllib.parse.unquote(urllib.parse.urlparse(abs_href).path)
             if href_path.rstrip("/") + "/" == dir_path or not href_path.startswith(root_path):
                 continue
-            rel = href_path[len(root_path):].lstrip("/")
-            if rel and rel != only_path and rel.casefold() == target_cf and is_safe_rel_md(rel) and not in_sync_subdir(rel, excluded_subdirs):
-                matches.append(rel)
+            rel = href_path[len(root_path):].lstrip("/").rstrip("/")
+            if rel:
+                entries.append((rel, is_col))
+        return entries
+
+    def _webdav_resolve_dir_case_variants(self, base_url, dir_parts, cfg=None, timeout=6):
+        """Find all remote directory paths matching dir_parts case-insensitively."""
+        if not dir_parts:
+            return [[]]
+        cur_prefixes = [[]]
+        for seg in dir_parts:
+            seg_cf = seg.casefold()
+            next_prefixes = []
+            seen = set()
+            for prefix in cur_prefixes:
+                for rel, is_col in self._webdav_list_dir_entries(base_url, prefix, cfg=cfg, timeout=timeout):
+                    if not is_col:
+                        continue
+                    name = rel.split("/")[-1]
+                    if name.casefold() == seg_cf:
+                        cand = tuple(prefix) + (name,)
+                        if cand not in seen:
+                            seen.add(cand)
+                            next_prefixes.append(list(cand))
+            if not next_prefixes:
+                return []
+            cur_prefixes = next_prefixes
+        return cur_prefixes
+
+    def _webdav_list_scoped(self, base_url, filter_fn, scope="all", cfg=None, timeout=6, excluded_subdirs=(), skip_assets=False):
+        sc = str(scope or "all").strip().strip("/")
+        if not sc or sc == "all":
+            return self._webdav_list_files(
+                base_url, filter_fn, cfg=cfg, timeout=timeout, excluded_subdirs=excluded_subdirs, skip_assets=skip_assets,
+            )
+        sc_parts = [p for p in sc.split("/") if p]
+        dir_variants = self._webdav_resolve_dir_case_variants(base_url, sc_parts, cfg=cfg, timeout=timeout)
+        if not dir_variants:
+            dir_variants = [sc_parts]
+        out = []
+        seen = set()
+        for parts in dir_variants:
+            sc_actual = "/".join(parts)
+            scope_prefix = "/".join(urllib.parse.quote(p, safe="") for p in parts)
+            scope_url = base_url + scope_prefix + "/"
+            sub_items = self._webdav_list_files(
+                scope_url, lambda rel, _p=sc_actual: filter_fn(f"{_p}/{rel}"), cfg=cfg, timeout=timeout, skip_assets=skip_assets,
+            )
+            for rel in sub_items:
+                full_rel = f"{sc_actual}/{rel}"
+                if full_rel not in seen and not in_sync_subdir(full_rel, excluded_subdirs):
+                    seen.add(full_rel)
+                    out.append(full_rel)
+        return out
+
+    def _webdav_find_case_variants(self, base_url, only_path, scope="all", cfg=None, timeout=6, excluded_subdirs=(), filter_fn=None):
+        """Locate remote WebDAV files differing from only_path only in letter case (including parent folders)."""
+        check_fn = filter_fn or is_safe_rel_md
+        target_cf = only_path.casefold()
+        parts = [p for p in only_path.split("/") if p]
+        if not parts:
+            return []
+        parent_variants = self._webdav_resolve_dir_case_variants(base_url, parts[:-1], cfg=cfg, timeout=timeout)
+        matches = []
+        seen = set()
+        for pv in parent_variants:
+            for rel, is_col in self._webdav_list_dir_entries(base_url, pv, cfg=cfg, timeout=timeout):
+                if is_col:
+                    continue
+                if rel != only_path and rel.casefold() == target_cf and check_fn(rel) and not in_sync_subdir(rel, excluded_subdirs):
+                    if rel not in seen:
+                        seen.add(rel)
+                        matches.append(rel)
         return matches
 
     def _fetch_webdav_notes(self, cfg, only_path=None, scope="all", timeout=6, force_refresh=False, subdir="", excluded_subdirs=()):
