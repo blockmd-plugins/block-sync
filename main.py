@@ -25,6 +25,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import xml.etree.ElementTree as ET
 
 
@@ -50,6 +51,8 @@ LAYOUTS_META_KEY = "notebook_layouts"
 INITIALIZED_META_KEY = "initialized_targets"
 MAX_STORED_CONFIRM_SAMPLES = 30
 MAX_WEBDAV_DIRS = 2000
+CREDENTIAL_FIELDS = ("git_token", "webdav_pass")
+CREDENTIAL_REF = re.compile(r"^sync\.(git_token|webdav_pass)\.[0-9a-f]{32}$")
 
 DEFAULT_CONFIG = {
     "selected_notebooks": [],
@@ -65,10 +68,36 @@ DEFAULT_CONFIG = {
     "git_auth": "ssh",
     "git_token": "",
     "auto_sync": True,
+    "system_notifications": True,
     "sync_assets": True,
     "conflict_policy": "keep_both",
     "delete_guard": True,
 }
+
+
+class WebDAVRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        def origin(url):
+            parsed = urllib.parse.urlsplit(url)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username is not None:
+                return None
+            port = parsed.port
+            return parsed.scheme, parsed.hostname, port if port is not None else (443 if parsed.scheme == "https" else 80)
+
+        try:
+            source, destination = origin(req.full_url), origin(newurl)
+        except ValueError:
+            source, destination = None, None
+        if destination is None or source != destination:
+            raise urllib.error.HTTPError(req.full_url, 403, "WebDAV redirected outside its origin", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+WEBDAV_OPENER = urllib.request.build_opener(WebDAVRedirect())
+
+
+class SyncStateError(RuntimeError):
+    pass
 
 
 class HostBridge:
@@ -804,6 +833,11 @@ class SyncPlugin:
         self.supports_checklist = False
         self.supports_form_layout = False
         self.supports_multi_notebook = False
+        self.supports_system = False
+        self._stored_global = None
+        self._credential_cleanup = set()
+        self._saved_config = dict(self.config)
+        self._result_notice = None
         self.last_status = ""
         self._last_synced_notebooks = []
 
@@ -1074,32 +1108,34 @@ class SyncPlugin:
         nb_cfgs_res = bridge.call_host("host.storage.get", {"key": "notebook_configs"})
         if nb_cfgs_res.get("found") and isinstance(nb_cfgs_res.get("value"), dict):
             self.notebook_configs = {
-                str(k): self._normalize_config(v, base=DEFAULT_CONFIG)
+                str(k): self._load_config_record(v)
                 for k, v in nb_cfgs_res["value"].items()
                 if isinstance(v, dict)
             }
 
         cfg_res = bridge.call_host("host.storage.get", {"key": "config"})
         raw_cfg = cfg_res.get("value") if (cfg_res.get("found") and isinstance(cfg_res.get("value"), dict)) else None
+        self._stored_global = self._load_config_record(raw_cfg) if raw_cfg is not None else None
+        if self._stored_global is not None and "selected_notebooks" not in raw_cfg:
+            self._stored_global.pop("selected_notebooks", None)
         if not self.supports_multi_notebook:
             if nb_key in self.notebook_configs:
-                self.config = self._normalize_config(self.notebook_configs[nb_key], base=DEFAULT_CONFIG)
+                self.config = dict(self.notebook_configs[nb_key])
             elif raw_cfg is not None and not raw_cfg.get("selected_notebooks"):
-                self.config = self._normalize_config(raw_cfg, base=DEFAULT_CONFIG)
+                self.config = dict(self._stored_global)
             else:
                 self.config = dict(DEFAULT_CONFIG)
             if self.notebook_root:
                 self.config["selected_notebooks"] = [self._norm_nb_path(self.notebook_root)]
         elif raw_cfg is not None and "selected_notebooks" in raw_cfg:
-            self.config = self._normalize_config(raw_cfg, base=DEFAULT_CONFIG)
+            self.config = dict(self._stored_global)
         elif nb_key in self.notebook_configs:
-            self.config = self._normalize_config(self.notebook_configs[nb_key], base=DEFAULT_CONFIG)
+            self.config = dict(self.notebook_configs[nb_key])
             if self.notebook_root:
                 self.config["selected_notebooks"] = [self._norm_nb_path(self.notebook_root)]
         elif raw_cfg is not None:
-            self.config = self._normalize_config(raw_cfg, base=DEFAULT_CONFIG)
-            if self.notebook_root and not self.config["selected_notebooks"]:
-                self.config["selected_notebooks"] = [self._norm_nb_path(self.notebook_root)]
+            self.config = dict(self._stored_global)
+            self.config["selected_notebooks"] = [self._norm_nb_path(self.notebook_root)] if self.notebook_root else []
         else:
             self.config = dict(DEFAULT_CONFIG)
             if self.notebook_root:
@@ -1146,6 +1182,152 @@ class SyncPlugin:
         self.pending_confirm = self.pending_confirms.get(self._result_key())
         self._remote_preview_cache = {}
         self.last_status = ""
+        self._saved_config = dict(self.config)
+        if self.supports_system:
+            journal = bridge.call_host("host.storage.get", {"key": "credential_cleanup"}).get("value")
+            if isinstance(journal, list):
+                self._credential_cleanup = {ref for ref in journal if isinstance(ref, str) and CREDENTIAL_REF.fullmatch(ref)}
+
+    def _load_config_record(self, raw):
+        config = self._normalize_config(raw, base=DEFAULT_CONFIG)
+        refs = raw.get("credential_refs")
+        if isinstance(refs, dict):
+            config["credential_refs"] = {
+                key: ref for key, ref in refs.items()
+                if key in CREDENTIAL_FIELDS and isinstance(ref, str) and CREDENTIAL_REF.fullmatch(ref) and ref.startswith(f"sync.{key}.")
+            }
+        return config
+
+    def _config_values(self, config):
+        if not self.supports_system:
+            return dict(config)
+        values = {key: val for key, val in config.items() if key not in CREDENTIAL_FIELDS and key != "credential_refs"}
+        values.update({field: "" for field in CREDENTIAL_FIELDS})
+        return values
+
+    def _credential_field_value(self, config, key):
+        return "" if self.supports_system else config[key]
+
+    def _credential_placeholder(self, config, field, default):
+        if self.supports_system and (config.get(field) or config.get("credential_refs", {}).get(field)):
+            return self._tr("已保存，留空保留", "Saved. Leave blank to keep it.")
+        return default
+
+    @staticmethod
+    def _credential_target(config, field):
+        if field == "webdav_pass":
+            return config.get("webdav_url", "").rstrip("/"), config.get("webdav_user", "")
+        return config.get("git_remote", "").rstrip("/")
+
+    def _resolve_credentials(self, bridge, config):
+        field = None
+        if config["protocol"] == "webdav":
+            field = "webdav_pass"
+        elif config["protocol"] == "git" and config["git_auth"] == "token":
+            field = "git_token"
+        ref = config.get("credential_refs", {}).get(field)
+        if not ref or config.get(field):
+            return config
+        try:
+            stored = bridge.call_host("host.secrets.get", {"key": ref})
+            value = stored.get("value") if stored.get("found") else None
+        except (RuntimeError, OSError):
+            value = None
+        if not isinstance(value, str) or not value:
+            raise RuntimeError(self._tr(
+                "无法读取系统凭据，请解锁或重新填写同步凭据",
+                "Could not read the system credential. Unlock the credential store or enter it again.",
+            ))
+        return dict(config, **{field: value})
+
+    @staticmethod
+    def _config_refs(notebooks, shared, current):
+        return {ref for cfg in [*notebooks.values(), shared, current] if cfg for ref in cfg.get("credential_refs", {}).values()}
+
+    def _cleanup_credentials(self, bridge):
+        active = self._config_refs(self.notebook_configs, self._stored_global, self.config)
+        complete = self._credential_cleanup & active
+        for ref in sorted(self._credential_cleanup - active)[:4]:
+            try:
+                bridge.call_host("host.secrets.delete", {"key": ref})
+            except (RuntimeError, OSError):
+                break
+            complete.add(ref)
+        if complete:
+            remaining = self._credential_cleanup - complete
+            bridge.call_host("host.storage.set", {"key": "credential_cleanup", "value": sorted(remaining)})
+            self._credential_cleanup = remaining
+
+    def _commit_system_config(self, bridge, notebooks, shared, current, migrate=None):
+        staged = {}
+        refs_by_value = {}
+
+        def prepare(config):
+            if config is None:
+                return None
+            disk = dict(config)
+            refs = dict(config.get("credential_refs", {}))
+            for field in CREDENTIAL_FIELDS:
+                value = config.get(field, "")
+                if migrate is not None:
+                    replace = (field, value) == migrate
+                else:
+                    replace = value and (value != self._saved_config.get(field) or
+                                         self._credential_target(config, field) != self._credential_target(self._saved_config, field))
+                if replace:
+                    ref = refs_by_value.get((field, value))
+                    if ref is None:
+                        ref = f"sync.{field}.{uuid.uuid4().hex}"
+                        refs_by_value[field, value] = ref
+                        staged[ref] = value
+                    refs[field] = ref
+                    disk[field] = ""
+            disk["credential_refs"] = refs
+            return disk
+
+        actual_notebooks = {key: prepare(cfg) for key, cfg in notebooks.items()} if migrate else dict(notebooks)
+        actual_shared = prepare(shared) if migrate or self.supports_multi_notebook else shared
+        actual_current = prepare(current)
+        if not migrate:
+            actual_notebooks[self._notebook_key()] = actual_current
+        old_refs = self._config_refs(self.notebook_configs, self._stored_global, self.config)
+        new_refs = self._config_refs(actual_notebooks, actual_shared, actual_current)
+        if staged:
+            pending = self._credential_cleanup | set(staged)
+            bridge.call_host("host.storage.set", {"key": "credential_cleanup", "value": sorted(pending)})
+            self._credential_cleanup = pending
+            for ref, secret in staged.items():
+                bridge.call_host("host.secrets.set", {"key": ref, "value": secret})
+                check = bridge.call_host("host.secrets.get", {"key": ref})
+                if not check.get("found") or check.get("value") != secret:
+                    raise RuntimeError("system credential verification failed")
+        retired = (self._credential_cleanup | old_refs) - new_refs
+        bridge.call_host("host.storage.set_many", {"values": {
+            "notebook_configs": actual_notebooks, "config": actual_shared, "credential_cleanup": sorted(retired),
+        }})
+        self.notebook_configs = actual_notebooks
+        self._stored_global = actual_shared
+        self.config = actual_current
+        self._saved_config = dict(self.config)
+        self._credential_cleanup = retired
+
+    def _migrate_credentials(self, bridge):
+        if not self.supports_system:
+            return "skipped"
+        try:
+            self._cleanup_credentials(bridge)
+            stored = [*self.notebook_configs.values(), self._stored_global, self.config]
+            pending = dict.fromkeys(
+                (field, cfg[field]) for cfg in stored if cfg for field in CREDENTIAL_FIELDS
+                if cfg.get(field) and "\x00" not in cfg[field] and len(cfg[field].encode("utf-8", errors="replace")) <= 1536
+            )
+            if pending:
+                self._commit_system_config(bridge, self.notebook_configs, self._stored_global, self.config, migrate=next(iter(pending)))
+            if len(pending) > 1:
+                return "migration_pending"
+        except (RuntimeError, OSError):
+            return "migration_retry"
+        return "migration_retry" if self._credential_cleanup else "skipped"
 
     def _normalize_pending_confirm(self, raw):
         if not isinstance(raw, dict):
@@ -1365,6 +1547,8 @@ class SyncPlugin:
         for key in str_fields:
             if key in raw and raw[key] is not None:
                 val = str(raw[key])
+                if self.supports_system and key in CREDENTIAL_FIELDS and not val:
+                    continue
                 merged[key] = val if key in ("mirror_dir", "webdav_pass", "git_token") else val.strip()
 
         # Resolve old presets once. Current controls store the actual paths and branch.
@@ -1417,7 +1601,7 @@ class SyncPlugin:
         if git_auth in VALID_GIT_AUTHS:
             merged["git_auth"] = git_auth
 
-        for bool_key in ("auto_sync", "sync_assets", "delete_guard"):
+        for bool_key in ("auto_sync", "sync_assets", "delete_guard", "system_notifications"):
             if bool_key in raw:
                 merged[bool_key] = bool(raw[bool_key])
 
@@ -1426,9 +1610,49 @@ class SyncPlugin:
             merged["conflict_policy"] = policy
 
         merged["mirror_dir"] = self._resolve_mirror_dir(merged)
+        if self.supports_system and base is not DEFAULT_CONFIG:
+            refs = dict(merged.get("credential_refs", {}))
+            for field in CREDENTIAL_FIELDS:
+                if self._credential_target(merged, field) != self._credential_target(src_base, field):
+                    refs.pop(field, None)
+                    if not raw.get(field):
+                        merged[field] = ""
+            if "credential_refs" in merged:
+                merged["credential_refs"] = refs
         return merged
 
-    def _save_config(self, bridge):
+    def _save_config(self, bridge, config=None, forget=None):
+        candidate = self.config if config is None else config
+        if self.supports_system:
+            try:
+                shared = candidate if self.supports_multi_notebook else self._stored_global
+                notebooks = self.notebook_configs
+                if forget:
+                    target = self._credential_target(candidate, forget)
+
+                    def remove_credential(record):
+                        if record is None or self._credential_target(record, forget) != target:
+                            return record
+                        refs = dict(record.get("credential_refs", {}))
+                        refs.pop(forget, None)
+                        return dict(record, credential_refs=refs, **{forget: ""})
+
+                    notebooks = {key: remove_credential(record) for key, record in notebooks.items()}
+                    shared = remove_credential(shared)
+                    candidate = remove_credential(candidate)
+                self._commit_system_config(bridge, notebooks, shared, candidate)
+            except (RuntimeError, OSError) as exc:
+                self.config = dict(self._saved_config)
+                raise RuntimeError(self._tr(
+                    "同步配置未保存，请检查系统凭据库后重试",
+                    "Sync settings were not saved. Check the system credential store and retry.",
+                )) from exc
+            try:
+                self._cleanup_credentials(bridge)
+            except (RuntimeError, OSError):
+                pass
+            return
+        self.config = candidate
         self.notebook_configs[self._notebook_key()] = dict(self.config)
         bridge.call_host("host.storage.set", {"key": "notebook_configs", "value": self.notebook_configs})
         if self.supports_multi_notebook:
@@ -1440,12 +1664,26 @@ class SyncPlugin:
             self.pending_confirms.pop(key, None)
         else:
             self.pending_confirms[key] = self.pending_confirm
-        bridge.call_host("host.storage.set", {"key": "stats", "value": self.stats})
-        bridge.call_host("host.storage.set", {"key": "logs", "value": self.logs[:MAX_LOG_ENTRIES]})
-        bridge.call_host("host.storage.set", {"key": "sync_meta", "value": self.sync_meta})
-        bridge.call_host("host.storage.set", {"key": "notebook_results", "value": self.notebook_results})
-        bridge.call_host("host.storage.set", {"key": "pending_confirms", "value": self.pending_confirms})
-        bridge.call_host("host.storage.set", {"key": "pending_confirm", "value": self.pending_confirm})
+        values = {
+            "stats": self.stats, "logs": self.logs[:MAX_LOG_ENTRIES], "sync_meta": self.sync_meta,
+            "notebook_results": self.notebook_results, "pending_confirms": self.pending_confirms,
+            "pending_confirm": self.pending_confirm,
+        }
+        try:
+            if self.supports_system:
+                bridge.call_host("host.storage.set_many", {"values": values})
+            else:
+                for key, value in values.items():
+                    bridge.call_host("host.storage.set", {"key": key, "value": value})
+        except (RuntimeError, OSError) as exc:
+            if self._result_notice:
+                status, conflicts = self._result_notice
+                if status not in ("失败", "待确认") and not conflicts:
+                    self._result_notice = ("失败", 0)
+            self.last_status = self._tr("同步状态未保存，请检查后重试", "Sync state could not be saved. Check settings and retry.")
+            raise SyncStateError(self.last_status) from exc
+        finally:
+            self._send_result_notice(bridge)
 
     def _result_key(self):
         return "__multi__" if self.supports_multi_notebook else self._notebook_key()
@@ -1496,6 +1734,31 @@ class SyncPlugin:
         if last_success is not None:
             entry["last_success"] = last_success
         self.notebook_results[nb_key] = entry
+        self._result_notice = (status_str, int(conflicts or 0))
+
+    def _send_result_notice(self, bridge):
+        notice, self._result_notice = self._result_notice, None
+        if not notice or not self.supports_system or not self.config["system_notifications"]:
+            return
+        status, conflicts = notice
+        if status == "失败":
+            title = self._tr("同步失败", "Sync failed")
+            body = self._tr("打开 Block 同步设置查看详情。", "Open Block Sync settings for details.")
+            tone = "error"
+        elif conflicts:
+            title = self._tr("同步发现冲突", "Sync conflicts detected")
+            body = self._tr(f"同步处理了 {conflicts} 处冲突。打开同步设置查看结果。", f"Sync handled {conflicts} conflicts. Open Sync settings for details.")
+            tone = "warning"
+        elif status == "待确认":
+            title = self._tr("同步等待确认", "Sync needs confirmation")
+            body = self._tr("同步已暂停。打开 Block 同步设置查看待确认的变更。", "Sync is paused. Open Block Sync settings to review the changes.")
+            tone = "warning"
+        else:
+            return
+        try:
+            bridge.send({"jsonrpc": "2.0", "method": "host.system.notify", "params": {"title": title, "body": body, "tone": tone}})
+        except (AttributeError, RuntimeError, OSError):
+            pass
 
     def _get_last_result(self):
         return self.notebook_results.get(self._result_key()) or self.notebook_results.get(self._notebook_key())
@@ -2816,7 +3079,7 @@ class SyncPlugin:
                 method=upper,
             )
             try:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                with WEBDAV_OPENER.open(req, timeout=timeout) as resp:
                     resp_headers = {k.lower(): v for k, v in resp.headers.items()} if resp.headers else {}
                     return resp.status, resp.read(), resp_headers
             except urllib.error.HTTPError as exc:
@@ -6143,10 +6406,6 @@ class SyncPlugin:
         except Exception:
             if protocol != "git":
                 self.sync_meta[plan["meta_key"]] = base_map
-                try:
-                    bridge.call_host("host.storage.set", {"key": "sync_meta", "value": self.sync_meta})
-                except Exception:
-                    pass
             raise
         finally:
             if active_target_fd[0] is not None:
@@ -6179,6 +6438,8 @@ class SyncPlugin:
         return pushed, pulled, conflict_count, asset_count, base_map, written_remote_paths, synced_repo_paths, planned_git_blobs
 
     def _compute_batch_plan(self, bridge, cfg, notebooks, only_path=None, inspect_remote=True, force_refresh=False):
+        if inspect_remote:
+            cfg = self._resolve_credentials(bridge, cfg)
         protocol = cfg.get("protocol", "local_mirror")
         target_display = self._target_display(cfg)
         repo_dir = None
@@ -6296,6 +6557,7 @@ class SyncPlugin:
         total_pushed = 0
         total_pulled = 0
         total_conflicts = 0
+        reported_conflicts = 0
         total_assets = 0
 
         layouts = self.sync_meta.get(LAYOUTS_META_KEY, {})
@@ -6380,6 +6642,8 @@ class SyncPlugin:
             total_pushed += pushed
             total_pulled += pulled
             total_conflicts += conflicts
+            risks = self._plan_risk_metrics(plan)
+            reported_conflicts += risks["conflicts"] + risks["pull_conflict"] + risks["push_conflict"]
             total_assets += assets
             pending_base_maps.append((plan["meta_key"], updated_base))
             staged_git_paths.extend(written_paths)
@@ -6445,8 +6709,8 @@ class SyncPlugin:
             return summary
 
         summary = self._tr(
-            f"{nb_prefix}推送 {total_pushed} 篇 · 拉取 {total_pulled} 篇 · 冲突 {total_conflicts} 篇",
-            f"{nb_prefix}Pushed: {total_pushed} · Pulled: {total_pulled} · Conflicts: {total_conflicts}",
+            f"{nb_prefix}推送 {total_pushed} 篇 · 拉取 {total_pulled} 篇 · 冲突 {reported_conflicts} 处",
+            f"{nb_prefix}Pushed: {total_pushed} · Pulled: {total_pulled} · Conflicts: {reported_conflicts}",
         )
         if total_assets > 0:
             summary += self._tr(f" · 附件 {total_assets} 个", f" · Attachments: {total_assets}")
@@ -6457,7 +6721,7 @@ class SyncPlugin:
             target=batch["target_display"],
             pushed=total_pushed,
             pulled=total_pulled,
-            conflicts=total_conflicts,
+            conflicts=reported_conflicts,
             assets=total_assets,
         )
         return self._tr(f"已完成{self._protocol_label(protocol)}同步：{summary}", f"{self._protocol_label(protocol)} sync complete: {summary}")
@@ -6686,12 +6950,18 @@ class SyncPlugin:
         self.last_status = msg
         return msg
 
-    def _run_test_conn(self, cfg=None):
+    def _run_test_conn(self, cfg=None, bridge=None):
         c = cfg or self.config
         err = self._target_error(c, require_notebooks=False)
         if err:
             self.last_status = err
             return False, err
+        if bridge is not None:
+            try:
+                c = self._resolve_credentials(bridge, c)
+            except RuntimeError as exc:
+                self.last_status = str(exc)
+                return False, self.last_status
         prev_cfg = self.config
         self.config = c
         try:
@@ -6823,8 +7093,8 @@ class SyncPlugin:
             ("secret", "webdav_pass", self._tr("密码", "Password"), ""),
         ):
             target_items.append({
-                "kind": kind, "id": key, "label": label, "value": c[key],
-                "placeholder": placeholder,
+                "kind": kind, "id": key, "label": label, "value": self._credential_field_value(c, key) if kind == "secret" else c[key],
+                "placeholder": self._credential_placeholder(c, key, placeholder) if kind == "secret" else placeholder,
                 "visible_when": {"control_id": "protocol", "equals": "webdav"},
             })
 
@@ -6862,7 +7132,8 @@ class SyncPlugin:
                 "kind": "secret",
                 "id": "git_token",
                 "label": self._tr("访问令牌", "Access Token"),
-                "value": c["git_token"],
+                "value": self._credential_field_value(c, "git_token"),
+                "placeholder": self._credential_placeholder(c, "git_token", "ghp_..."),
                 "visible_when": {"control_id": "git_auth", "equals": "token"},
             })
         target_items.extend([
@@ -6876,13 +7147,29 @@ class SyncPlugin:
             {
                 "kind": "actions",
                 "visible_when": {"control_id": "protocol", "in": ["webdav", "git"]},
-                "buttons": [
-                    {"id": "test_conn", "label": self._tr("测试连接", "Test Connection"), "variant": "secondary"},
-                    {"id": "save_config", "label": self._tr("保存", "Save"), "variant": "primary"},
-                ],
+                "buttons": self._config_buttons(protocol),
             },
         ])
+        if self.supports_system:
+            target_items.append(self._notification_switch(c))
         return [{"id": "target-card", "title": self._tr("同步设置", "Sync Settings"), "items": target_items}]
+
+    def _config_buttons(self, protocol):
+        buttons = [
+            {"id": "test_conn", "label": self._tr("测试连接", "Test Connection"), "variant": "secondary"},
+            {"id": "save_config", "label": self._tr("保存", "Save"), "variant": "primary"},
+        ]
+        field = {"git": "git_token", "webdav": "webdav_pass"}.get(protocol)
+        if self.supports_system and protocol == self.config["protocol"] and field and (self.config.get(field) or self.config.get("credential_refs", {}).get(field)):
+            buttons.insert(0, {"id": "forget_credential", "label": self._tr("清除凭据", "Forget Credential"), "variant": "secondary"})
+        return buttons
+
+    def _notification_switch(self, config):
+        return {
+            "kind": "switch", "id": "system_notifications",
+            "label": self._tr("同步失败或冲突时通知", "Notify on Sync Errors or Conflicts"),
+            "value": config["system_notifications"],
+        }
 
     def build_page(self, cfg=None):
         c = cfg or self.config
@@ -6974,8 +7261,8 @@ class SyncPlugin:
                             "id": "webdav_pass",
                             "label": self._tr("密码", "Password"),
                             "layout": "stacked",
-                            "value": c["webdav_pass"],
-                            "placeholder": self._tr("应用密码或口令", "App password or passphrase"),
+                            "value": self._credential_field_value(c, "webdav_pass"),
+                            "placeholder": self._credential_placeholder(c, "webdav_pass", self._tr("应用密码或口令", "App password or passphrase")),
                         },
                     ],
                 },
@@ -7017,8 +7304,8 @@ class SyncPlugin:
                             "id": "git_token",
                             "label": self._tr("访问令牌", "Access Token"),
                             "layout": "stacked",
-                            "value": c["git_token"],
-                            "placeholder": "ghp_...",
+                            "value": self._credential_field_value(c, "git_token"),
+                            "placeholder": self._credential_placeholder(c, "git_token", "ghp_..."),
                             "visible_when": {"control_id": "git_auth", "equals": "token"},
                         },
                     ],
@@ -7026,10 +7313,7 @@ class SyncPlugin:
                 {
                     "kind": "actions",
                     "visible_when": {"control_id": "protocol", "in": ["webdav", "git"]},
-                    "buttons": [
-                        {"id": "test_conn", "label": self._tr("测试连接", "Test Connection"), "variant": "secondary"},
-                        {"id": "save_config", "label": self._tr("保存", "Save"), "variant": "primary"},
-                    ],
+                    "buttons": self._config_buttons(protocol),
                 },
             ]
 
@@ -7051,6 +7335,8 @@ class SyncPlugin:
                     },
                 ],
             }
+            if self.supports_system:
+                options_card["items"].append(self._notification_switch(c))
             cards = [notebooks_card, target_card, options_card]
         else:
             cards = self._build_legacy_page(c)
@@ -7138,6 +7424,7 @@ class SyncPlugin:
             self.supports_form_layout = "form_layout" in caps
             self.supports_multi_notebook = "multi_notebook" in caps
             self.supports_action_progress = "action_progress" in caps
+            self.supports_system = "system_integration" in caps
             raw_nbs = params.get("notebooks")
             if isinstance(raw_nbs, list):
                 self.known_notebooks = [str(p) for p in raw_nbs if str(p or "").strip()]
@@ -7161,6 +7448,9 @@ class SyncPlugin:
                 if cfg["auto_sync"] != self.config["auto_sync"]:
                     self.config["auto_sync"] = cfg["auto_sync"]
                     changed_immediate = True
+                if cfg["system_notifications"] != self.config["system_notifications"]:
+                    self.config["system_notifications"] = cfg["system_notifications"]
+                    changed_immediate = True
                 if cfg["conflict_policy"] != self.config["conflict_policy"]:
                     self.config["conflict_policy"] = cfg["conflict_policy"]
                     self._clear_pending_confirm(bridge)
@@ -7183,7 +7473,7 @@ class SyncPlugin:
                     self._save_config(bridge)
                 accepted = {
                     key: self.config[key]
-                    for key in ("selected_notebooks", "auto_sync", "conflict_policy", "protocol", "mirror_dir")
+                    for key in ("selected_notebooks", "auto_sync", "system_notifications", "conflict_policy", "protocol", "mirror_dir")
                     if key in values and cfg[key] == self.config[key]
                 }
             else:
@@ -7208,22 +7498,36 @@ class SyncPlugin:
                     return {
                         "ok": False,
                         "tone": "danger",
-                        "values": dict(next_cfg),
+                        "values": self._config_values(next_cfg),
                         "page": self.build_page(cfg=next_cfg),
                         "status": status,
                     }
                 if next_cfg != self.config:
                     self._clear_pending_confirm(bridge)
                     self._remote_preview_cache.clear()
-                self.config = next_cfg
-                self._save_config(bridge)
+                self._save_config(bridge, next_cfg)
                 status = self._tr("已保存同步目标配置", "Sync destination saved")
                 self.last_status = status
                 ok = True
                 tone = "success"
+            elif action_id == "forget_credential" and self.supports_system:
+                field = {"git": "git_token", "webdav": "webdav_pass"}.get(self.config["protocol"])
+                if field and values.get("protocol", self.config["protocol"]) == self.config["protocol"]:
+                    self._save_config(bridge, forget=field)
+                    self._clear_pending_confirm(bridge)
+                    self._remote_preview_cache.clear()
+                    status = self._tr("已清除此目标的同步凭据", "Sync credential cleared for this destination")
+                    if self._credential_cleanup:
+                        status = self._tr("已取消使用此目标的凭据，系统凭据库中的删除将重试", "Sync will stop using this credential. Deletion from the system store will be retried.")
+                    tone = "success"
+                else:
+                    status = self._tr("请先保存同步方式", "Save the sync method first")
+                    tone = "warning"
+                    ok = False
+                self.last_status = status
             elif action_id == "test_conn":
                 next_cfg = self._normalize_config(values)
-                ok, status = self._run_test_conn(cfg=next_cfg)
+                ok, status = self._run_test_conn(cfg=next_cfg, bridge=bridge)
                 self._save_runtime(bridge)
                 return {
                     "ok": ok,
@@ -7240,15 +7544,14 @@ class SyncPlugin:
                         return {
                             "ok": False,
                             "tone": "danger",
-                            "values": dict(next_cfg),
+                            "values": self._config_values(next_cfg),
                             "page": self.build_page(cfg=next_cfg),
                             "status": err,
                         }
                     if next_cfg != self.config:
                         self._clear_pending_confirm(bridge)
                         self._remote_preview_cache.clear()
-                        self.config = next_cfg
-                        self._save_config(bridge)
+                        self._save_config(bridge, next_cfg)
                 err = self._target_error(self.config)
                 if err or not self._selected_notebooks(self.config):
                     status = err or self._tr("请至少选择一个笔记本", "Select at least one notebook")
@@ -7400,7 +7703,7 @@ class SyncPlugin:
             res = {
                 "ok": ok,
                 "tone": tone,
-                "values": dict(self.config),
+                "values": self._config_values(self.config),
                 "page": self.build_page(cfg=self.config),
                 "status": status,
             }
@@ -7410,6 +7713,12 @@ class SyncPlugin:
 
         if method == "plugin.event":
             event_name = str(params.get("event") or "")
+            if event_name == "plugin.credentials_migrate":
+                return {"handled": True, "outcome": self._migrate_credentials(bridge)}
+            if event_name in ("system.wake", "network.changed"):
+                return self._sync_after_system_event(bridge, event_name, params)
+            if event_name != "note.saved":
+                return {"handled": False}
             rel_path = str(params.get("path") or "").replace("\\", "/")
             event_nb = self._norm_nb_path(params.get("notebook_root") or self.notebook_root)
             outcome = "skipped"
@@ -7427,6 +7736,30 @@ class SyncPlugin:
             return {"ok": True}
 
         raise RuntimeError(f"unsupported method: {method}")
+
+    def _sync_after_system_event(self, bridge, event_name, params):
+        skipped = {"handled": True, "outcome": "skipped"}
+        if not self.config["auto_sync"] or self.pending_confirm:
+            return skipped
+        protocol = self.config["protocol"]
+        git_target = self.config["git_remote"]
+        needs_network = protocol == "webdav" or (
+            protocol == "git" and self._is_remote_git_url(git_target) and not git_target.lower().startswith("file://")
+        )
+        if event_name == "network.changed" and (params.get("online") is not True or not needs_network):
+            return skipped
+        if event_name == "system.wake" and params.get("online") is False and needs_network:
+            return skipped
+        self._refresh_known_notebooks(bridge)
+        if self._target_error(self.config) or not self._selected_notebooks(self.config):
+            return skipped
+        try:
+            self._run_sync(bridge)
+        except SyncStateError:
+            return {"handled": True, "outcome": "state_error"}
+        except RuntimeError:
+            return {"handled": True, "outcome": "failed"}
+        return {"handled": True, "outcome": self._last_sync_outcome, "synced_notebooks": self._last_synced_notebooks}
 
 
 def main():
