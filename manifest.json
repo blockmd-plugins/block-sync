@@ -26,7 +26,10 @@
     "notes:read",
     "notes:write",
     "network",
-    "events:note_saved"
+    "events:note_saved",
+    "system:notify",
+    "system:secrets",
+    "events:system"
   ],
   "permission_reasons": {
     "storage": {
@@ -48,6 +51,18 @@
     "events:note_saved": {
       "zh": "在笔记保存后自动触发增量同步",
       "en": "Automatically trigger incremental sync when a note is saved"
+    },
+    "system:notify": {
+      "zh": "同步失败、发生冲突或需要确认时发出通知",
+      "en": "Notify you when sync fails, encounters conflicts, or needs confirmation"
+    },
+    "system:secrets": {
+      "zh": "将 Git 令牌和 WebDAV 密码保存在系统凭据库中",
+      "en": "Store Git tokens and WebDAV passwords in the system credential store"
+    },
+    "events:system": {
+      "zh": "系统唤醒或恢复联网后按现有规则补做自动同步",
+      "en": "Resume automatic sync after waking or reconnecting, using the existing sync rules"
     }
   },
   "surfaces": [
