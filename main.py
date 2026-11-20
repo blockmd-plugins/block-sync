@@ -3958,6 +3958,51 @@ class SyncPlugin:
         )
         return [f"{sc}/{rel}" for rel in sub_items if not in_sync_subdir(f"{sc}/{rel}", excluded_subdirs)]
 
+    def _webdav_find_case_variants(self, base_url, only_path, scope="all", cfg=None, timeout=6, excluded_subdirs=()):
+        """Locate remote WebDAV notes differing from only_path only in letter case."""
+        target_cf = only_path.casefold()
+        parts = [p for p in only_path.split("/") if p]
+        parent_parts = parts[:-1]
+        parent_prefix = "/".join(parent_parts)
+        dir_url = base_url + ("/".join(urllib.parse.quote(p, safe="") for p in parent_parts) + "/" if parent_parts else "")
+        root_path = urllib.parse.unquote(urllib.parse.urlparse(base_url).path).rstrip("/") + "/"
+        if not root_path.startswith("/"):
+            root_path = "/" + root_path
+        dav_ns = "{DAV:}"
+        try:
+            status, body = self._webdav_request("PROPFIND", dir_url, extra_headers={"Depth": "1"}, timeout=timeout, cfg=cfg)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                if parent_parts:
+                    all_items = self._webdav_list_scoped(
+                        base_url, is_safe_rel_md, scope=scope, cfg=cfg, timeout=timeout,
+                        excluded_subdirs=excluded_subdirs, skip_assets=True,
+                    )
+                    return [rel for rel in all_items if rel != only_path and rel.casefold() == target_cf]
+                return []
+            raise
+        if status not in (200, 207):
+            return []
+        dir_path = urllib.parse.unquote(urllib.parse.urlparse(dir_url).path).rstrip("/") + "/"
+        matches = []
+        root = ET.fromstring(body)
+        for resp in (elem for elem in root.iter() if elem.tag in (f"{dav_ns}response", "response")):
+            href_text = ""
+            for child in list(resp):
+                if child.tag in (f"{dav_ns}href", "href") and child.text:
+                    href_text = child.text.strip()
+                    break
+            if not href_text or self._webdav_resp_is_collection(resp, href_text):
+                continue
+            abs_href = urllib.parse.urljoin(dir_url, href_text)
+            href_path = urllib.parse.unquote(urllib.parse.urlparse(abs_href).path)
+            if href_path.rstrip("/") + "/" == dir_path or not href_path.startswith(root_path):
+                continue
+            rel = href_path[len(root_path):].lstrip("/")
+            if rel and rel != only_path and rel.casefold() == target_cf and is_safe_rel_md(rel) and not in_sync_subdir(rel, excluded_subdirs):
+                matches.append(rel)
+        return matches
+
     def _fetch_webdav_notes(self, cfg, only_path=None, scope="all", timeout=6, force_refresh=False, subdir="", excluded_subdirs=()):
         root_url = self._webdav_root_url(cfg)
         base_url = self._webdav_base_url(cfg, subdir=subdir)
@@ -3990,6 +4035,16 @@ class SyncPlugin:
                     remote_notes[rel_path] = self._decode_note_bytes(raw_bytes, rel_path)
                     if etag:
                         remote_etags[rel_path] = etag
+            if only_path and not remote_notes and is_safe_rel_md(only_path) and not is_safe_rel_asset(only_path) and not in_sync_subdir(only_path, excluded_subdirs):
+                for alt_rel in self._webdav_find_case_variants(
+                    base_url, only_path, scope=scope, cfg=cfg, timeout=timeout, excluded_subdirs=excluded_subdirs
+                ):
+                    alt_url = base_url + "/".join(urllib.parse.quote(p, safe="") for p in alt_rel.split("/"))
+                    found, raw_bytes, etag = self._webdav_get_bytes_with_etag(alt_url, cfg=cfg, timeout=timeout)
+                    if found:
+                        remote_notes[alt_rel] = self._decode_note_bytes(raw_bytes, alt_rel)
+                        if etag:
+                            remote_etags[alt_rel] = etag
             if only_path is None:
                 self._remote_preview_cache[cache_key] = (time.time(), dict(remote_notes), dict(remote_etags))
             return True, remote_notes, remote_etags, None
