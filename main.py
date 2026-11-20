@@ -185,6 +185,15 @@ def sync_dir_key(name):
     return unicodedata.normalize("NFC", name).casefold()
 
 
+def fold_sync_path(rel_path, case=False, normalize=False):
+    text = str(rel_path or "").replace("\\", "/")
+    if normalize:
+        text = unicodedata.normalize("NFC", text)
+    if case:
+        text = text.casefold()
+    return text
+
+
 def in_sync_subdir(rel_path, subdirs):
     return sync_dir_key(rel_path.split("/", 1)[0]) in subdirs
 
@@ -1599,12 +1608,14 @@ class SyncPlugin:
                     )
         return ""
 
-    def _matches_scope(self, rel_path, scope=None, case_insensitive=False):
+    def _matches_scope(self, rel_path, scope=None, case_insensitive=False, normalize=False):
         sc = scope if scope is not None else self.config.get("sync_scope", "all")
         if not sc or sc == "all":
             return True
-        if case_insensitive:
-            return rel_path.casefold().startswith(f"{sc.casefold()}/")
+        if case_insensitive or normalize:
+            folded = fold_sync_path(rel_path, case=case_insensitive, normalize=normalize)
+            prefix = fold_sync_path(sc, case=case_insensitive, normalize=normalize)
+            return folded.startswith(f"{prefix}/")
         return rel_path.startswith(f"{sc}/")
 
     def _list_local_note_paths(self, bridge, nb_root=None):
@@ -1638,11 +1649,13 @@ class SyncPlugin:
                 raise
             return notes
         all_paths = paths if paths is not None else self._list_local_note_paths(bridge, nb_root=nb_root)
-        local_ci = self._dir_is_case_insensitive(nb_root or self.notebook_root)
+        local_root = nb_root or self.notebook_root
+        local_ci = self._dir_is_case_insensitive(local_root)
+        local_norm = self._dir_is_normalization_insensitive(local_root)
         for rel_path in all_paths:
             if not is_safe_rel_md(rel_path):
                 continue
-            if not self._matches_scope(rel_path, scope, case_insensitive=local_ci):
+            if not self._matches_scope(rel_path, scope, case_insensitive=local_ci, normalize=local_norm):
                 continue
             params = {"path": rel_path}
             if nb_root and self.supports_multi_notebook:
@@ -2045,11 +2058,11 @@ class SyncPlugin:
             if part in entries:
                 chosen = part
             else:
-                target_cf = part.casefold()
+                target_key = fold_sync_path(part, case=True, normalize=True)
                 chosen = None
                 cand_full = os.path.join(cur_dir, part)
                 for entry in entries:
-                    if entry.casefold() == target_cf:
+                    if fold_sync_path(entry, case=True, normalize=True) == target_key:
                         try:
                             if os.path.samefile(os.path.join(cur_dir, entry), cand_full):
                                 chosen = entry
@@ -2082,6 +2095,7 @@ class SyncPlugin:
             return remote_files
 
         mirror_ci = self._dir_is_case_insensitive(mirror_dir)
+        mirror_norm = self._dir_is_normalization_insensitive(mirror_dir)
         for root, dirs, files in os.walk(mirror_dir):
             kept_dirs = []
             for d in dirs:
@@ -2106,7 +2120,7 @@ class SyncPlugin:
                 if ex_reals and self._path_hits_excluded(f_real, ex_reals):
                     continue
                 rel = os.path.relpath(full, mirror_dir).replace(os.sep, "/")
-                if not is_safe_rel_md(rel) or in_sync_subdir(rel, excluded_subdirs) or not self._matches_scope(rel, scope, case_insensitive=mirror_ci):
+                if not is_safe_rel_md(rel) or in_sync_subdir(rel, excluded_subdirs) or not self._matches_scope(rel, scope, case_insensitive=mirror_ci, normalize=mirror_norm):
                     continue
                 with open(full, "rb") as fh:
                     remote_files[rel] = self._decode_note_bytes(fh.read(), rel)
@@ -4030,13 +4044,13 @@ class SyncPlugin:
                 entries.append((rel, is_col))
         return entries
 
-    def _webdav_resolve_dir_case_variants(self, base_url, dir_parts, cfg=None, timeout=6):
+    def _webdav_resolve_dir_case_variants(self, base_url, dir_parts, cfg=None, timeout=6, normalize=False):
         """Find all remote directory paths matching dir_parts case-insensitively."""
         if not dir_parts:
             return [[]]
         cur_prefixes = [[]]
         for seg in dir_parts:
-            seg_cf = seg.casefold()
+            seg_key = fold_sync_path(seg, case=True, normalize=normalize)
             next_prefixes = []
             seen = set()
             for prefix in cur_prefixes:
@@ -4044,7 +4058,7 @@ class SyncPlugin:
                     if not is_col:
                         continue
                     name = rel.split("/")[-1]
-                    if name.casefold() == seg_cf:
+                    if fold_sync_path(name, case=True, normalize=normalize) == seg_key:
                         cand = tuple(prefix) + (name,)
                         if cand not in seen:
                             seen.add(cand)
@@ -4054,14 +4068,14 @@ class SyncPlugin:
             cur_prefixes = next_prefixes
         return cur_prefixes
 
-    def _webdav_list_scoped(self, base_url, filter_fn, scope="all", cfg=None, timeout=6, excluded_subdirs=(), skip_assets=False):
+    def _webdav_list_scoped(self, base_url, filter_fn, scope="all", cfg=None, timeout=6, excluded_subdirs=(), skip_assets=False, normalize=False):
         sc = str(scope or "all").strip().strip("/")
         if not sc or sc == "all":
             return self._webdav_list_files(
                 base_url, filter_fn, cfg=cfg, timeout=timeout, excluded_subdirs=excluded_subdirs, skip_assets=skip_assets,
             )
         sc_parts = [p for p in sc.split("/") if p]
-        dir_variants = self._webdav_resolve_dir_case_variants(base_url, sc_parts, cfg=cfg, timeout=timeout)
+        dir_variants = self._webdav_resolve_dir_case_variants(base_url, sc_parts, cfg=cfg, timeout=timeout, normalize=normalize)
         if not dir_variants:
             dir_variants = [sc_parts]
         out = []
@@ -4080,21 +4094,21 @@ class SyncPlugin:
                     out.append(full_rel)
         return out
 
-    def _webdav_find_case_variants(self, base_url, only_path, scope="all", cfg=None, timeout=6, excluded_subdirs=(), filter_fn=None):
+    def _webdav_find_case_variants(self, base_url, only_path, scope="all", cfg=None, timeout=6, excluded_subdirs=(), filter_fn=None, normalize=False):
         """Locate remote WebDAV files differing from only_path only in letter case (including parent folders)."""
         check_fn = filter_fn or is_safe_rel_md
-        target_cf = only_path.casefold()
+        target_key = fold_sync_path(only_path, case=True, normalize=normalize)
         parts = [p for p in only_path.split("/") if p]
         if not parts:
             return []
-        parent_variants = self._webdav_resolve_dir_case_variants(base_url, parts[:-1], cfg=cfg, timeout=timeout)
+        parent_variants = self._webdav_resolve_dir_case_variants(base_url, parts[:-1], cfg=cfg, timeout=timeout, normalize=normalize)
         matches = []
         seen = set()
         for pv in parent_variants:
             for rel, is_col in self._webdav_list_dir_entries(base_url, pv, cfg=cfg, timeout=timeout):
                 if is_col:
                     continue
-                if rel != only_path and rel.casefold() == target_cf and check_fn(rel) and not in_sync_subdir(rel, excluded_subdirs):
+                if rel != only_path and fold_sync_path(rel, case=True, normalize=normalize) == target_key and check_fn(rel) and not in_sync_subdir(rel, excluded_subdirs):
                     if rel not in seen:
                         seen.add(rel)
                         matches.append(rel)
@@ -4113,12 +4127,13 @@ class SyncPlugin:
                 return True, dict(cached_notes), dict(cached_etags), None
 
         try:
+            name_norm = self._dir_is_normalization_insensitive(self.notebook_root)
             remote_paths = (
                 [only_path]
                 if only_path
                 else self._webdav_list_scoped(
                     base_url, is_safe_rel_md, scope=scope, cfg=cfg, timeout=timeout,
-                    excluded_subdirs=excluded_subdirs, skip_assets=True,
+                    excluded_subdirs=excluded_subdirs, skip_assets=True, normalize=name_norm,
                 )
             )
             remote_notes = {}
@@ -4134,7 +4149,7 @@ class SyncPlugin:
                         remote_etags[rel_path] = etag
             if only_path and not remote_notes and is_safe_rel_md(only_path) and not is_safe_rel_asset(only_path) and not in_sync_subdir(only_path, excluded_subdirs):
                 for alt_rel in self._webdav_find_case_variants(
-                    base_url, only_path, scope=scope, cfg=cfg, timeout=timeout, excluded_subdirs=excluded_subdirs
+                    base_url, only_path, scope=scope, cfg=cfg, timeout=timeout, excluded_subdirs=excluded_subdirs, normalize=name_norm,
                 ):
                     alt_url = base_url + "/".join(urllib.parse.quote(p, safe="") for p in alt_rel.split("/"))
                     found, raw_bytes, etag = self._webdav_get_bytes_with_etag(alt_url, cfg=cfg, timeout=timeout)
@@ -4248,15 +4263,16 @@ class SyncPlugin:
 
         local_candidates = set(self._asset_paths_for_sync(nb_root, explicit_paths, excluded_subdirs))
         remote_candidates = set()
+        name_norm = self._dir_is_normalization_insensitive(nb_root)
         if explicit_paths is None:
             if protocol == "webdav":
                 remote_candidates.update(self._webdav_list_scoped(
-                    base_url, is_safe_rel_asset, scope=scope, cfg=cfg, excluded_subdirs=excluded_subdirs,
+                    base_url, is_safe_rel_asset, scope=scope, cfg=cfg, excluded_subdirs=excluded_subdirs, normalize=name_norm,
                 ))
             elif target_dir and os.path.isdir(target_dir):
                 found_assets = self._list_dir_assets(target_dir, excluded_subdirs=excluded_subdirs)
                 if tracked_remote_paths is not None:
-                    found_assets = {p for p in found_assets if p in tracked_remote_paths}
+                    found_assets = set(self._align_paths_to_tracked({p: None for p in found_assets}, tracked_remote_paths, target_dir))
                 remote_candidates.update(found_assets)
         else:
             remote_candidates.update(explicit_paths)
@@ -4269,7 +4285,8 @@ class SyncPlugin:
             for np, txt in remote_notes.items():
                 referenced.update(note_asset_paths(np, txt))
             asset_ci = self._dir_is_case_insensitive(nb_root) or (bool(target_dir) and self._dir_is_case_insensitive(target_dir))
-            candidates = {p for p in candidates if self._matches_scope(p, scope, case_insensitive=asset_ci)} | referenced
+            asset_norm = name_norm or (bool(target_dir) and self._dir_is_normalization_insensitive(target_dir))
+            candidates = {p for p in candidates if self._matches_scope(p, scope, case_insensitive=asset_ci, normalize=asset_norm)} | referenced
         if excluded_subdirs:
             candidates = {p for p in candidates if not in_sync_subdir(p, excluded_subdirs)}
 
@@ -4281,7 +4298,7 @@ class SyncPlugin:
         if git_tree_paths:
             for tp in sorted(git_tree_paths):
                 if is_safe_rel_asset(tp) and not in_sync_subdir(tp, excluded_subdirs):
-                    git_tracked_assets_folded.setdefault(tp.casefold(), []).append(tp)
+                    git_tracked_assets_folded.setdefault(self._fold_identity(tp), []).append(tp)
 
         for rel in sorted(candidates):
             if excluded_subdirs and in_sync_subdir(rel, excluded_subdirs):
@@ -4302,7 +4319,7 @@ class SyncPlugin:
                         remote_asset_etags[rel] = etag
                 elif explicit_paths is not None or rel in referenced:
                     for alt_rel in self._webdav_find_case_variants(
-                        base_url, rel, scope=scope, cfg=cfg, excluded_subdirs=excluded_subdirs, filter_fn=is_safe_rel_asset
+                        base_url, rel, scope=scope, cfg=cfg, excluded_subdirs=excluded_subdirs, filter_fn=is_safe_rel_asset, normalize=name_norm,
                     ):
                         alt_url = base_url + "/".join(urllib.parse.quote(p, safe="") for p in alt_rel.split("/"))
                         found_a, rdata_a, etag_a = self._webdav_get_bytes_with_etag(alt_url, cfg=cfg)
@@ -4313,7 +4330,12 @@ class SyncPlugin:
             elif target_dir:
                 actual_rel = rel
                 if git_tree_paths and rel not in git_tree_paths:
-                    folded_hits = git_tracked_assets_folded.get(rel.casefold()) or []
+                    folded_hits = [
+                        candidate for candidate in git_tracked_assets_folded.get(self._fold_identity(rel), [])
+                        if self._paths_collapse(target_dir, rel, candidate)
+                    ]
+                    if len(folded_hits) > 1:
+                        raise RuntimeError(self._collapsed_name_error(" / ".join(folded_hits[:2])))
                     if len(folded_hits) == 1:
                         actual_rel = folded_hits[0]
                 if tracked_remote_paths is None or actual_rel in tracked_remote_paths:
@@ -4326,25 +4348,19 @@ class SyncPlugin:
         # Detect multi-file attachment case collisions and pair 1-to-1 case-only renamed attachments.
         local_afolded = {}
         for lp in sorted(local_assets):
-            local_afolded.setdefault(lp.casefold(), []).append(lp)
+            local_afolded.setdefault(self._fold_identity(lp), []).append(lp)
         remote_afolded = {}
         for rp in sorted(remote_assets):
-            remote_afolded.setdefault(rp.casefold(), []).append(rp)
+            remote_afolded.setdefault(self._fold_identity(rp), []).append(rp)
 
-        multi_remote_a = [grp for grp in remote_afolded.values() if len(grp) > 1]
-        if multi_remote_a and self._dir_is_case_insensitive(nb_root, local_assets.keys()):
+        multi_remote_a = [grp for grp in remote_afolded.values() if self._group_collapses(grp, nb_root)]
+        if multi_remote_a:
             pair = " / ".join(multi_remote_a[0][:2])
-            raise RuntimeError(self._tr(
-                f"远端存在仅大小写不同的同名附件（{pair}），当前本地磁盘不区分大小写，请先重命名其中一个",
-                f"Remote contains attachments differing only in letter case ({pair}) on a case-insensitive local disk; rename one first",
-            ))
-        multi_local_a = [grp for grp in local_afolded.values() if len(grp) > 1]
-        if multi_local_a and protocol in ("local_mirror", "git") and self._dir_is_case_insensitive(target_dir, remote_assets.keys()):
+            raise RuntimeError(self._collapsed_name_error(pair))
+        multi_local_a = [grp for grp in local_afolded.values() if protocol in ("local_mirror", "git") and self._group_collapses(grp, target_dir)]
+        if multi_local_a:
             pair = " / ".join(multi_local_a[0][:2])
-            raise RuntimeError(self._tr(
-                f"本地存在仅大小写不同的同名附件（{pair}），同步目标磁盘不区分大小写，请先重命名其中一个",
-                f"Local notebook contains attachments differing only in letter case ({pair}) on a case-insensitive sync target; rename one first",
-            ))
+            raise RuntimeError(self._collapsed_name_error(pair))
 
         for fk, l_list in local_afolded.items():
             r_list = remote_afolded.get(fk)
@@ -4353,8 +4369,8 @@ class SyncPlugin:
             lp, rp = l_list[0], r_list[0]
             if lp == rp or lp in remote_assets or rp in local_assets:
                 continue
-            collides = self._paths_case_collide_on_dir(nb_root, lp, rp) or (
-                protocol in ("local_mirror", "git") and self._paths_case_collide_on_dir(target_dir, lp, rp)
+            collides = self._paths_collapse(nb_root, lp, rp) or (
+                protocol in ("local_mirror", "git") and self._paths_collapse(target_dir, lp, rp)
             )
             if collides:
                 remote_asset_path_map[lp] = rp
@@ -4450,6 +4466,116 @@ class SyncPlugin:
         except OSError:
             pass
         return False
+
+    def _probe_norm_insensitive(self, probe_dir):
+        token = f".bsnorm-{os.getpid()}-{time.time_ns()}-caf\u00e9"
+        nfc_name = unicodedata.normalize("NFC", token)
+        nfd_name = unicodedata.normalize("NFD", token)
+        probe = os.path.join(probe_dir, nfc_name)
+        created = False
+        try:
+            fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            created = True
+            os.close(fd)
+            other = os.path.join(probe_dir, nfd_name)
+            return os.path.exists(other) and os.path.samefile(probe, other)
+        except OSError:
+            return False
+        finally:
+            if created:
+                for name in (nfc_name, nfd_name):
+                    try:
+                        os.unlink(os.path.join(probe_dir, name))
+                    except OSError:
+                        pass
+
+    def _dir_is_normalization_insensitive(self, base_dir):
+        if not base_dir or not os.path.isdir(base_dir):
+            return False
+        cache = getattr(self, "_norm_fs_cache", None)
+        if cache is None:
+            cache = {}
+            self._norm_fs_cache = cache
+        try:
+            dev = os.stat(base_dir).st_dev
+        except OSError:
+            return False
+        if dev in cache:
+            return cache[dev]
+        result = False
+        probed = False
+        scratch = ""
+        try:
+            scratch = tempfile.mkdtemp(prefix="block-sync-norm-")
+            if os.stat(scratch).st_dev == dev:
+                result = self._probe_norm_insensitive(scratch)
+                probed = True
+        except OSError:
+            probed = False
+        finally:
+            if scratch:
+                shutil.rmtree(scratch, ignore_errors=True)
+        if not probed:
+            result = self._probe_norm_insensitive(base_dir)
+        cache[dev] = result
+        return result
+
+    def _fold_identity(self, rel_path):
+        return fold_sync_path(rel_path, case=True, normalize=True)
+
+    def _paths_collapse(self, base_dir, path_a, path_b):
+        if not base_dir or not path_a or not path_b or not os.path.isdir(base_dir):
+            return False
+        if path_a == path_b:
+            return True
+        file_a = os.path.join(base_dir, *str(path_a).split("/"))
+        file_b = os.path.join(base_dir, *str(path_b).split("/"))
+        try:
+            if os.path.exists(file_a) and os.path.exists(file_b):
+                return os.path.samefile(file_a, file_b)
+        except OSError:
+            return False
+        case = self._dir_is_case_insensitive(base_dir, (path_a, path_b))
+        norm = self._dir_is_normalization_insensitive(base_dir)
+        if not case and not norm:
+            return False
+        return fold_sync_path(path_a, case=case, normalize=norm) == fold_sync_path(path_b, case=case, normalize=norm)
+
+    def _group_collapses(self, group, base_dir):
+        if len(group) < 2 or not base_dir:
+            return False
+        for index, left in enumerate(group):
+            for right in group[index + 1:]:
+                if self._paths_collapse(base_dir, left, right):
+                    return True
+        return False
+
+    def _collapsed_name_error(self, pair):
+        return self._tr(
+            f"这些路径只差大小写或文字正规化（{pair}），当前磁盘会当成同一个文件，请先重命名其中一个",
+            f"These paths differ only by letter case or Unicode form ({pair}); this disk stores them as one file. Rename one first",
+        )
+
+    def _align_paths_to_tracked(self, scanned, tracked, base_dir):
+        if tracked is None:
+            return dict(scanned)
+        folded = {}
+        for tracked_path in tracked:
+            folded.setdefault(self._fold_identity(tracked_path), []).append(tracked_path)
+        aligned = {}
+        for rel_path, value in scanned.items():
+            if rel_path in tracked:
+                aligned[rel_path] = value
+                continue
+            hits = [
+                candidate for candidate in folded.get(self._fold_identity(rel_path), [])
+                if self._paths_collapse(base_dir, rel_path, candidate)
+            ]
+            if len(hits) > 1:
+                raise RuntimeError(self._collapsed_name_error(" / ".join(hits[:2])))
+            if len(hits) == 1:
+                aligned[hits[0]] = value
+        return aligned
 
     def _dir_is_case_insensitive(self, base_dir, candidate_paths=()):
         if not base_dir or not os.path.isdir(base_dir):
@@ -4568,7 +4694,7 @@ class SyncPlugin:
                 try:
                     tracked_remote_paths = self._git_tracked_rel_paths(repo_root, subdir=subdir, cfg=cfg, strict=True)
                     git_tree_paths = tracked_remote_paths
-                    remote_notes = {k: v for k, v in remote_notes.items() if k in tracked_remote_paths}
+                    remote_notes = self._align_paths_to_tracked(remote_notes, tracked_remote_paths, target_dir)
                 except Exception as exc:
                     remote_inspected = False
                     remote_error = self._error_detail(exc)
@@ -4581,19 +4707,20 @@ class SyncPlugin:
             if remote_inspected and not remote_error and git_tree_paths:
                 local_base_dir = nb_root or self.notebook_root
                 tracked_folded = {}
-                only_cf = only_path.casefold() if only_path else None
+                only_key = self._fold_identity(only_path) if only_path else None
                 sync_assets_on = bool(cfg.get("sync_assets", True))
                 only_asset_cfs = set()
                 if only_path is not None and sync_assets_on:
                     for ap in note_asset_paths(only_path, local_notes.get(only_path, "")):
-                        only_asset_cfs.add(ap.casefold())
+                        only_asset_cfs.add(self._fold_identity(ap))
                     for rnp, rtxt in remote_notes.items():
-                        if rnp.casefold() == only_cf:
+                        if self._fold_identity(rnp) == only_key:
                             for ap in note_asset_paths(rnp, rtxt):
-                                only_asset_cfs.add(ap.casefold())
+                                only_asset_cfs.add(self._fold_identity(ap))
                     if is_safe_rel_asset(only_path):
-                        only_asset_cfs.add(only_path.casefold())
+                        only_asset_cfs.add(only_key)
                 git_scope_ci = self._dir_is_case_insensitive(local_base_dir, local_notes.keys()) or self._dir_is_case_insensitive(target_dir, remote_notes.keys())
+                git_scope_norm = self._dir_is_normalization_insensitive(local_base_dir) or self._dir_is_normalization_insensitive(target_dir)
                 for tp in sorted(git_tree_paths):
                     if in_sync_subdir(tp, excluded_subdirs):
                         continue
@@ -4601,25 +4728,22 @@ class SyncPlugin:
                     is_as = sync_assets_on and is_safe_rel_asset(tp)
                     if not (is_md or is_as):
                         continue
-                    if is_md and not self._matches_scope(tp, scope, case_insensitive=git_scope_ci):
+                    if is_md and not self._matches_scope(tp, scope, case_insensitive=git_scope_ci, normalize=git_scope_norm):
                         continue
-                    if only_cf is not None:
-                        if is_md and tp.casefold() != only_cf:
+                    if only_key is not None:
+                        if is_md and self._fold_identity(tp) != only_key:
                             continue
-                        if is_as and tp.casefold() not in only_asset_cfs:
+                        if is_as and self._fold_identity(tp) not in only_asset_cfs:
                             continue
-                    tracked_folded.setdefault(tp.casefold(), []).append(tp)
-                multi_tracked = [grp for grp in tracked_folded.values() if len(grp) > 1]
-                if multi_tracked and (
-                    self._dir_is_case_insensitive(local_base_dir, local_notes.keys())
-                    or self._dir_is_case_insensitive(target_dir, remote_notes.keys())
-                ):
+                    tracked_folded.setdefault(self._fold_identity(tp), []).append(tp)
+                multi_tracked = [
+                    grp for grp in tracked_folded.values()
+                    if self._group_collapses(grp, local_base_dir) or self._group_collapses(grp, target_dir)
+                ]
+                if multi_tracked:
                     pair = " / ".join(multi_tracked[0][:2])
                     remote_inspected = False
-                    remote_error = self._tr(
-                        f"Git 远端分支存在仅大小写不同的同名文件（{pair}），当前磁盘不区分大小写，请先在 Git 仓库中重命名其中一个",
-                        f"Git remote branch contains files differing only in letter case ({pair}) on a case-insensitive disk; rename one in Git first",
-                    )
+                    remote_error = self._collapsed_name_error(pair)
 
         aliases = [
             self._meta_key(protocol, f"{base}::{subdir}" if subdir else base, nb_key=nb_key)
@@ -4656,28 +4780,22 @@ class SyncPlugin:
             local_base_dir = nb_root or self.notebook_root
             local_folded = {}
             for lp in sorted(local_notes):
-                local_folded.setdefault(lp.casefold(), []).append(lp)
+                local_folded.setdefault(self._fold_identity(lp), []).append(lp)
             remote_folded = {}
             for rp in sorted(remote_notes):
-                remote_folded.setdefault(rp.casefold(), []).append(rp)
+                remote_folded.setdefault(self._fold_identity(rp), []).append(rp)
 
             # Check for multi-file case collisions against a case-insensitive filesystem.
-            multi_remote = [grp for grp in remote_folded.values() if len(grp) > 1]
-            if multi_remote and self._dir_is_case_insensitive(local_base_dir, local_notes.keys()):
+            multi_remote = [grp for grp in remote_folded.values() if self._group_collapses(grp, local_base_dir)]
+            if multi_remote:
                 pair = " / ".join(multi_remote[0][:2])
                 remote_inspected = False
-                remote_error = self._tr(
-                    f"远端存在仅大小写不同的同名笔记（{pair}），当前本地磁盘不区分大小写，请先重命名其中一个",
-                    f"Remote contains notes differing only in letter case ({pair}) on a case-insensitive local disk; rename one first",
-                )
-            multi_local = [grp for grp in local_folded.values() if len(grp) > 1]
-            if remote_inspected and multi_local and protocol in ("local_mirror", "git") and self._dir_is_case_insensitive(target_dir, remote_notes.keys()):
+                remote_error = self._collapsed_name_error(pair)
+            multi_local = [grp for grp in local_folded.values() if protocol in ("local_mirror", "git") and self._group_collapses(grp, target_dir)]
+            if remote_inspected and multi_local:
                 pair = " / ".join(multi_local[0][:2])
                 remote_inspected = False
-                remote_error = self._tr(
-                    f"本地存在仅大小写不同的同名笔记（{pair}），同步目标磁盘不区分大小写，请先重命名其中一个",
-                    f"Local notebook contains notes differing only in letter case ({pair}) on a case-insensitive sync target; rename one first",
-                )
+                remote_error = self._collapsed_name_error(pair)
 
             # Pair 1-to-1 case-only differences (e.g. draft.md locally vs DRAFT.md on macOS mirror)
             # into a single logical note so they sync cleanly instead of colliding as two new notes.
@@ -4689,8 +4807,8 @@ class SyncPlugin:
                     lp, rp = l_list[0], r_list[0]
                     if lp == rp or lp in remote_notes or rp in local_notes:
                         continue
-                    collides = self._paths_case_collide_on_dir(local_base_dir, lp, rp) or (
-                        protocol in ("local_mirror", "git") and self._paths_case_collide_on_dir(target_dir, lp, rp)
+                    collides = self._paths_collapse(local_base_dir, lp, rp) or (
+                        protocol in ("local_mirror", "git") and self._paths_collapse(target_dir, lp, rp)
                     )
                     if collides:
                         remote_path_map[lp] = rp
