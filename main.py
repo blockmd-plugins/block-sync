@@ -5371,10 +5371,21 @@ class SyncPlugin:
             for plan in batch["plans"]:
                 sub = (plan.get("subdir") or "").strip("/")
                 sub_prefix = f"{sub}/" if sub else ""
+                asset_copy_map = {orig: cp for orig, cp in (plan.get("asset_conflicts") or ())}
+                remote_notes = plan.get("remote_notes") or {}
                 for p in plan["to_push_new"]:
                     all_planned_git_writes.append(f"{sub_prefix}{p}")
                 for p in plan["to_push_overwrite"]:
                     all_planned_git_writes.append(f"{sub_prefix}{p}")
+                if asset_copy_map:
+                    for p in plan["to_pull_new"]:
+                        orig_text = remote_notes.get(p)
+                        if orig_text is not None and rewrite_note_asset_links(p, orig_text, asset_copy_map) != orig_text:
+                            all_planned_git_writes.append(f"{sub_prefix}{p}")
+                    for p in plan["to_pull_overwrite"]:
+                        orig_text = remote_notes.get(p)
+                        if orig_text is not None and rewrite_note_asset_links(p, orig_text, asset_copy_map) != orig_text:
+                            all_planned_git_writes.append(f"{sub_prefix}{p}")
                 for p, cp, _ in plan["conflicts"]:
                     all_planned_git_writes.append(f"{sub_prefix}{p}")
                     all_planned_git_writes.append(f"{sub_prefix}{cp}")
@@ -5387,6 +5398,10 @@ class SyncPlugin:
                 for p, cp in (plan.get("asset_conflicts") or ()):
                     all_planned_git_writes.append(f"{sub_prefix}{p}")
                     all_planned_git_writes.append(f"{sub_prefix}{cp}")
+                for p in plan["synced"]:
+                    all_planned_git_writes.append(f"{sub_prefix}{p}")
+                for p in (plan.get("assets_synced") or ()):
+                    all_planned_git_writes.append(f"{sub_prefix}{p}")
             if all_planned_git_writes:
                 with self._target_lock(batch["repo_root"]):
                     self._check_git_staged_conflicts(batch["repo_root"], all_planned_git_writes, cfg=cfg)
