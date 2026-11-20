@@ -12,3 +12,5 @@
 - **系统凭据**：Git 令牌和 WebDAV 密码保存在系统凭据库。旧凭据在系统存储确认成功后迁移，凭据库锁定时会稍后重试。超出 1536 字节或含空字符的旧凭据会提示重新录入或清除。更改服务器、WebDAV 用户名或 Git 仓库时，请重新输入所需凭据。「清除凭据」适用于当前同步目标及账号的设置。Linux 使用 Secret Service。
 
 **安装**：打开 Block「设置 → 应用商店」搜索 **同步**，或手动填入 `blockmd-plugins/block-sync`。
+
+旧版 Block 可从应用商店安装兼容版本，也可手动安装 [v1.3.44 发行包](https://github.com/blockmd-plugins/block-sync/releases/tag/v1.3.44)。使用通知、系统凭据和唤醒补同步前请升级 Block。

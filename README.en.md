@@ -12,3 +12,5 @@
 - **System credentials** — Git tokens and WebDAV passwords go in the system credential store. Existing credentials migrate after a verified write. Migration retries if the store is locked. Replace or clear old credentials that exceed 1536 bytes or contain NUL characters. Re-enter credentials when changing the server, WebDAV username, or Git repository. Clear Credential applies to settings for the current destination and account. Linux uses Secret Service.
 
 **Install**: Open Block Settings -> App Store and search **Sync**, or enter `blockmd-plugins/block-sync`.
+
+Older Block versions can install the compatible version from the App Store or use the [v1.3.44 release package](https://github.com/blockmd-plugins/block-sync/releases/tag/v1.3.44). Upgrade Block to use notifications, system credentials, and resume sync.
