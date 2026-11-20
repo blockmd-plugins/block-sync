@@ -362,26 +362,30 @@ def rewrite_note_asset_links(note_path, text, asset_copy_map):
 
     def rewrite_non_code_chunk(chunk):
         # Scan CommonMark backtick code spans (including multi-line spans within the same paragraph)
-        # and only rewrite links outside code spans.
+        # respecting backslash-escaped opening backticks and whitespace-only paragraph separators.
         out = []
         n = len(chunk)
         i = 0
         plain_start = 0
+        para_sep_re = re.compile(r"\r?\n[ \t]*\r?\n")
         while i < n:
             if chunk[i] == "`":
+                # CommonMark §2.4: odd number of preceding backslashes escapes the opening backtick.
+                bs = 0
+                p = i - 1
+                while p >= 0 and chunk[p] == "\\":
+                    bs += 1
+                    p -= 1
+                if bs % 2 == 1:
+                    i += 1
+                    continue
                 j = i
                 while j < n and chunk[j] == "`":
                     j += 1
                 ticks = j - i
-                # Find matching run of exact length `ticks` before any blank line (paragraph boundary).
-                para_end = chunk.find("\n\n", j)
-                crlf_end = chunk.find("\r\n\r\n", j)
-                if para_end == -1:
-                    limit = crlf_end if crlf_end != -1 else n
-                elif crlf_end == -1:
-                    limit = para_end
-                else:
-                    limit = min(para_end, crlf_end)
+                # Find matching run of exact length `ticks` before any blank (whitespace-only) line.
+                sep_m = para_sep_re.search(chunk, j)
+                limit = sep_m.start() if sep_m else n
                 k = j
                 matched_end = -1
                 while k < limit:
@@ -409,22 +413,36 @@ def rewrite_note_asset_links(note_path, text, asset_copy_map):
             out.append(rewrite_plain_segment(chunk[plain_start:]))
         return "".join(out)
 
-    # Split into fenced-code vs non-code chunks, supporting blockquoted fences (e.g. "> ```").
+    # Split into code-block (fenced, blockquoted-fenced, or 4-space indented) vs non-code chunks.
     fence_open_re = re.compile(r"^((?: {0,3}>[ \t]?)*) {0,3}(\x60{3,}|~{3,})(.*)$")
+    bq_prefix_re = re.compile(r"^((?: {0,3}>[ \t]?)*)(.*)$")
     segments = []
     buf = []
     fence_char = ""
     fence_len = 0
     fence_bq_depth = 0
+    in_indented_code = False
+    indented_bq_depth = 0
+    prev_line_blank = True
 
     def bq_depth(prefix):
         return prefix.count(">")
 
+    def leading_indent_cols(s):
+        cols = 0
+        for ch in s:
+            if ch == " ":
+                cols += 1
+            elif ch == "\t":
+                cols += 4 - (cols % 4)
+            else:
+                break
+        return cols
+
     for raw_line in text.splitlines(keepends=True):
         body = raw_line.rstrip("\r\n")
         if fence_char:
-            # Check if blockquote depth dropped (closes fenced block inside blockquote).
-            bq_match = re.match(r"^((?: {0,3}>[ \t]?)*)(.*)$", body)
+            bq_match = bq_prefix_re.match(body)
             cur_depth = bq_depth(bq_match.group(1)) if bq_match else 0
             if cur_depth < fence_bq_depth:
                 segments.append((True, "".join(buf)))
@@ -432,7 +450,7 @@ def rewrite_note_asset_links(note_path, text, asset_copy_map):
                 fence_char = ""
                 fence_len = 0
                 fence_bq_depth = 0
-                # Fall through to process this line as normal text.
+                prev_line_blank = False
             else:
                 rest_after_bq = bq_match.group(2) if bq_match else body
                 close_m = re.match(r"^ {0,3}(\x60{3,}|~{3,})[ \t]*$", rest_after_bq)
@@ -448,12 +466,37 @@ def rewrite_note_asset_links(note_path, text, asset_copy_map):
                     fence_char = ""
                     fence_len = 0
                     fence_bq_depth = 0
+                    prev_line_blank = False
                 continue
+
+        bq_match = bq_prefix_re.match(body)
+        cur_depth = bq_depth(bq_match.group(1)) if bq_match else 0
+        rest_after_bq = bq_match.group(2) if bq_match else body
+        is_blank = (rest_after_bq.strip() == "")
+
+        if in_indented_code:
+            if cur_depth == indented_bq_depth and (is_blank or leading_indent_cols(rest_after_bq) >= 4):
+                buf.append(raw_line)
+                prev_line_blank = is_blank
+                continue
+            segments.append((True, "".join(buf)))
+            buf = []
+            in_indented_code = False
+
+        if prev_line_blank and not is_blank and leading_indent_cols(rest_after_bq) >= 4:
+            if buf:
+                segments.append((False, "".join(buf)))
+                buf = []
+            in_indented_code = True
+            indented_bq_depth = cur_depth
+            buf.append(raw_line)
+            prev_line_blank = False
+            continue
+
         open_m = fence_open_re.match(body)
         if open_m:
             ch = open_m.group(2)[0]
             info = open_m.group(3)
-            # CommonMark: backtick fence info string cannot contain backticks.
             if ch != "`" or "`" not in info:
                 if buf:
                     segments.append((False, "".join(buf)))
@@ -462,10 +505,12 @@ def rewrite_note_asset_links(note_path, text, asset_copy_map):
                 fence_len = len(open_m.group(2))
                 fence_bq_depth = bq_depth(open_m.group(1))
                 buf.append(raw_line)
+                prev_line_blank = False
                 continue
         buf.append(raw_line)
+        prev_line_blank = is_blank
     if buf:
-        segments.append((bool(fence_char), "".join(buf)))
+        segments.append((bool(fence_char or in_indented_code), "".join(buf)))
 
     out_parts = []
     for is_code, seg in segments:
@@ -1615,6 +1660,49 @@ class SyncPlugin:
                 pass
             os.close(fd)
 
+    def _resolve_git_dir(self, start_dir):
+        """Return (work_tree_root, actual_git_dir) if start_dir is inside a Git repo (supporting .git pointer files)."""
+        cur = os.path.realpath(start_dir)
+        while cur:
+            git_entry = os.path.join(cur, ".git")
+            if os.path.isdir(git_entry):
+                return cur, os.path.realpath(git_entry)
+            if os.path.isfile(git_entry):
+                try:
+                    with open(git_entry, "r", encoding="utf-8", errors="replace") as fh:
+                        first_line = fh.readline().strip()
+                    if first_line.lower().startswith("gitdir:"):
+                        raw_gd = first_line.split(":", 1)[1].strip()
+                        if raw_gd:
+                            gd = raw_gd if os.path.isabs(raw_gd) else os.path.join(cur, raw_gd)
+                            if os.path.isdir(gd):
+                                return cur, os.path.realpath(gd)
+                except OSError:
+                    pass
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+        return "", ""
+
+    def _ensure_git_info_exclude(self, git_dir, pattern):
+        try:
+            info_dir = os.path.join(git_dir, "info")
+            os.makedirs(info_dir, exist_ok=True)
+            exclude_path = os.path.join(info_dir, "exclude")
+            existing = ""
+            if os.path.isfile(exclude_path):
+                with open(exclude_path, "r", encoding="utf-8", errors="replace") as fh:
+                    existing = fh.read()
+            lines = [ln.strip() for ln in existing.splitlines()]
+            if pattern not in lines:
+                with open(exclude_path, "a", encoding="utf-8") as fh:
+                    if existing and not existing.endswith("\n"):
+                        fh.write("\n")
+                    fh.write(f"{pattern}\n")
+        except OSError:
+            pass
+
     def _stash_replaced_inode(self, temp_path, root_dir, rel_path):
         """Move a swapped-out inode into a bounded same-volume recovery dir without unlinking it.
 
@@ -1624,41 +1712,51 @@ class SyncPlugin:
         if not temp_path or not os.path.exists(temp_path):
             return ""
         root_real = os.path.realpath(root_dir)
-        # Walk up to detect if root_real is inside a Git repo; if so, stash inside .git/ so
-        # git status and working tree stay completely clean while remaining on the same filesystem.
         stash_dir = ""
-        cur = root_real
-        while cur:
-            git_dir = os.path.join(cur, ".git")
-            if os.path.isdir(git_dir):
-                stash_dir = os.path.join(git_dir, "block-sync-replaced")
-                break
-            parent = os.path.dirname(cur)
-            if parent == cur:
-                break
-            cur = parent
+        try:
+            root_dev = os.stat(root_real).st_dev
+        except OSError:
+            root_dev = None
+        wt_root, git_dir = self._resolve_git_dir(root_real)
+        if git_dir:
+            try:
+                if root_dev is None or os.stat(git_dir).st_dev == root_dev:
+                    stash_dir = os.path.join(git_dir, "block-sync-replaced")
+            except OSError:
+                pass
+            if not stash_dir:
+                # Cross-volume separate git dir: stash on same volume and exclude from git status locally.
+                stash_dir = os.path.join(wt_root or root_real, ".block-sync-replaced")
+                self._ensure_git_info_exclude(git_dir, "/.block-sync-replaced/")
         if not stash_dir:
             stash_dir = os.path.join(root_real, ".block-sync-replaced")
         try:
             os.makedirs(stash_dir, exist_ok=True)
+            now_ms = int(time.time() * 1000)
             base_name = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(rel_path))[:48] or "file"
-            tag = f"{int(time.time() * 1000)}-{sha256_text(rel_path)[:8]}-{base_name}"
+            tag = f"{now_ms:015d}-{sha256_text(rel_path)[:8]}-{base_name}"
             dest_stash = os.path.join(stash_dir, tag)
             for idx in range(50):
                 cand = dest_stash if idx == 0 else f"{dest_stash}-{idx}"
                 if not os.path.exists(cand):
                     os.replace(temp_path, cand)
-                    # Prune oldest stashed inodes beyond 64 to keep disk usage bounded.
+                    # Prune oldest stashed entries by stash-entry timestamp (filename prefix), never pruning
+                    # the freshly stashed inode or entries stashed within the last 60 seconds.
                     try:
-                        entries = sorted(
-                            (os.path.join(stash_dir, e) for e in os.listdir(stash_dir)),
-                            key=lambda p: os.path.getmtime(p),
-                        )
-                        for stale in entries[:-64]:
-                            try:
-                                os.unlink(stale)
-                            except OSError:
-                                pass
+                        cutoff_ms = now_ms - 60000
+                        names = sorted(os.listdir(stash_dir))
+                        cand_name = os.path.basename(cand)
+                        if len(names) > 64:
+                            for old_name in names[:-64]:
+                                if old_name == cand_name:
+                                    continue
+                                ts_part = old_name.split("-", 1)[0]
+                                if ts_part.isdigit() and int(ts_part) >= cutoff_ms:
+                                    continue
+                                try:
+                                    os.unlink(os.path.join(stash_dir, old_name))
+                                except OSError:
+                                    pass
                     except OSError:
                         pass
                     return cand
@@ -2512,18 +2610,25 @@ class SyncPlugin:
                     )
                 except Exception as put_exc:
                     if lock_token and created_lock_placeholder:
-                        # Handle lost-response PUT: check under lock whether server actually saved our bytes.
+                        is_transport_err = not isinstance(put_exc, urllib.error.HTTPError)
+                        # Handle lost-response PUT: verify under lock whether server saved our content.
                         try:
                             found_after, after_bytes, _ = self._webdav_get_bytes_with_etag(
                                 file_url, cfg=cfg, treat_405_as_absent=True,
                             )
                         except Exception:
                             found_after, after_bytes = False, b""
-                        if found_after and len(after_bytes) > 0:
-                            created_lock_placeholder = False
-                            if sha256_bytes(after_bytes) == content_hash:
+                        if found_after:
+                            if len(after_bytes) > 0:
+                                created_lock_placeholder = False
+                                if sha256_bytes(after_bytes) == content_hash:
+                                    return
+                                raise RuntimeError(change_err) from put_exc
+                            if is_transport_err and sha256_bytes(after_bytes) == content_hash:
+                                # Server has our exact intended empty note after a dropped transport response;
+                                # do not delete it.
+                                created_lock_placeholder = False
                                 return
-                            raise RuntimeError(change_err) from put_exc
                     raise
                 created_lock_placeholder = False
                 return
@@ -2557,7 +2662,20 @@ class SyncPlugin:
                         if not self._is_strong_etag(cur_etag):
                             raise RuntimeError(unsafe_err)
                         headers["If-Match"] = cur_etag
-            self._webdav_request("PUT", file_url, body=payload_bytes, extra_headers=headers, cfg=cfg)
+            try:
+                self._webdav_request("PUT", file_url, body=payload_bytes, extra_headers=headers, cfg=cfg)
+            except Exception as put_exc:
+                if lock_token and not isinstance(put_exc, urllib.error.HTTPError):
+                    # Verify under lock if server actually committed our PUT before dropping the response.
+                    try:
+                        found_after, after_bytes, _ = self._webdav_get_bytes_with_etag(
+                            file_url, cfg=cfg, treat_405_as_absent=True,
+                        )
+                    except Exception:
+                        found_after, after_bytes = False, b""
+                    if found_after and sha256_bytes(after_bytes) == content_hash:
+                        return
+                raise
         except urllib.error.HTTPError as exc:
             if exc.code == 412:
                 found, cur_bytes, _ = self._webdav_get_bytes_with_etag(file_url, cfg=cfg)
@@ -2992,7 +3110,8 @@ class SyncPlugin:
                             self._run_git(["remote", "add", "origin", target], cwd=repo_dir, cfg=cfg)
                         else:
                             self._run_git(["symbolic-ref", "HEAD", f"refs/heads/{branch}"], cwd=repo_dir, cfg=cfg)
-                            self._run_git(["clean", "-fd"], cwd=repo_dir, cfg=cfg)
+                            clean_flags = "-fdx" if self._is_managed_git_dir(repo_dir) else "-fd"
+                            self._run_git(["clean", clean_flags], cwd=repo_dir, cfg=cfg)
                 return True, repo_dir
 
             # Remote has the requested branch.
@@ -3048,7 +3167,8 @@ class SyncPlugin:
                         err = self._git_error_message(co_proc.stderr or co_proc.stdout, self._tr("切换分支失败", "Checkout failed"))
                         return False, self._tr(f"Git 切换分支失败: {err}", f"Git branch checkout failed: {err}")
                     self._run_git(["reset", "--hard", f"refs/remotes/origin/{branch}"], cwd=repo_dir, cfg=cfg)
-                    self._run_git(["clean", "-fd"], cwd=repo_dir, cfg=cfg)
+                    clean_flags = "-fdx" if self._is_managed_git_dir(repo_dir) else "-fd"
+                    self._run_git(["clean", clean_flags], cwd=repo_dir, cfg=cfg)
         else:
             if not os.path.isdir(os.path.join(repo_dir, ".git")):
                 if not allow_init_or_clone:
@@ -3189,6 +3309,35 @@ class SyncPlugin:
                 return True
         return False
 
+    def _git_tracked_rel_paths(self, repo_root, subdir="", cfg=None):
+        """Return set of git-tracked paths relative to subdir (or repo_root), or None if not a git repo."""
+        if not repo_root or not os.path.exists(os.path.join(repo_root, ".git")):
+            return None
+        proc = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=repo_root,
+            env=self._git_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            timeout=8,
+        )
+        if proc.returncode != 0:
+            return None
+        sub = subdir.strip("/")
+        prefix = f"{sub}/" if sub else ""
+        tracked = set()
+        for raw in (proc.stdout or b"").split(b"\0"):
+            if not raw:
+                continue
+            rel = os.fsdecode(raw).replace(os.sep, "/")
+            if prefix:
+                if rel.startswith(prefix):
+                    tracked.add(rel[len(prefix):])
+            else:
+                tracked.add(rel)
+        return tracked
+
     def _plan_notebook_assets(
         self,
         protocol,
@@ -3203,6 +3352,7 @@ class SyncPlugin:
         remote_notes,
         only_path=None,
         excluded_subdirs=(),
+        tracked_remote_paths=None,
     ):
         empty = {
             "local_assets": {},
@@ -3235,7 +3385,10 @@ class SyncPlugin:
                     base_url, is_safe_rel_asset, scope=scope, cfg=cfg, excluded_subdirs=excluded_subdirs,
                 ))
             elif target_dir and os.path.isdir(target_dir):
-                remote_candidates.update(self._list_dir_assets(target_dir, excluded_subdirs=excluded_subdirs))
+                found_assets = self._list_dir_assets(target_dir, excluded_subdirs=excluded_subdirs)
+                if tracked_remote_paths is not None:
+                    found_assets = {p for p in found_assets if p in tracked_remote_paths}
+                remote_candidates.update(found_assets)
         else:
             remote_candidates.update(explicit_paths)
 
@@ -3263,9 +3416,10 @@ class SyncPlugin:
                     if etag:
                         remote_asset_etags[rel] = etag
             elif target_dir:
-                rdata = self._read_asset_file(target_dir, rel, excluded_subdirs=excluded_subdirs)
-                if rdata is not None:
-                    remote_assets[rel] = rdata
+                if tracked_remote_paths is None or rel in tracked_remote_paths:
+                    rdata = self._read_asset_file(target_dir, rel, excluded_subdirs=excluded_subdirs)
+                    if rdata is not None:
+                        remote_assets[rel] = rdata
 
         push_new = []
         push_ow = []
@@ -3436,6 +3590,11 @@ class SyncPlugin:
                 remote_notes = self._scan_mirror_files(target_dir, only_path=only_path, scope=scope, excluded_subdirs=excluded_subdirs)
             else:
                 remote_inspected = False
+            tracked_remote_paths = None
+            if remote_inspected and self._is_managed_git_dir(repo_root):
+                tracked_remote_paths = self._git_tracked_rel_paths(repo_root, subdir=subdir, cfg=cfg)
+                if tracked_remote_paths is not None:
+                    remote_notes = {k: v for k, v in remote_notes.items() if k in tracked_remote_paths}
 
         aliases = [
             self._meta_key(protocol, f"{base}::{subdir}" if subdir else base, nb_key=nb_key)
@@ -3544,6 +3703,7 @@ class SyncPlugin:
                     remote_notes,
                     only_path=only_path,
                     excluded_subdirs=excluded_subdirs,
+                    tracked_remote_paths=tracked_remote_paths if protocol == "git" else None,
                 )
             except Exception as exc:
                 remote_inspected = False
@@ -3800,12 +3960,15 @@ class SyncPlugin:
         all_check_paths = sorted(written | candidate_tracked)
 
         # Fail loudly if .gitignore / .git/info/exclude blocks any file in the sync plan.
+        # Note: Apple Git rejects `--literal-pathspecs` with `check-ignore`; prefixing each NUL-delimited
+        # relative path with `./` disables pathspec magic (e.g. `:(glob)literal.md`) portably.
         if all_check_paths:
+            chk_input = b"\0".join(os.fsencode("./" + p) for p in all_check_paths) + b"\0"
             chk = subprocess.run(
-                ["git", "--literal-pathspecs", "check-ignore", "-z", "--stdin"],
+                ["git", "check-ignore", "-z", "--stdin"],
                 cwd=repo_root,
                 env=self._git_env(),
-                input=b"\0".join(os.fsencode(p) for p in all_check_paths) + b"\0",
+                input=chk_input,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 timeout=8,
@@ -3814,7 +3977,13 @@ class SyncPlugin:
                 err_txt = (chk.stderr or chk.stdout or b"").decode("utf-8", errors="replace")
                 err = self._error_detail(err_txt or self._tr("git check-ignore 失败", "git check-ignore failed"))
                 raise RuntimeError(self._tr(f"Git 忽略规则检查失败: {err}", f"Git ignore check failed: {err}"))
-            ignored = [os.fsdecode(raw) for raw in (chk.stdout or b"").split(b"\0") if raw]
+            ignored = []
+            for raw in (chk.stdout or b"").split(b"\0"):
+                if raw:
+                    dec = os.fsdecode(raw)
+                    if dec.startswith("./"):
+                        dec = dec[2:]
+                    ignored.append(dec)
             if ignored:
                 sample = ", ".join(ignored[:3]) + ("..." if len(ignored) > 3 else "")
                 raise RuntimeError(self._tr(
@@ -4084,18 +4253,20 @@ class SyncPlugin:
                     asset_count += 1
                     step_progress()
 
+                deferred_asset_overwrites = []
                 for rel, copy_rel in plan.get("asset_conflicts") or ():
                     ldata = local_assets[rel]
                     rdata = remote_assets[rel]
                     rhash = sha256_bytes(rdata)
                     # Unconditionally enforce create_only on both sides so a preempted conflict copy path
                     # with different bytes aborts BEFORE overwriting the original remote asset.
+                    # Defer overwriting the original remote asset until AFTER conflict notes and
+                    # asset_view_copies are safely persisted so a note-write failure never orphans the copy.
                     self._write_mirror_bytes(nb_root, copy_rel, rdata, create_only=True)
                     write_remote_asset(copy_rel, rdata, create_only=True)
-                    write_remote_asset(rel, ldata, expected_hash=rhash)
                     base_map[f"asset:{copy_rel}"] = rhash
-                    base_map[f"asset:{rel}"] = sha256_bytes(ldata)
                     asset_copy_map[rel] = copy_rel
+                    deferred_asset_overwrites.append((rel, ldata, rhash))
                     asset_count += 1
                     step_progress()
 
@@ -4238,6 +4409,12 @@ class SyncPlugin:
                         log_args={"path": f"{prefix}{rel_path}", "copy": conflict_rel},
                     )
                     step_progress()
+
+                # 3. Complete deferred remote original-asset overwrites now that all conflict copies
+                # and rewritten note views are safely saved on both sides.
+                for rel, ldata, rhash in deferred_asset_overwrites:
+                    write_remote_asset(rel, ldata, expected_hash=rhash)
+                    base_map[f"asset:{rel}"] = sha256_bytes(ldata)
         except Exception:
             if protocol != "git":
                 self.sync_meta[plan["meta_key"]] = base_map
@@ -4303,14 +4480,14 @@ class SyncPlugin:
                         "fingerprint": "",
                     }
 
-        # Validate physical target directories (catching symlink escapes and cross-notebook target aliasing).
+        # Validate physical target directories across ALL configured notebook bindings (not only the narrowed
+        # auto-sync target) so a symlink pointing into another notebook's folder is caught even on note.saved.
         if protocol in ("local_mirror", "git"):
             base_root = self._resolve_mirror_dir(cfg) if protocol == "local_mirror" else (prepared_repo_dir or repo_dir)
             if base_root:
                 base_real = os.path.realpath(base_root)
                 resolved_targets = []
-                for nb in notebooks:
-                    sub = bindings[nb]
+                for nb, sub in bindings.items():
                     tdir = os.path.join(base_root, sub) if sub else base_root
                     treal = os.path.realpath(tdir)
                     if sub:
