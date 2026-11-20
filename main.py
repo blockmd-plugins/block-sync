@@ -1599,10 +1599,12 @@ class SyncPlugin:
                     )
         return ""
 
-    def _matches_scope(self, rel_path, scope=None):
+    def _matches_scope(self, rel_path, scope=None, case_insensitive=False):
         sc = scope if scope is not None else self.config.get("sync_scope", "all")
         if not sc or sc == "all":
             return True
+        if case_insensitive:
+            return rel_path.casefold().startswith(f"{sc.casefold()}/")
         return rel_path.startswith(f"{sc}/")
 
     def _list_local_note_paths(self, bridge, nb_root=None):
@@ -1636,10 +1638,11 @@ class SyncPlugin:
                 raise
             return notes
         all_paths = paths if paths is not None else self._list_local_note_paths(bridge, nb_root=nb_root)
+        local_ci = self._dir_is_case_insensitive(nb_root or self.notebook_root)
         for rel_path in all_paths:
             if not is_safe_rel_md(rel_path):
                 continue
-            if not self._matches_scope(rel_path, scope):
+            if not self._matches_scope(rel_path, scope, case_insensitive=local_ci):
                 continue
             params = {"path": rel_path}
             if nb_root and self.supports_multi_notebook:
@@ -2078,6 +2081,7 @@ class SyncPlugin:
                     remote_files[actual_rel] = self._decode_note_bytes(fh.read(), actual_rel)
             return remote_files
 
+        mirror_ci = self._dir_is_case_insensitive(mirror_dir)
         for root, dirs, files in os.walk(mirror_dir):
             kept_dirs = []
             for d in dirs:
@@ -2102,7 +2106,7 @@ class SyncPlugin:
                 if ex_reals and self._path_hits_excluded(f_real, ex_reals):
                     continue
                 rel = os.path.relpath(full, mirror_dir).replace(os.sep, "/")
-                if not is_safe_rel_md(rel) or in_sync_subdir(rel, excluded_subdirs) or not self._matches_scope(rel, scope):
+                if not is_safe_rel_md(rel) or in_sync_subdir(rel, excluded_subdirs) or not self._matches_scope(rel, scope, case_insensitive=mirror_ci):
                     continue
                 with open(full, "rb") as fh:
                     remote_files[rel] = self._decode_note_bytes(fh.read(), rel)
@@ -4264,7 +4268,8 @@ class SyncPlugin:
                 referenced.update(note_asset_paths(np, txt))
             for np, txt in remote_notes.items():
                 referenced.update(note_asset_paths(np, txt))
-            candidates = {p for p in candidates if self._matches_scope(p, scope)} | referenced
+            asset_ci = self._dir_is_case_insensitive(nb_root) or (bool(target_dir) and self._dir_is_case_insensitive(target_dir))
+            candidates = {p for p in candidates if self._matches_scope(p, scope, case_insensitive=asset_ci)} | referenced
         if excluded_subdirs:
             candidates = {p for p in candidates if not in_sync_subdir(p, excluded_subdirs)}
 
@@ -4588,6 +4593,7 @@ class SyncPlugin:
                                 only_asset_cfs.add(ap.casefold())
                     if is_safe_rel_asset(only_path):
                         only_asset_cfs.add(only_path.casefold())
+                git_scope_ci = self._dir_is_case_insensitive(local_base_dir, local_notes.keys()) or self._dir_is_case_insensitive(target_dir, remote_notes.keys())
                 for tp in sorted(git_tree_paths):
                     if in_sync_subdir(tp, excluded_subdirs):
                         continue
@@ -4595,7 +4601,7 @@ class SyncPlugin:
                     is_as = sync_assets_on and is_safe_rel_asset(tp)
                     if not (is_md or is_as):
                         continue
-                    if is_md and not self._matches_scope(tp, scope):
+                    if is_md and not self._matches_scope(tp, scope, case_insensitive=git_scope_ci):
                         continue
                     if only_cf is not None:
                         if is_md and tp.casefold() != only_cf:
@@ -4801,15 +4807,16 @@ class SyncPlugin:
                     )
                     asset_view_copies.append((rel_path, conflict_rel, rtext))
 
+        missing_scope_ci = self._dir_is_case_insensitive(nb_root or self.notebook_root)
         remote_missing = [
             p for p in base_map
-            if is_safe_rel_md(p) and self._matches_scope(p, scope) and p in local_notes and p not in remote_notes
+            if is_safe_rel_md(p) and self._matches_scope(p, scope, case_insensitive=missing_scope_ci) and p in local_notes and p not in remote_notes
         ] if (remote_inspected and only_path is None) else (
             [only_path] if (remote_inspected and only_path is not None and only_path in base_map and only_path in local_notes and only_path not in remote_notes) else []
         )
         local_missing = [
             p for p in base_map
-            if is_safe_rel_md(p) and self._matches_scope(p, scope) and p in remote_notes and p not in local_notes
+            if is_safe_rel_md(p) and self._matches_scope(p, scope, case_insensitive=missing_scope_ci) and p in remote_notes and p not in local_notes
         ] if (remote_inspected and only_path is None) else []
 
         local_hashes = {p: sha256_text(local_notes[p]) for p in sorted(local_notes)}
@@ -7134,7 +7141,8 @@ class SyncPlugin:
             rel_path = str(params.get("path") or "").replace("\\", "/")
             event_nb = self._norm_nb_path(params.get("notebook_root") or self.notebook_root)
             outcome = "skipped"
-            if event_name == "note.saved" and self.config["auto_sync"] and is_safe_rel_md(rel_path) and self._matches_scope(rel_path):
+            event_scope_ci = self._dir_is_case_insensitive(event_nb or self.notebook_root)
+            if event_name == "note.saved" and self.config["auto_sync"] and is_safe_rel_md(rel_path) and self._matches_scope(rel_path, case_insensitive=event_scope_ci):
                 self._refresh_known_notebooks(bridge)
                 if not self._target_error(self.config):
                     selected = self._selected_notebooks(self.config)
