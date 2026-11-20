@@ -1778,8 +1778,13 @@ class SyncPlugin:
             queued[key] = {
                 "params": self._result_notice_params(*notice),
                 "fingerprint": self.pending_confirm.get("fingerprint", "") if notice[0] == "待确认" and self.pending_confirm else "",
+                "status": notice[0],
             }
             values["pending_notices"] = dict(list(queued.items())[-32:])
+        elif notice and notice[0] in ("成功", "无变更"):
+            previous = self._pending_notices.get(key)
+            if isinstance(previous, dict) and self._is_pause_notice(previous):
+                values["pending_notices"] = {scope: item for scope, item in self._pending_notices.items() if scope != key}
         try:
             if self.supports_system:
                 bridge.call_host("host.storage.set_many", {"values": values})
@@ -1796,7 +1801,7 @@ class SyncPlugin:
             self.last_status = self._tr("同步状态未保存，请检查后重试", "Sync state could not be saved. Check settings and retry.")
             self._send_result_notice(bridge)
             raise SyncStateError(self.last_status, self._result_notified) from exc
-        if queue_notice:
+        if "pending_notices" in values:
             self._pending_notices = values["pending_notices"]
         self._send_result_notice(bridge)
         if queue_notice and self._result_notified:
@@ -1809,7 +1814,7 @@ class SyncPlugin:
             return "__multi__"
         return self._notebook_key()
 
-    def _record_result(self, status, summary, protocol=None, target="", pushed=0, pulled=0, conflicts=0, assets=0):
+    def _record_result(self, status, summary, protocol=None, target="", pushed=0, pulled=0, conflicts=0, assets=0, notice_key=""):
         nb_key = self._result_key()
         proto = protocol or self.config.get("protocol", "local_mirror")
         proto_label = self._protocol_label(proto)
@@ -1855,7 +1860,7 @@ class SyncPlugin:
         if last_success is not None:
             entry["last_success"] = last_success
         self.notebook_results[nb_key] = entry
-        self._result_notice = (status_str, int(conflicts or 0))
+        self._result_notice = (status_str, int(conflicts or 0), notice_key)
 
     def _send_result_notice(self, bridge):
         notice, self._result_notice = self._result_notice, None
@@ -1870,7 +1875,7 @@ class SyncPlugin:
             params["timeout_ms"] = max(1, min(15000, int(remaining * 1000)))
         self._result_notified = self._deliver_result_notice(bridge, params)
 
-    def _result_notice_params(self, status, conflicts):
+    def _result_notice_params(self, status, conflicts, notice_key=""):
         if status in ("失败", "状态未保存"):
             title = self._tr("同步失败", "Sync failed")
             if status == "状态未保存":
@@ -1888,6 +1893,10 @@ class SyncPlugin:
         else:
             return None
         params = {"title": title, "body": body, "tone": tone}
+        if status == "待确认":
+            fingerprint = (self.pending_confirm or {}).get("fingerprint") or notice_key
+            if fingerprint:
+                params["dedup_key"] = fingerprint
         if self.notebook_root and self._result_key() != "__multi__":
             root_key = self._notebook_key()
             params["notebook_root"] = next(
@@ -1923,15 +1932,26 @@ class SyncPlugin:
             params = notice.get("params") if isinstance(notice, dict) else None
             fingerprint = notice.get("fingerprint") if isinstance(notice, dict) else None
             plan = self.pending_confirms.get(key) or {}
-            if not isinstance(params, dict) or (fingerprint and fingerprint != plan.get("fingerprint")) or not config or not config["system_notifications"]:
+            status = (self.notebook_results.get(key) or {}).get("status")
+            cleared_pause = isinstance(notice, dict) and self._is_pause_notice(notice) and status in ("成功", "无变更")
+            if not isinstance(params, dict) or cleared_pause or (fingerprint and fingerprint != plan.get("fingerprint")) or not config or not config["system_notifications"]:
                 done.append(key)
                 continue
             remaining = int((deadline - time.monotonic()) * 1000)
             if remaining <= 0:
                 break
-            if self._deliver_result_notice(bridge, dict(params, timeout_ms=min(remaining, 500))):
+            params = dict(params, timeout_ms=min(remaining, 500))
+            if fingerprint:
+                params["dedup_key"] = fingerprint
+            if self._deliver_result_notice(bridge, params):
                 done.append(key)
         self._ack_result_notices(bridge, done)
+
+    def _is_pause_notice(self, notice):
+        params = notice.get("params")
+        return notice.get("status") == "待确认" or isinstance(params, dict) and params.get("title") in (
+            "同步等待确认", "Sync needs confirmation",
+        )
 
     def _get_last_result(self):
         return self.notebook_results.get(self._result_key()) or self.notebook_results.get(self._notebook_key())
@@ -7183,7 +7203,7 @@ class SyncPlugin:
                         log_key="auto_paused",
                         log_args={"path": only_path},
                     )
-                    self._record_result("待确认", msg, protocol=protocol, target=batch["target_display"])
+                    self._record_result("待确认", msg, protocol=protocol, target=batch["target_display"], notice_key=batch["fingerprint"])
                     self._save_runtime(bridge)
                     self.last_status = msg
                     return msg
