@@ -3796,8 +3796,29 @@ class SyncPlugin:
     def _is_managed_git_dir(self, repo_dir):
         if not repo_dir:
             return False
-        managed_root = os.path.realpath(os.path.join(self.data_dir or os.getcwd(), "git-repos"))
-        return os.path.realpath(repo_dir).startswith(managed_root + os.sep)
+        data_dir = os.path.abspath(self.data_dir or os.getcwd())
+        managed_root = os.path.join(data_dir, "git-repos")
+        repo_dir = os.path.abspath(repo_dir)
+        if os.path.normcase(os.path.dirname(repo_dir)) != os.path.normcase(managed_root):
+            return False
+        expected = os.path.join(os.path.realpath(data_dir), "git-repos", os.path.basename(repo_dir))
+        return os.path.normcase(os.path.realpath(repo_dir)) == os.path.normcase(expected)
+
+    def _managed_git_checkout_is_safe(self, repo_dir, cfg):
+        if not self._is_managed_git_dir(repo_dir):
+            return False
+        git_dir = os.path.join(os.path.realpath(repo_dir), ".git")
+        if not os.path.lexists(git_dir):
+            return not os.path.lexists(repo_dir) or (os.path.isdir(repo_dir) and not os.listdir(repo_dir))
+        if not os.path.isdir(git_dir) or os.path.islink(git_dir):
+            return False
+        result = self._run_git(
+            ["rev-parse", "--path-format=absolute", "--show-toplevel", "--absolute-git-dir", "--git-common-dir"],
+            cwd=repo_dir, cfg=cfg,
+        )
+        return result.returncode == 0 and [os.path.normcase(os.path.realpath(path)) for path in result.stdout.splitlines()] == [
+            os.path.normcase(os.path.realpath(repo_dir)), os.path.normcase(git_dir), os.path.normcase(git_dir),
+        ]
 
     def _git_current_branch(self, repo_dir, cfg=None):
         proc = self._run_git(["symbolic-ref", "--short", "HEAD"], cwd=repo_dir, cfg=cfg)
@@ -3821,7 +3842,7 @@ class SyncPlugin:
         canonical = os.path.join(base, f"repo-{sha256_text(repo_key)[:12]}")
         legacy = []
         legacy_unbranched = os.path.join(base, f"repo-{sha256_text(target)[:12]}")
-        if os.path.isdir(base) and shutil.which("git"):
+        if self._is_managed_git_dir(canonical) and os.path.isdir(base) and shutil.which("git"):
             candidates = []
             if legacy_unbranched != canonical and self._has_git_marker(legacy_unbranched):
                 candidates.append(legacy_unbranched)
@@ -3832,6 +3853,8 @@ class SyncPlugin:
                 if self._has_git_marker(path):
                     candidates.append(path)
             for path in candidates:
+                if not self._managed_git_checkout_is_safe(path, cfg):
+                    continue
                 result = self._run_git(["config", "--local", "--get", "remote.origin.url"], cwd=path, cfg=cfg)
                 if result.returncode == 0 and result.stdout.strip() == target:
                     cur_branch = self._git_current_branch(path, cfg=cfg)
@@ -4036,6 +4059,8 @@ class SyncPlugin:
     def _verify_git_push_history(self, repo, branch, head, remote, cfg):
         rev_range = f"{remote}..{head}" if remote else head
         commits = self._run_git(["rev-list", rev_range], cwd=repo, cfg=cfg)
+        if commits.returncode == 0 and not commits.stdout.strip():
+            return
         reflog = self._run_git(["reflog", "show", "--format=%H%x00%gs", f"refs/heads/{branch}"], cwd=repo, cfg=cfg)
         owned = {
             oid for line in reflog.stdout.splitlines()
@@ -4210,13 +4235,16 @@ class SyncPlugin:
         target = str(cfg.get("git_remote") or "").strip()
         branch = self._git_branch(cfg)
         repo_dir = repo_dir or self._resolve_local_git_dir(cfg)
+        managed_remote = target and self._is_remote_git_url(target)
+        if managed_remote and not self._managed_git_checkout_is_safe(repo_dir, cfg):
+            return False, self._tr("Git 缓存位置不安全，已停止同步", "Git cache location is unsafe. Sync stopped.")
         if repo_dir and self._has_git_marker(repo_dir):
             try:
                 self._recover_abandoned_git_index(repo_dir, cfg=cfg)
             except RuntimeError as exc:
                 return False, str(exc)
 
-        if target and self._is_remote_git_url(target):
+        if managed_remote:
             ok_heads, heads_or_err = self._git_remote_heads(target, cfg=cfg, timeout=10, retries=2, total_budget=22.0)
             if not ok_heads:
                 return False, self._tr(f"Git 远端不可达: {heads_or_err}", f"Git remote is unreachable: {heads_or_err}")
@@ -4295,6 +4323,8 @@ class SyncPlugin:
                         # Reset unborn/stale managed cache (no commits on target branch) so an empty remote
                         # never inherits commits from another branch.
                         head_chk = self._run_git(["rev-parse", "--verify", "HEAD"], cwd=repo_dir, cfg=cfg)
+                        if not self._managed_git_checkout_is_safe(repo_dir, cfg):
+                            return False, self._tr("Git 缓存位置不安全，已停止同步", "Git cache location is unsafe. Sync stopped.")
                         if head_chk.returncode == 0:
                             shutil.rmtree(repo_dir, ignore_errors=True)
                             os.makedirs(repo_dir, exist_ok=True)
@@ -4305,8 +4335,7 @@ class SyncPlugin:
                             self._run_git(["remote", "add", "origin", target], cwd=repo_dir, cfg=cfg)
                         else:
                             self._run_git(["symbolic-ref", "HEAD", f"refs/heads/{branch}"], cwd=repo_dir, cfg=cfg)
-                            clean_flags = "-fdx" if self._is_managed_git_dir(repo_dir) else "-fd"
-                            self._run_git(["clean", clean_flags], cwd=repo_dir, cfg=cfg)
+                            self._run_git(["clean", "-fdx"], cwd=repo_dir, cfg=cfg)
                 return True, repo_dir
 
             # Remote has the requested branch.
@@ -4415,14 +4444,15 @@ class SyncPlugin:
                     # any divergence against the user's real notebook using the configured conflict_policy.
                     # Force-checkout when inside plugin-managed git-repos/ so leftover dirty files from an
                     # earlier failed sync (e.g. .gitignore rejection) never deadlock recovery on retry.
-                    co_args = ["checkout", "-f", "-B", branch, f"refs/remotes/origin/{branch}"] if self._is_managed_git_dir(repo_dir) else ["checkout", "-B", branch, f"refs/remotes/origin/{branch}"]
+                    if not self._managed_git_checkout_is_safe(repo_dir, cfg):
+                        return False, self._tr("Git 缓存位置不安全，已停止同步", "Git cache location is unsafe. Sync stopped.")
+                    co_args = ["checkout", "-f", "-B", branch, f"refs/remotes/origin/{branch}"]
                     co_proc = self._run_git(co_args, cwd=repo_dir, cfg=cfg)
                     if co_proc.returncode != 0:
                         err = self._git_error_message(co_proc.stderr or co_proc.stdout, self._tr("切换分支失败", "Checkout failed"))
                         return False, self._tr(f"Git 切换分支失败: {err}", f"Git branch checkout failed: {err}")
                     self._run_git(["reset", "--hard", f"refs/remotes/origin/{branch}"], cwd=repo_dir, cfg=cfg)
-                    clean_flags = "-fdx" if self._is_managed_git_dir(repo_dir) else "-fd"
-                    self._run_git(["clean", clean_flags], cwd=repo_dir, cfg=cfg)
+                    self._run_git(["clean", "-fdx"], cwd=repo_dir, cfg=cfg)
         else:
             if not self._has_git_marker(repo_dir):
                 if not allow_init_or_clone:
@@ -6781,6 +6811,19 @@ class SyncPlugin:
             raise RuntimeError(self._tr("Git 同步已到达后台执行时限，请重试", "Git sync reached the background deadline. Retry to continue."))
         protocol = batch["protocol"]
         cfg = batch["cfg"]
+        repo = batch.get("repo_root")
+        if protocol == "git" and repo and not self._is_remote_git_url(cfg.get("git_remote") or ""):
+            branch = self._git_branch(cfg)
+            remotes = self._run_git(["remote"], cwd=repo, cfg=cfg)
+            if remotes.returncode != 0:
+                raise RuntimeError(self._tr("无法读取 Git 远端配置", "Could not read Git remotes"))
+            names = remotes.stdout.splitlines()
+            if names:
+                name = "origin" if "origin" in names else names[0]
+                head = self._run_git(["rev-parse", "--verify", f"refs/heads/{branch}"], cwd=repo, cfg=cfg)
+                if head.returncode == 0:
+                    remote = self._get_git_synced_branch_oid(repo, branch, remote_name=name, cfg=cfg)
+                    self._verify_git_push_history(repo, branch, head.stdout.strip(), remote, cfg)
         total_pushed = 0
         total_pulled = 0
         total_conflicts = 0
