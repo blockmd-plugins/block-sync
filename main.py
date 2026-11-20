@@ -8049,7 +8049,7 @@ class SyncPlugin:
             return skipped
         protocol = self.config["protocol"]
         git_target = self.config["git_remote"]
-        local_remote_uses_network = False
+        git_urls = [git_target]
         if protocol == "git" and not self._is_remote_git_url(git_target):
             repo = self._resolve_local_git_dir(self.config)
             if self._has_git_marker(repo):
@@ -8057,19 +8057,18 @@ class SyncPlugin:
                     remotes = self._run_git(["remote"], cwd=repo, timeout=1).stdout.splitlines()
                     if remotes:
                         name = "origin" if "origin" in remotes else remotes[0]
-                        git_target = self._run_git(["remote", "get-url", name], cwd=repo, timeout=1).stdout.strip()
-                        local_remote_uses_network = git_target.startswith("\\\\") or (
-                            not re.match(r"^[A-Za-z]:", git_target) and
-                            bool(re.match(r"^(?:[^/@:\\]+@)?[^/\\:]+:", git_target)) and
-                            not git_target.lower().startswith("file://")
-                        )
+                        for flags in ([], ["--push"]):
+                            urls = self._run_git(["remote", "get-url", *flags, "--all", name], cwd=repo, timeout=1)
+                            if urls.returncode == 0:
+                                git_urls.extend(urls.stdout.splitlines())
                 except (OSError, subprocess.TimeoutExpired):
                     pass
-        needs_network = protocol == "webdav" or (
-            protocol == "git" and (local_remote_uses_network or (
-                self._is_remote_git_url(git_target) and not git_target.lower().startswith("file://")
-            ))
-        )
+        needs_network = protocol == "webdav" or (protocol == "git" and any(
+            url.startswith("\\\\") or (
+                not url.lower().startswith("file://") and not re.match(r"^[A-Za-z]:", url)
+                and bool(re.match(r"^(?:[^/@:\\]+@)?[^/\\:]+:", url))
+            ) for url in git_urls
+        ))
         if event_name == "network.changed" and (params.get("online") is not True or not needs_network):
             return skipped
         if event_name == "system.wake" and params.get("online") is False and needs_network:
