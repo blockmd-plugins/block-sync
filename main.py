@@ -3596,6 +3596,15 @@ class SyncPlugin:
                     elif url_proc.stdout.strip() != target:
                         self._run_git(["remote", "set-url", "origin", target], cwd=repo_dir, cfg=cfg)
                     if self._is_managed_git_dir(repo_dir):
+                        # If we previously synced with origin/<branch> (remote-tracking ref exists) and the remote
+                        # now has no branches, the remote branch was deleted or reset — abort loudly instead of
+                        # silently pushing local history back to origin or deleting the local cache.
+                        remote_ref = f"refs/remotes/origin/{branch}"
+                        if self._run_git(["rev-parse", "--verify", remote_ref], cwd=repo_dir, cfg=cfg).returncode == 0:
+                            return False, self._tr(
+                                f"远端分支 {branch} 已不存在（疑似被删除或重置），为避免未经确认重建远端历史已中止同步",
+                                f"Remote branch {branch} no longer exists (it may have been deleted or reset); sync aborted to avoid silently recreating remote history",
+                            )
                         # Before resetting a managed cache against an empty remote, check if our target branch
                         # already has unpushed local commits (e.g. first push rejected by a receive hook).
                         local_ref = f"refs/heads/{branch}"
