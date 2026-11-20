@@ -2029,6 +2029,36 @@ class SyncPlugin:
                 f"Note {rel_path} is not valid UTF-8; sync aborted to avoid corrupting content",
             )) from exc
 
+    def _resolve_actual_rel_casing(self, base_dir, rel_path):
+        """Return the true on-disk casing of rel_path relative to base_dir on case-insensitive disks."""
+        parts = [p for p in rel_path.replace("\\", "/").split("/") if p]
+        cur_dir = base_dir
+        resolved_parts = []
+        for part in parts:
+            try:
+                entries = os.listdir(cur_dir)
+            except OSError:
+                return rel_path
+            if part in entries:
+                chosen = part
+            else:
+                target_cf = part.casefold()
+                chosen = None
+                cand_full = os.path.join(cur_dir, part)
+                for entry in entries:
+                    if entry.casefold() == target_cf:
+                        try:
+                            if os.path.samefile(os.path.join(cur_dir, entry), cand_full):
+                                chosen = entry
+                                break
+                        except OSError:
+                            pass
+                if chosen is None:
+                    return rel_path
+            resolved_parts.append(chosen)
+            cur_dir = os.path.join(cur_dir, chosen)
+        return "/".join(resolved_parts)
+
     def _scan_mirror_files(self, mirror_dir, only_path=None, scope=None, excluded_subdirs=()):
         remote_files = {}
         if not os.path.isdir(mirror_dir):
@@ -2043,8 +2073,9 @@ class SyncPlugin:
             except ValueError:
                 return remote_files
             if os.path.isfile(candidate):
+                actual_rel = self._resolve_actual_rel_casing(mirror_dir, only_path)
                 with open(candidate, "rb") as fh:
-                    remote_files[only_path] = self._decode_note_bytes(fh.read(), only_path)
+                    remote_files[actual_rel] = self._decode_note_bytes(fh.read(), actual_rel)
             return remote_files
 
         for root, dirs, files in os.walk(mirror_dir):
@@ -4409,7 +4440,9 @@ class SyncPlugin:
                 elif target_dir:
                     def check_remote_note(cand):
                         found_map = self._scan_mirror_files(target_dir, only_path=cand, scope=scope, excluded_subdirs=excluded_subdirs)
-                        return found_map.get(cand)
+                        if cand in found_map:
+                            return found_map[cand]
+                        return next(iter(found_map.values()), None)
 
             all_paths = sorted(set(local_notes.keys()) | set(remote_notes.keys()))
             for rel_path in all_paths:
