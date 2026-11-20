@@ -1778,8 +1778,10 @@ class SyncPlugin:
             self._clear_pending_confirm(bridge)
             self._remote_preview_cache.clear()
 
-    def _save_runtime(self, bridge, only_path=None, notebook_root=None):
+    def _save_runtime(self, bridge, only_path=None, notebook_root=None, clear_pending=False):
         key = self._result_key()
+        if clear_pending:
+            self.pending_confirm = None
         if self.pending_confirm is None:
             self.pending_confirms.pop(key, None)
         else:
@@ -7425,7 +7427,7 @@ class SyncPlugin:
 
         self._last_sync_outcome = "synced"
         self._last_synced_notebooks = [p["nb_root"] for p in batch.get("plans") or () if p.get("nb_root")]
-        self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root)
+        self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root, clear_pending=confirmed)
         self.last_status = msg
         return msg
 
@@ -8159,7 +8161,6 @@ class SyncPlugin:
                         else:
                             status = self._run_sync(bridge, only_path=only_path, only_nb_root=only_nb_root,
                                                     confirmed=True, approved_batch=batch, report_progress=True)
-                            self._clear_pending_confirm(bridge)
                             ok = True
                             tone = "success"
             elif action_id == "cancel_confirm":
