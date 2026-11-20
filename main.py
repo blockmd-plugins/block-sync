@@ -4785,7 +4785,7 @@ class SyncPlugin:
                 f"Files planned for sync are ignored by Git ignore rules: {sample}",
             ))
 
-    def _commit_and_push_git(self, repo_root, cfg, staged_rel_paths=None, tracked_plan_paths=None):
+    def _commit_and_push_git(self, repo_root, cfg, staged_rel_paths=None, tracked_plan_paths=None, planned_blobs=None):
         # Remove any stale untracked atomic-write temp files left behind by a prior SIGKILL cancellation
         # so they can never be staged or pushed to the remote repository.
         self._cleanup_stale_temp_files(repo_root, cfg=cfg)
@@ -4801,88 +4801,245 @@ class SyncPlugin:
         written = {p.replace("\\", "/").lstrip("/") for p in (staged_rel_paths or []) if p}
         candidate_tracked = {p.replace("\\", "/").lstrip("/") for p in (tracked_plan_paths or []) if p} - written
         all_check_paths = sorted(written | candidate_tracked)
+        blob_map = {k.replace("\\", "/").lstrip("/"): v for k, v in (planned_blobs or {}).items() if k}
 
         # Fail loudly if .gitignore / .git/info/exclude blocks any file in the sync plan.
         self._check_git_ignored(repo_root, all_check_paths, cfg=cfg)
 
-        # Also include any previously-written synced files that remain untracked/modified in the working tree
-        # (e.g., retrying after removing a .gitignore / .git/info/exclude rule).
-        dirty_tracked = set()
-        if candidate_tracked:
-            st_proc = subprocess.run(
-                ["git", "--literal-pathspecs", "status", "--porcelain", "-z", "--untracked-files=all", "--", *sorted(candidate_tracked)],
-                cwd=repo_root,
-                env=self._git_env(),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=8,
-            )
-            if st_proc.returncode != 0:
-                err_txt = (st_proc.stderr or st_proc.stdout or b"").decode("utf-8", errors="replace")
-                err = self._error_detail(err_txt or self._tr("git status 失败", "git status failed"))
-                raise RuntimeError(self._tr(f"Git 状态检查失败: {err}", f"Git status check failed: {err}"))
-            if st_proc.stdout:
-                tokens = st_proc.stdout.split(b"\0")
-                i = 0
-                while i < len(tokens):
-                    tok = tokens[i]
-                    if len(tok) >= 4:
-                        xy = tok[:2].decode("ascii", errors="replace")
-                        p_str = os.fsdecode(tok[3:]).replace("\\", "/")
-                        if p_str in candidate_tracked:
-                            dirty_tracked.add(p_str)
-                        if "R" in xy or "C" in xy:
-                            i += 1
-                    i += 1
-
-        rel_paths = sorted(written | dirty_tracked)
-        self._check_git_staged_conflicts(repo_root, rel_paths, cfg=cfg)
-        did_commit = False
-        if rel_paths:
-            # Find which planned paths are untracked so we can intent-to-add ONLY those,
-            # leaving any user pre-staged files in the index completely untouched.
-            oth_proc = subprocess.run(
-                ["git", "--literal-pathspecs", "ls-files", "--others", "-z", "--", *rel_paths],
-                cwd=repo_root,
-                env=self._git_env(),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=8,
-            )
-            untracked_new = sorted({os.fsdecode(raw).replace("\\", "/") for raw in (oth_proc.stdout or b"").split(b"\0") if raw})
-            if untracked_new:
-                add_proc = self._run_git(["--literal-pathspecs", "add", "-N", "--", *untracked_new], cwd=repo_root, cfg=cfg)
-                if add_proc.returncode != 0:
-                    err = self._error_detail(add_proc.stderr or add_proc.stdout or self._tr("git add 失败", "git add failed"))
-                    raise RuntimeError(self._tr(f"Git 暂存失败: {err}", f"Git staging failed: {err}"))
-
-            st_plan = subprocess.run(
-                ["git", "--literal-pathspecs", "status", "--porcelain", "-z", "--", *rel_paths],
-                cwd=repo_root,
-                env=self._git_env(),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=8,
-            )
-            has_plan_changes = bool(st_plan.returncode == 0 and st_plan.stdout.strip(b"\0"))
-            if has_plan_changes:
-                commit_proc = self._run_git(
-                    [
-                        "--literal-pathspecs",
-                        "-c", "user.name=Block Sync",
-                        "-c", "user.email=sync@blockmd.local",
-                        "commit", "-m", "sync: update markdown notes",
-                        "--only", "--", *rel_paths,
-                    ],
+        # Inspect HEAD and compare exact planned blobs directly against HEAD's tree so that:
+        # 1. Mutable working-tree edits arriving after sync writes are NEVER committed in place of planned bytes.
+        # 2. Index flags like --assume-unchanged can NEVER hide a planned write from being committed & pushed.
+        # 3. Acquiring .git/index.lock while re-checking staged conflicts, updating refs/heads/<branch>, and
+        #    atomically replacing .git/index makes concurrent `git add` races impossible.
+        head_chk = self._run_git(["rev-parse", "--verify", "HEAD"], cwd=repo_root, cfg=cfg)
+        old_head = head_chk.stdout.strip() if head_chk.returncode == 0 and head_chk.stdout.strip() else ""
+        old_tree = ""
+        head_entries = {}
+        if old_head:
+            tree_chk = self._run_git(["rev-parse", "--verify", "HEAD^{tree}"], cwd=repo_root, cfg=cfg)
+            if tree_chk.returncode == 0 and tree_chk.stdout.strip():
+                old_tree = tree_chk.stdout.strip()
+            if all_check_paths:
+                ls_proc = subprocess.run(
+                    ["git", "--literal-pathspecs", "ls-tree", "-r", "-z", old_head, "--", *all_check_paths],
                     cwd=repo_root,
-                    cfg=cfg,
+                    env=self._git_env(),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=8,
                 )
-                if commit_proc.returncode != 0:
-                    if untracked_new:
-                        self._run_git(["--literal-pathspecs", "reset", "--", *untracked_new], cwd=repo_root, cfg=cfg)
-                    err = self._error_detail(commit_proc.stderr or commit_proc.stdout or self._tr("git commit 失败", "git commit failed"))
-                    raise RuntimeError(self._tr(f"Git 提交失败: {err}", f"Git commit failed: {err}"))
+                if ls_proc.returncode != 0:
+                    err_txt = (ls_proc.stderr or ls_proc.stdout or b"").decode("utf-8", errors="replace")
+                    err = self._error_detail(err_txt or self._tr("git ls-tree 失败", "git ls-tree failed"))
+                    raise RuntimeError(self._tr(f"Git 树检查失败: {err}", f"Git tree inspection failed: {err}"))
+                for entry in (ls_proc.stdout or b"").split(b"\0"):
+                    if not entry or b"\t" not in entry:
+                        continue
+                    meta_b, path_b = entry.split(b"\t", 1)
+                    parts = meta_b.decode("ascii", errors="replace").split()
+                    if len(parts) >= 3:
+                        p_str = os.fsdecode(path_b).replace("\\", "/")
+                        head_entries[p_str] = (parts[0], parts[2])
+
+        use_sha1_fast = (not old_head) or (len(old_head) == 40)
+        changed_entries = []  # list of (path, mode, blob_oid)
+        git_env = self._git_env()
+        for p in all_check_paths:
+            if p in blob_map:
+                raw_data = blob_map[p]
+            else:
+                disk_path = os.path.join(repo_root, *p.split("/"))
+                if not os.path.isfile(disk_path):
+                    continue
+                with open(disk_path, "rb") as fh:
+                    raw_data = fh.read()
+            prev_mode, prev_oid = head_entries.get(p, ("100644", ""))
+            mode = prev_mode if prev_mode in ("100644", "100755") else "100644"
+            if use_sha1_fast and prev_oid:
+                fast_oid = hashlib.sha1(f"blob {len(raw_data)}\0".encode("ascii") + raw_data).hexdigest()
+                if fast_oid == prev_oid:
+                    continue
+            ho_proc = subprocess.run(
+                ["git", "hash-object", "-w", "--stdin"],
+                cwd=repo_root,
+                env=git_env,
+                input=raw_data,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=8,
+            )
+            if ho_proc.returncode != 0:
+                err_txt = (ho_proc.stderr or ho_proc.stdout or b"").decode("utf-8", errors="replace")
+                err = self._error_detail(err_txt or self._tr("git hash-object 失败", "git hash-object failed"))
+                raise RuntimeError(self._tr(f"Git 对象写入失败: {err}", f"Git object write failed: {err}"))
+            new_oid = (ho_proc.stdout or b"").decode("ascii", errors="replace").strip()
+            if old_head and new_oid == prev_oid:
+                continue
+            changed_entries.append((p, mode, new_oid))
+
+        changed_paths = [p for p, _, _ in changed_entries]
+        if all_check_paths:
+            self._check_git_staged_conflicts(repo_root, all_check_paths, cfg=cfg)
+
+        did_commit = False
+        if changed_entries:
+            real_index = self._git_path(repo_root, "index", cfg=cfg)
+            if not real_index:
+                raise RuntimeError(self._tr("无法定位 Git 索引文件", "Could not locate Git index file"))
+            index_dir = os.path.dirname(real_index)
+            pid = os.getpid()
+            ts_ns = time.time_ns()
+            tmp_tree_idx = os.path.join(index_dir, f"block-sync-tree-{pid}-{ts_ns}.idx")
+            tmp_real_idx = os.path.join(index_dir, f"block-sync-real-{pid}-{ts_ns}.idx")
+            index_lock = real_index + ".lock"
+            index_info_payload = b"".join(
+                f"{mode} {oid}\t".encode("ascii") + os.fsencode(p) + b"\0"
+                for p, mode, oid in changed_entries
+            )
+            try:
+                # 1. Build commit tree strictly from old_tree + exact planned blobs (isolated temp index).
+                tree_env = dict(git_env)
+                tree_env["GIT_INDEX_FILE"] = tmp_tree_idx
+                if old_tree:
+                    rt_proc = subprocess.run(
+                        ["git", "read-tree", old_tree],
+                        cwd=repo_root,
+                        env=tree_env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=8,
+                    )
+                    if rt_proc.returncode != 0:
+                        err_txt = (rt_proc.stderr or rt_proc.stdout or b"").decode("utf-8", errors="replace")
+                        raise RuntimeError(self._tr(f"Git 树初始化失败: {self._error_detail(err_txt)}", f"Git read-tree failed: {self._error_detail(err_txt)}"))
+                ui_proc = subprocess.run(
+                    ["git", "update-index", "-z", "--index-info"],
+                    cwd=repo_root,
+                    env=tree_env,
+                    input=index_info_payload,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=8,
+                )
+                if ui_proc.returncode != 0:
+                    err_txt = (ui_proc.stderr or ui_proc.stdout or b"").decode("utf-8", errors="replace")
+                    raise RuntimeError(self._tr(f"Git 索引更新失败: {self._error_detail(err_txt)}", f"Git update-index failed: {self._error_detail(err_txt)}"))
+                wt_proc = subprocess.run(
+                    ["git", "write-tree"],
+                    cwd=repo_root,
+                    env=tree_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=8,
+                )
+                if wt_proc.returncode != 0:
+                    err_txt = (wt_proc.stderr or wt_proc.stdout or b"").decode("utf-8", errors="replace")
+                    raise RuntimeError(self._tr(f"Git 写入树失败: {self._error_detail(err_txt)}", f"Git write-tree failed: {self._error_detail(err_txt)}"))
+                new_tree = (wt_proc.stdout or b"").decode("ascii", errors="replace").strip()
+
+                commit_env = dict(git_env)
+                commit_env["GIT_AUTHOR_NAME"] = "Block Sync"
+                commit_env["GIT_AUTHOR_EMAIL"] = "sync@blockmd.local"
+                commit_env["GIT_COMMITTER_NAME"] = "Block Sync"
+                commit_env["GIT_COMMITTER_EMAIL"] = "sync@blockmd.local"
+                ct_args = ["git", "commit-tree", new_tree, "-m", "sync: update markdown notes"]
+                if old_head:
+                    ct_args[3:3] = ["-p", old_head]
+                ct_proc = subprocess.run(
+                    ct_args,
+                    cwd=repo_root,
+                    env=commit_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=8,
+                )
+                if ct_proc.returncode != 0:
+                    err_txt = (ct_proc.stderr or ct_proc.stdout or b"").decode("utf-8", errors="replace")
+                    raise RuntimeError(self._tr(f"Git 提交对象创建失败: {self._error_detail(err_txt)}", f"Git commit-tree failed: {self._error_detail(err_txt)}"))
+                new_commit = (ct_proc.stdout or b"").decode("ascii", errors="replace").strip()
+
+                # 2. Acquire .git/index.lock so no concurrent `git add` can mutate the real index between
+                #    our staged-conflict check, branch ref update, and atomic index replacement.
+                lock_fd = None
+                lock_deadline = time.monotonic() + 2.0
+                while True:
+                    try:
+                        lock_fd = os.open(index_lock, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+                        break
+                    except FileExistsError:
+                        if time.monotonic() >= lock_deadline:
+                            raise RuntimeError(self._tr(
+                                "Git 暂存区正被其他进程锁定，请稍后重试",
+                                "Git index is locked by another process; retry shortly",
+                            ))
+                        time.sleep(0.05)
+
+                replaced_index = False
+                try:
+                    # Re-check staged conflicts under index.lock (read-only against real_index).
+                    self._check_git_staged_conflicts(repo_root, all_check_paths, cfg=cfg)
+
+                    # Clone real_index (preserving any unrelated user-staged files) and update only changed_entries.
+                    if os.path.isfile(real_index):
+                        shutil.copyfile(real_index, tmp_real_idx)
+                    real_env = dict(git_env)
+                    real_env["GIT_INDEX_FILE"] = tmp_real_idx
+                    ui_real = subprocess.run(
+                        ["git", "update-index", "-z", "--index-info"],
+                        cwd=repo_root,
+                        env=real_env,
+                        input=index_info_payload,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=8,
+                    )
+                    if ui_real.returncode != 0:
+                        err_txt = (ui_real.stderr or ui_real.stdout or b"").decode("utf-8", errors="replace")
+                        raise RuntimeError(self._tr(f"Git 索引同步失败: {self._error_detail(err_txt)}", f"Git index sync failed: {self._error_detail(err_txt)}"))
+
+                    # Atomically advance refs/heads/<branch> (fails if HEAD moved concurrently).
+                    ur_proc = subprocess.run(
+                        ["git", "update-ref", "-m", "sync: update markdown notes", f"refs/heads/{branch}", new_commit, old_head],
+                        cwd=repo_root,
+                        env=commit_env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=8,
+                    )
+                    if ur_proc.returncode != 0:
+                        err_txt = (ur_proc.stderr or ur_proc.stdout or b"").decode("utf-8", errors="replace")
+                        raise RuntimeError(self._tr(f"Git 分支更新失败（可能存在并发提交）: {self._error_detail(err_txt)}", f"Git branch update failed (concurrent commit?): {self._error_detail(err_txt)}"))
+
+                    # Atomically replace real_index via index_lock (Git's native atomic index-commit protocol).
+                    with open(tmp_real_idx, "rb") as src_idx:
+                        idx_bytes = src_idx.read()
+                    view = memoryview(idx_bytes)
+                    while view:
+                        n_written = os.write(lock_fd, view)
+                        view = view[n_written:]
+                    os.fsync(lock_fd)
+                    os.close(lock_fd)
+                    lock_fd = None
+                    os.replace(index_lock, real_index)
+                    replaced_index = True
+                finally:
+                    if lock_fd is not None:
+                        try:
+                            os.close(lock_fd)
+                        except OSError:
+                            pass
+                    if not replaced_index:
+                        try:
+                            os.unlink(index_lock)
+                        except OSError:
+                            pass
                 did_commit = True
+            finally:
+                for p_tmp in (tmp_tree_idx, tmp_real_idx):
+                    try:
+                        os.unlink(p_tmp)
+                    except OSError:
+                        pass
 
         remote_proc = self._run_git(["remote"], cwd=repo_root, cfg=cfg)
         if remote_proc.returncode != 0:
@@ -5056,10 +5213,13 @@ class SyncPlugin:
                 ))
 
         remote_path_map = plan.get("remote_path_map") or {}
+        planned_git_blobs = {}
 
-        def record_remote_path(rel):
+        def record_remote_path(rel, raw_bytes=None):
             repo_rel = f"{subdir.strip('/')}/{rel}" if subdir.strip("/") else rel
             written_remote_paths.append(repo_rel)
+            if raw_bytes is not None:
+                planned_git_blobs[repo_rel] = bytes(raw_bytes)
 
         if protocol == "local_mirror":
             def write_remote_note(rel, text, expected_hash=None, create_only=False):
@@ -5127,7 +5287,7 @@ class SyncPlugin:
                     verify_target=verify_target,
                     root_dir_fd=active_target_fd[0],
                 )
-                record_remote_path(target_rel)
+                record_remote_path(target_rel, text.encode("utf-8"))
             def write_remote_asset(rel, data, expected_hash=None, create_only=False):
                 self._write_mirror_bytes(
                     target_dir,
@@ -5139,7 +5299,7 @@ class SyncPlugin:
                     verify_target=verify_target,
                     root_dir_fd=active_target_fd[0],
                 )
-                record_remote_path(rel)
+                record_remote_path(rel, data)
 
         pushed = 0
         pulled = 0
@@ -5409,10 +5569,16 @@ class SyncPlugin:
         if protocol == "git":
             sub_prefix = f"{subdir.strip('/')}/" if subdir.strip("/") else ""
             for rel_path in plan["synced"]:
-                synced_repo_paths.append(f"{sub_prefix}{remote_path_map.get(rel_path, rel_path)}")
+                repo_rel = f"{sub_prefix}{remote_path_map.get(rel_path, rel_path)}"
+                synced_repo_paths.append(repo_rel)
+                if repo_rel not in planned_git_blobs and rel_path in local_notes:
+                    planned_git_blobs[repo_rel] = local_notes[rel_path].encode("utf-8")
             for rel_path in plan.get("assets_synced") or ():
-                synced_repo_paths.append(f"{sub_prefix}{rel_path}")
-        return pushed, pulled, conflict_count, asset_count, base_map, written_remote_paths, synced_repo_paths
+                repo_rel = f"{sub_prefix}{rel_path}"
+                synced_repo_paths.append(repo_rel)
+                if repo_rel not in planned_git_blobs and rel_path in local_assets:
+                    planned_git_blobs[repo_rel] = bytes(local_assets[rel_path])
+        return pushed, pulled, conflict_count, asset_count, base_map, written_remote_paths, synced_repo_paths, planned_git_blobs
 
     def _compute_batch_plan(self, bridge, cfg, notebooks, only_path=None, inspect_remote=True, force_refresh=False):
         protocol = cfg.get("protocol", "local_mirror")
@@ -5563,6 +5729,7 @@ class SyncPlugin:
         pending_base_maps = []
         staged_git_paths = []
         tracked_git_paths = []
+        planned_git_blobs = {}
         # For Git batches, check ALL planned write paths across ALL notebooks against the Git index
         # BEFORE writing any notebook so a staged-index conflict on notebook B never leaves notebook A mutated.
         if protocol == "git" and batch.get("repo_root"):
@@ -5608,7 +5775,7 @@ class SyncPlugin:
                     self._check_git_staged_conflicts(batch["repo_root"], all_planned_git_writes, cfg=cfg)
 
         for plan in batch["plans"]:
-            pushed, pulled, conflicts, assets, updated_base, written_paths, synced_paths = self._apply_notebook_plan(
+            pushed, pulled, conflicts, assets, updated_base, written_paths, synced_paths, nb_blobs = self._apply_notebook_plan(
                 bridge, plan, only_path=only_path, progress_state=progress_state
             )
             total_pushed += pushed
@@ -5618,6 +5785,7 @@ class SyncPlugin:
             pending_base_maps.append((plan["meta_key"], updated_base))
             staged_git_paths.extend(written_paths)
             tracked_git_paths.extend(synced_paths)
+            planned_git_blobs.update(nb_blobs)
             if protocol != "git":
                 self.sync_meta[plan["meta_key"]] = updated_base
 
@@ -5636,6 +5804,7 @@ class SyncPlugin:
                     cfg,
                     staged_rel_paths=staged_git_paths,
                     tracked_plan_paths=tracked_git_paths,
+                    planned_blobs=planned_git_blobs,
                 )
             for mk, updated_base in pending_base_maps:
                 self.sync_meta[mk] = updated_base
