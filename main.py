@@ -3574,12 +3574,37 @@ class SyncPlugin:
         try:
             data = self._load_git_pushed_refs(repo_dir, cfg=cfg)
             data[f"{remote_name}:{branch}"] = oid
+            data.pop(f"pending_initial:{remote_name}:{branch}", None)
             tmp_p = f"{p}.{os.getpid()}.tmp"
             with open(tmp_p, "w", encoding="utf-8") as fh:
                 json.dump(data, fh, ensure_ascii=False, sort_keys=True)
             os.replace(tmp_p, p)
         except Exception:
             pass
+
+    def _record_git_pending_initial(self, repo_dir, branch, oid, remote_name="origin", cfg=None):
+        oid = str(oid or "").strip()
+        if not oid or not branch:
+            return
+        p = self._git_path(repo_dir, "block-sync-pushed-refs.json", cfg=cfg)
+        if not p:
+            return
+        try:
+            data = self._load_git_pushed_refs(repo_dir, cfg=cfg)
+            if not data.get(f"{remote_name}:{branch}"):
+                data[f"pending_initial:{remote_name}:{branch}"] = oid
+                tmp_p = f"{p}.{os.getpid()}.tmp"
+                with open(tmp_p, "w", encoding="utf-8") as fh:
+                    json.dump(data, fh, ensure_ascii=False, sort_keys=True)
+                os.replace(tmp_p, p)
+        except Exception:
+            pass
+
+    def _has_git_pending_initial(self, repo_dir, branch, remote_name="origin", cfg=None):
+        if not repo_dir or not branch or not self._has_git_marker(repo_dir):
+            return False
+        data = self._load_git_pushed_refs(repo_dir, cfg=cfg)
+        return bool(data.get(f"pending_initial:{remote_name}:{branch}")) and not bool(data.get(f"{remote_name}:{branch}"))
 
     def _get_git_synced_branch_oid(self, repo_dir, branch, remote_name="origin", cfg=None):
         if not repo_dir or not branch or not self._has_git_marker(repo_dir):
@@ -3608,9 +3633,11 @@ class SyncPlugin:
         return m_proc.stdout.strip() in (f"refs/heads/{branch}", branch)
 
     def _was_git_branch_synced(self, repo_dir, branch, remote_name="origin", cfg=None):
-        return bool(self._get_git_synced_branch_oid(repo_dir, branch, remote_name=remote_name, cfg=cfg)) or (
-            self._git_branch_has_upstream_config(repo_dir, branch, remote_name=remote_name, cfg=cfg)
-        )
+        if self._get_git_synced_branch_oid(repo_dir, branch, remote_name=remote_name, cfg=cfg):
+            return True
+        if self._has_git_pending_initial(repo_dir, branch, remote_name=remote_name, cfg=cfg):
+            return False
+        return self._git_branch_has_upstream_config(repo_dir, branch, remote_name=remote_name, cfg=cfg)
 
     def _test_git(self):
         if not shutil.which("git"):
@@ -5216,12 +5243,14 @@ class SyncPlugin:
                                 f"Local Git branch {branch} diverged from last synced remote commit; push aborted",
                             ))
                         lease_arg = f"--force-with-lease=refs/heads/{branch}:{expected_remote_oid}"
-                    elif old_head and self._git_branch_has_upstream_config(repo_root, branch, remote_name=remote_name, cfg=cfg):
+                    elif old_head and not self._has_git_pending_initial(repo_root, branch, remote_name=remote_name, cfg=cfg) and self._git_branch_has_upstream_config(repo_root, branch, remote_name=remote_name, cfg=cfg):
                         raise RuntimeError(self._tr(
                             f"远端 {remote_name} 的分支 {branch} 已不存在（疑似被删除或重置），为避免未经确认重建远端历史已中止同步",
                             f"Remote {remote_name} branch {branch} no longer exists (it may have been deleted or reset); sync aborted to avoid silently recreating remote history",
                         ))
                     else:
+                        if not old_head:
+                            self._record_git_pending_initial(repo_root, branch, head_oid, remote_name=remote_name, cfg=cfg)
                         lease_arg = f"--force-with-lease=refs/heads/{branch}:"
                     push_proc = self._run_git_network(
                         ["push", lease_arg, "-u", remote_name, f"HEAD:refs/heads/{branch}"],
