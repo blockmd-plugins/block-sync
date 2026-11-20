@@ -259,9 +259,60 @@ def split_markdown_code_segments(text):
             out.append((False, chunk[plain_start:]))
         return out
 
-    bq_prefix_re = re.compile(r"^((?: {0,3}>[ \t]?)*)(.*)$")
-    list_marker_re = re.compile(r"^( {0,3}(?:[*+-]|\d{1,9}[.)])(?:[ \t]+|$))(.*)$")
+    bq_one_re = re.compile(r"^ {0,3}>[ \t]?(.*)$")
+    list_one_re = re.compile(r"^( {0,3}(?:[*+-]|\d{1,9}[.)])(?:[ \t]+|$))(.*)$")
     fence_re = re.compile(r"^([ \t]*)(\x60{3,}|~{3,})(.*)$")
+    atx_heading_re = re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)")
+    thematic_break_re = re.compile(r"^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$")
+
+    def strip_containers(line_body, active_indent=0):
+        """Strip arbitrarily nested blockquote (`>`) and list-item (`-`/`1.`) prefixes in order.
+
+        Returns (rest, bq_count, total_list_indent, opened_list).
+        Also handles continuation indentation inside active list items before an inner `>` (e.g. `1. > ~~~` followed by `   > code`).
+        """
+        rest = line_body
+        bq_count = 0
+        total_indent = 0
+        opened_list = False
+        while True:
+            bm = bq_one_re.match(rest)
+            if bm:
+                bq_count += 1
+                rest = bm.group(1)
+                continue
+            lm = list_one_re.match(rest)
+            if lm:
+                marker_str = lm.group(1)
+                step = expand_indent_cols(marker_str)
+                if not marker_str.endswith((" ", "\t")):
+                    step += 1
+                total_indent += step
+                rest = lm.group(2)
+                opened_list = True
+                continue
+            # Handle continuation indentation before an inner blockquote inside a list item (e.g. "   > code").
+            if active_indent > total_indent and expand_indent_cols(rest) >= (active_indent - total_indent):
+                needed = active_indent - total_indent
+                cols = 0
+                idx = 0
+                while idx < len(rest) and cols < needed:
+                    if rest[idx] == " ":
+                        cols += 1
+                    elif rest[idx] == "\t":
+                        cols += 4 - (cols % 4)
+                    else:
+                        break
+                    idx += 1
+                candidate = rest[idx:]
+                bm2 = bq_one_re.match(candidate)
+                if bm2:
+                    total_indent = active_indent
+                    bq_count += 1
+                    rest = bm2.group(1)
+                    continue
+            break
+        return rest, bq_count, total_indent, opened_list
 
     block_segments = []
     buf = []
@@ -275,18 +326,25 @@ def split_markdown_code_segments(text):
     prev_line_blank = True
     active_list_indent = 0
     active_list_bq_depth = 0
+    last_plain_sig = None
+
+    def flush_plain():
+        nonlocal buf
+        if buf:
+            block_segments.append((False, "".join(buf)))
+            buf = []
 
     for raw_line in text.splitlines(keepends=True):
         body = raw_line.rstrip("\r\n")
-        bq_match = bq_prefix_re.match(body)
-        cur_depth = bq_match.group(1).count(">") if bq_match else 0
-        rest_after_bq = bq_match.group(2) if bq_match else body
-        is_blank = (rest_after_bq.strip() == "")
-        indent_cols = expand_indent_cols(rest_after_bq)
 
         if fence_char:
-            dropped_container = (cur_depth < fence_bq_depth) or (
-                not is_blank and fence_min_indent > 0 and indent_cols < fence_min_indent
+            # Strip container prefixes matching the fence's nesting (supporting both "> ```" and "1. > ```").
+            f_rest, f_bq, f_list_ind, _ = strip_containers(body, active_indent=fence_min_indent)
+            f_blank = (f_rest.strip() == "")
+            f_lead = expand_indent_cols(f_rest)
+            effective_indent = f_list_ind + f_lead
+            dropped_container = (f_bq < fence_bq_depth) or (
+                not f_blank and fence_min_indent > 0 and effective_indent < fence_min_indent
             )
             if dropped_container:
                 block_segments.append((True, "".join(buf)))
@@ -296,13 +354,14 @@ def split_markdown_code_segments(text):
                 fence_bq_depth = 0
                 fence_min_indent = 0
                 prev_line_blank = False
+                last_plain_sig = None
             else:
-                close_m = re.match(r"^([ \t]*)(\x60{3,}|~{3,})[ \t]*$", rest_after_bq)
+                close_m = re.match(r"^([ \t]*)(\x60{3,}|~{3,})[ \t]*$", f_rest)
                 buf.append(raw_line)
                 if (
-                    cur_depth == fence_bq_depth
+                    f_bq == fence_bq_depth
                     and close_m
-                    and expand_indent_cols(close_m.group(1)) <= fence_min_indent + 3
+                    and (f_list_ind + expand_indent_cols(close_m.group(1))) <= fence_min_indent + 3
                     and close_m.group(2)[0] == fence_char
                     and len(close_m.group(2)) >= fence_len
                 ):
@@ -313,74 +372,76 @@ def split_markdown_code_segments(text):
                     fence_bq_depth = 0
                     fence_min_indent = 0
                     prev_line_blank = False
+                    last_plain_sig = None
                 continue
 
+        rest, cur_depth, line_list_indent, opened_list_on_line = strip_containers(
+            body, active_indent=active_list_indent,
+        )
+        is_blank = (rest.strip() == "")
+        indent_cols = expand_indent_cols(rest)
+        eff_indent = line_list_indent + indent_cols
+
         if in_indented_code:
-            if cur_depth == indented_bq_depth and (is_blank or indent_cols >= indented_min_cols):
+            if cur_depth == indented_bq_depth and (is_blank or eff_indent >= indented_min_cols):
                 buf.append(raw_line)
                 prev_line_blank = is_blank
                 continue
             block_segments.append((True, "".join(buf)))
             buf = []
             in_indented_code = False
+            last_plain_sig = None
 
-        if not is_blank and (cur_depth != active_list_bq_depth or indent_cols < active_list_indent):
+        if not is_blank and not opened_list_on_line and (cur_depth != active_list_bq_depth or eff_indent < active_list_indent):
             active_list_indent = 0
             active_list_bq_depth = 0
 
-        # Check for list-item container(s) on this line (e.g. "1. ~~~md" or "- ```").
-        list_rest = rest_after_bq
-        line_list_indent = active_list_indent if cur_depth == active_list_bq_depth else 0
-        opened_list_on_line = False
-        while True:
-            lm = list_marker_re.match(list_rest)
-            if not lm:
-                break
-            marker_str = lm.group(1)
-            line_list_indent = (line_list_indent if opened_list_on_line else 0) + expand_indent_cols(marker_str)
-            # If marker had no trailing space (empty list item), content indent is marker + 1.
-            if not marker_str.endswith((" ", "\t")):
-                line_list_indent += 1
-            list_rest = lm.group(2)
-            opened_list_on_line = True
         if opened_list_on_line:
             active_list_indent = line_list_indent
             active_list_bq_depth = cur_depth
 
-        # Check fenced code block opening (either right after list marker or at container indent + 0..3).
-        fence_target = list_rest if opened_list_on_line else rest_after_bq
+        # Check fenced code block opening (top-level, in blockquote, in list, or in list+blockquote).
         fence_base_indent = line_list_indent if opened_list_on_line else (active_list_indent if cur_depth == active_list_bq_depth else 0)
-        max_fence_lead = 3 if opened_list_on_line else (fence_base_indent + 3)
-        fm = fence_re.match(fence_target)
+        max_fence_lead = 3 if (opened_list_on_line or line_list_indent >= fence_base_indent) else (fence_base_indent + 3)
+        fm = fence_re.match(rest)
         if fm and expand_indent_cols(fm.group(1)) <= max_fence_lead:
             ch = fm.group(2)[0]
             info = fm.group(3)
             if ch != "`" or "`" not in info:
-                if buf:
-                    block_segments.append((False, "".join(buf)))
-                    buf = []
+                flush_plain()
                 fence_char = ch
                 fence_len = len(fm.group(2))
                 fence_bq_depth = cur_depth
                 fence_min_indent = fence_base_indent
                 buf.append(raw_line)
                 prev_line_blank = False
+                last_plain_sig = None
                 continue
 
         # Indented code block (CommonMark §4.4: 4 cols beyond container indent, not interrupting paragraph).
         min_indented_cols = (active_list_indent + 4) if (cur_depth == active_list_bq_depth and active_list_indent > 0) else 4
-        if prev_line_blank and not is_blank and not opened_list_on_line and indent_cols >= min_indented_cols:
-            if buf:
-                block_segments.append((False, "".join(buf)))
-                buf = []
+        if prev_line_blank and not is_blank and not opened_list_on_line and eff_indent >= min_indented_cols:
+            flush_plain()
             in_indented_code = True
             indented_bq_depth = cur_depth
             indented_min_cols = min_indented_cols
             buf.append(raw_line)
             prev_line_blank = False
+            last_plain_sig = None
             continue
 
+        # Block boundaries: ATX headings, thematic breaks, blank lines, and container changes must NOT
+        # share inline backtick code spans across leaf blocks (CommonMark §6.1).
+        is_leaf_boundary = bool(atx_heading_re.match(rest) or thematic_break_re.match(rest))
+        cur_sig = (cur_depth, active_list_indent if cur_depth == active_list_bq_depth else 0)
+        if is_blank or is_leaf_boundary or opened_list_on_line or (last_plain_sig is not None and cur_sig != last_plain_sig):
+            flush_plain()
         buf.append(raw_line)
+        if is_blank or is_leaf_boundary:
+            flush_plain()
+            last_plain_sig = None
+        else:
+            last_plain_sig = cur_sig
         prev_line_blank = is_blank
 
     if buf:
@@ -410,7 +471,7 @@ def note_asset_paths(note_path, text):
     link_dest = rf"<([^>\n]+)>|({bare_dest})"
     links = re.findall(rf"\]\(\s*(?:{link_dest})(?=[\s)])", visible_text)
     refs = re.findall(
-        rf"(?m)^ {{0,3}}\[(?:\\.|[^\]\\\n])+\]:[ \t]*(?:\r?\n[ \t]*)?(?:{link_dest})(?=[ \t\r]|$)",
+        rf"(?m)^(?: {{0,3}}>[ \t]?)* {{0,3}}\[(?:\\.|[^\]\\\n])+\]:[ \t]*(?:\r?\n(?: {{0,3}}>[ \t]?)*[ \t]*)?(?:{link_dest})(?=[ \t\r]|$)",
         visible_text,
     )
     attrs = re.findall(r"""(?is)\b(?:src|href)\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))""", visible_text)
@@ -456,6 +517,29 @@ def atomic_swap_files(path_a, path_b):
     if err in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV, errno.EINVAL):
         return False
     raise OSError(err, os.strerror(err), path_b)
+
+
+def atomic_swap_files_at(dir_fd, name_a, name_b):
+    """Atomically exchange two existing entries within an open directory fd on macOS via renameatx_np(RENAME_SWAP).
+
+    Returns True on success, False if the platform/filesystem does not support atomic swap.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        fn = libc.renameatx_np
+        fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        fn.restype = ctypes.c_int
+    except Exception:
+        return False
+    rc = fn(int(dir_fd), os.fsencode(name_a), int(dir_fd), os.fsencode(name_b), 0x00000002)
+    if rc == 0:
+        return True
+    err = ctypes.get_errno()
+    if err in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV, errno.EINVAL):
+        return False
+    raise OSError(err, os.strerror(err), name_b)
 
 
 def make_unique_conflict_path(
@@ -560,7 +644,7 @@ def rewrite_note_asset_links(note_path, text, asset_copy_map):
     def rewrite_plain_segment(segment):
         out = re.sub(rf"(\]\(\s*)(?:<([^>\n]+)>|({bare_dest}))(?=[\s)])", repl_md, segment)
         out = re.sub(
-            rf"(?m)^((?: {{0,3}})\[(?:\\.|[^\]\\\n])+\]:[ \t]*(?:\r?\n[ \t]*)?)(?:<([^>\n]+)>|({bare_dest}))(?=[ \t\r]|$)",
+            rf"(?m)^((?:(?: {{0,3}}>[ \t]?)* {{0,3}})\[(?:\\.|[^\]\\\n])+\]:[ \t]*(?:\r?\n(?: {{0,3}}>[ \t]?)*[ \t]*)?)(?:<([^>\n]+)>|({bare_dest}))(?=[ \t\r]|$)",
             repl_md,
             out,
         )
@@ -1913,15 +1997,28 @@ class SyncPlugin:
 
     def _test_local_mirror(self):
         mirror_dir = self._resolve_mirror_dir()
+        probe_file = None
         try:
             os.makedirs(mirror_dir, exist_ok=True)
-            probe_file = os.path.join(mirror_dir, ".block-sync-probe")
-            with open(probe_file, "w", encoding="utf-8") as fh:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=mirror_dir,
+                prefix=".block-sync-probe-",
+                suffix=".tmp",
+                delete=False,
+            ) as fh:
+                probe_file = fh.name
                 fh.write("ok")
-            os.remove(probe_file)
             return True, self._tr(f"目录镜像可用: {mirror_dir}", f"Local mirror is available: {mirror_dir}")
         except Exception as exc:
             return False, self._tr(f"目录镜像不可写: {self._error_detail(exc)}", f"Local mirror is not writable: {self._error_detail(exc)}")
+        finally:
+            if probe_file:
+                try:
+                    os.unlink(probe_file)
+                except OSError:
+                    pass
 
     def _scan_mirror_files(self, mirror_dir, only_path=None, scope=None, excluded_subdirs=()):
         remote_files = {}
@@ -1971,150 +2068,492 @@ class SyncPlugin:
                     remote_files[rel] = fh.read()
         return remote_files
 
-    def _write_mirror_file(self, mirror_dir, rel_path, content, expected_hash=None, create_only=False, excluded_subdirs=(), verify_target=None):
+    def _open_verified_dir_fd(self, target_dir, expected_real=None, expected_real_stat=None, disallow_symlink=False):
+        if os.name == "nt":
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        if disallow_symlink:
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(target_dir, flags)
+        try:
+            st = os.fstat(fd)
+            if expected_real_stat is not None and (st.st_dev, st.st_ino) != expected_real_stat:
+                raise RuntimeError(self._tr(
+                    f"同步目标目录已被替换，已中止写入：{target_dir}",
+                    f"Sync target directory was replaced; write aborted: {target_dir}",
+                ))
+            if expected_real is not None and os.path.realpath(target_dir) != expected_real:
+                raise RuntimeError(self._tr(
+                    f"同步目标目录路径已变更，已中止写入：{target_dir}",
+                    f"Sync target directory path changed; write aborted: {target_dir}",
+                ))
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def _walk_dir_fd(self, root_fd, rel_parts, create_missing=False):
+        """Walk rel_parts strictly via open directory fds with O_NOFOLLOW; caller owns returned fd if != root_fd."""
+        cur_fd = root_fd
+        owned = False
+        o_dir = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            for part in rel_parts:
+                try:
+                    nxt = os.open(part, o_dir, dir_fd=cur_fd)
+                except FileNotFoundError:
+                    if not create_missing:
+                        raise
+                    try:
+                        os.mkdir(part, 0o755, dir_fd=cur_fd)
+                    except FileExistsError:
+                        pass
+                    nxt = os.open(part, o_dir, dir_fd=cur_fd)
+                if owned:
+                    os.close(cur_fd)
+                cur_fd = nxt
+                owned = True
+            return cur_fd, owned
+        except BaseException:
+            if owned:
+                os.close(cur_fd)
+            raise
+
+    def _preserve_external_temp_at(self, parent_fd, tmp_name, base_name, hash_hex, default_ext=""):
+        stem, ext = os.path.splitext(base_name)
+        use_ext = ext or default_ext
+        short = str(hash_hex or "unknown")[:8]
+        for idx in range(100):
+            suffix = "" if idx == 0 else f"-{idx}"
+            candidate = f"{stem}.conflict-external-{short}{suffix}{use_ext}"
+            try:
+                os.link(tmp_name, candidate, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                try:
+                    os.unlink(tmp_name, dir_fd=parent_fd)
+                except OSError:
+                    pass
+                return candidate
+            except FileExistsError:
+                continue
+            except OSError as err:
+                if err.errno not in (
+                    errno.EXDEV,
+                    errno.ENOTSUP,
+                    errno.EOPNOTSUPP,
+                    errno.ENOSYS,
+                    errno.EMLINK,
+                ):
+                    return ""
+                try:
+                    os.lstat(candidate, dir_fd=parent_fd)
+                    continue
+                except FileNotFoundError:
+                    pass
+                try:
+                    os.replace(tmp_name, candidate, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                    return candidate
+                except OSError:
+                    return ""
+        return ""
+
+    def _stash_candidates_for_root(self, root_dir, rel_path):
+        root_real = os.path.realpath(root_dir)
+        now_ms = int(time.time() * 1000)
+        base_name = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(rel_path))[:48] or "file"
+        tag = f"{now_ms:015d}-{sha256_text(rel_path)[:8]}-{base_name}"
+        try:
+            root_dev = os.stat(root_real).st_dev
+        except OSError:
+            root_dev = None
+        candidate_dirs = []
+        wt_root, git_dir = self._resolve_git_dir(root_real)
+        if git_dir:
+            try:
+                if root_dev is None or os.stat(git_dir).st_dev == root_dev:
+                    candidate_dirs.append((os.path.join(git_dir, "block-sync-replaced"), False, ""))
+            except OSError:
+                pass
+            stash_wt = wt_root or root_real
+            candidate_dirs.append((os.path.join(stash_wt, ".block-sync-replaced"), True, "/.block-sync-replaced/"))
+            candidate_dirs.append((os.path.join(stash_wt, ".block-sync-recovery"), True, "/.block-sync-recovery/"))
+        else:
+            candidate_dirs.append((os.path.join(root_real, ".block-sync-replaced"), False, ""))
+            candidate_dirs.append((os.path.join(root_real, ".block-sync-recovery"), False, ""))
+        return now_ms, tag, wt_root, git_dir, candidate_dirs
+
+    def _prune_stash_dir(self, stash_dir, cand_name, now_ms):
+        try:
+            cutoff_ms = now_ms - 60000
+            names = sorted(os.listdir(stash_dir))
+            if len(names) > 64:
+                for old_name in names[:-64]:
+                    if old_name == cand_name:
+                        continue
+                    ts_part = old_name.split("-", 1)[0]
+                    if ts_part.isdigit() and int(ts_part) >= cutoff_ms:
+                        continue
+                    try:
+                        os.unlink(os.path.join(stash_dir, old_name))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+    def _stash_replaced_inode_at(self, parent_fd, tmp_name, root_dir, rel_path):
+        """Move a swapped-out inode from parent_fd/tmp_name into a same-volume recovery dir without unlinking."""
+        now_ms, tag, wt_root, git_dir, candidate_dirs = self._stash_candidates_for_root(root_dir, rel_path)
+        for stash_dir, needs_exclude, excl_pat in candidate_dirs:
+            try:
+                if os.path.exists(stash_dir) and not os.path.isdir(stash_dir):
+                    continue
+                os.makedirs(stash_dir, exist_ok=True)
+                if needs_exclude and git_dir and excl_pat:
+                    self._ensure_git_info_exclude(wt_root, git_dir, excl_pat)
+                dest_stash = os.path.join(stash_dir, tag)
+                for idx in range(50):
+                    cand = dest_stash if idx == 0 else f"{dest_stash}-{idx}"
+                    if not os.path.exists(cand):
+                        os.replace(tmp_name, cand, src_dir_fd=parent_fd)
+                        self._prune_stash_dir(stash_dir, os.path.basename(cand), now_ms)
+                        return cand
+            except OSError:
+                continue
+        # Fallback inside parent_fd with non-.tmp name so stale temp cleanup never deletes it.
+        for idx in range(50):
+            fb = f".block-sync-keep-{tag}" + ("" if idx == 0 else f"-{idx}")
+            try:
+                os.lstat(fb, dir_fd=parent_fd)
+                continue
+            except FileNotFoundError:
+                pass
+            try:
+                os.replace(tmp_name, fb, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                if git_dir:
+                    self._ensure_git_info_exclude(wt_root, git_dir, ".block-sync-keep-*")
+                return fb
+            except OSError:
+                break
+        return tmp_name
+
+    def _link_existing_to_stash_at(self, parent_fd, base_name, root_dir, rel_path):
+        """Create a same-volume hard link to parent_fd/base_name in the recovery dir BEFORE rename on non-swap FS."""
+        now_ms, tag, wt_root, git_dir, candidate_dirs = self._stash_candidates_for_root(root_dir, rel_path)
+        for stash_dir, needs_exclude, excl_pat in candidate_dirs:
+            try:
+                if os.path.exists(stash_dir) and not os.path.isdir(stash_dir):
+                    continue
+                os.makedirs(stash_dir, exist_ok=True)
+                if needs_exclude and git_dir and excl_pat:
+                    self._ensure_git_info_exclude(wt_root, git_dir, excl_pat)
+                dest_stash = os.path.join(stash_dir, tag)
+                for idx in range(50):
+                    cand = dest_stash if idx == 0 else f"{dest_stash}-{idx}"
+                    try:
+                        os.link(base_name, cand, src_dir_fd=parent_fd)
+                        return cand, stash_dir, now_ms
+                    except FileExistsError:
+                        continue
+            except OSError:
+                continue
+        return "", "", now_ms
+
+    def _read_all_at(self, parent_fd, name):
+        fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
+        try:
+            chunks = []
+            while True:
+                buf = os.read(fd, 65536)
+                if not buf:
+                    break
+                chunks.append(buf)
+            return b"".join(chunks)
+        finally:
+            os.close(fd)
+
+    def _same_inode_at(self, parent_fd, name, want_stat):
+        if want_stat is None or not name:
+            return False
+        try:
+            st = os.lstat(name, dir_fd=parent_fd)
+            return st.st_dev == want_stat.st_dev and st.st_ino == want_stat.st_ino
+        except OSError:
+            return False
+
+    def _write_mirror_payload(
+        self,
+        mirror_dir,
+        rel_path,
+        raw_bytes,
+        is_text=False,
+        expected_hash=None,
+        create_only=False,
+        excluded_subdirs=(),
+        verify_target=None,
+        root_dir_fd=None,
+        change_err="",
+    ):
         if verify_target is not None:
             verify_target()
-        dest = self._safe_mirror_dest(mirror_dir, rel_path, excluded_subdirs=excluded_subdirs)
+        if is_text:
+            dest = self._safe_mirror_dest(mirror_dir, rel_path, excluded_subdirs=excluded_subdirs)
+            content_hash = sha256_text(raw_bytes.decode("utf-8", errors="replace"))
+            default_ext = ".md"
+        else:
+            dest = self._asset_file(mirror_dir, rel_path, excluded_subdirs=excluded_subdirs)
+            content_hash = sha256_bytes(raw_bytes)
+            default_ext = ""
+
+        def hash_bytes(b):
+            return sha256_text(b.decode("utf-8", errors="replace")) if is_text else sha256_bytes(b)
+
+        parts = rel_path.split("/")
+        dir_parts = parts[:-1]
+        base_name = parts[-1]
+        pid = os.getpid()
+
+        # POSIX dir_fd-anchored path (eliminates post-verify_target symlink swap TOCTOU).
+        if os.name != "nt":
+            opened_root_fd = None
+            parent_fd = None
+            parent_owned = False
+            tmp_name = None
+            our_tmp_stat = None
+            try:
+                if root_dir_fd is not None:
+                    base_fd = root_dir_fd
+                else:
+                    os.makedirs(mirror_dir, exist_ok=True)
+                    opened_root_fd = os.open(os.path.realpath(mirror_dir), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                    base_fd = opened_root_fd
+                parent_fd, parent_owned = self._walk_dir_fd(base_fd, dir_parts, create_missing=True)
+                # Create unique PID-tagged temp file directly inside parent_fd.
+                for idx in range(100):
+                    cand_tmp = f".block-sync-{pid}-{int(time.time() * 1000000)}-{idx}.tmp"
+                    try:
+                        tfd = os.open(
+                            cand_tmp,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                            0o644,
+                            dir_fd=parent_fd,
+                        )
+                        tmp_name = cand_tmp
+                        break
+                    except FileExistsError:
+                        continue
+                if tmp_name is None:
+                    raise RuntimeError(self._tr("无法创建临时文件", "Cannot allocate temporary file"))
+                try:
+                    view = memoryview(raw_bytes)
+                    written = 0
+                    while written < len(view):
+                        n = os.write(tfd, view[written:])
+                        if n <= 0:
+                            raise OSError("short write")
+                        written += n
+                    os.fsync(tfd)
+                    our_tmp_stat = os.fstat(tfd)
+                finally:
+                    os.close(tfd)
+
+                if create_only:
+                    try:
+                        os.link(tmp_name, base_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                        return
+                    except FileExistsError:
+                        if hash_bytes(self._read_all_at(parent_fd, base_name)) == content_hash:
+                            return
+                        raise RuntimeError(change_err)
+                    except OSError as err:
+                        if err.errno not in (
+                            errno.EXDEV,
+                            errno.ENOTSUP,
+                            errno.EOPNOTSUPP,
+                            errno.ENOSYS,
+                            errno.EMLINK,
+                        ):
+                            raise
+                        try:
+                            excl_fd = os.open(
+                                base_name,
+                                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                                0o644,
+                                dir_fd=parent_fd,
+                            )
+                        except FileExistsError:
+                            if hash_bytes(self._read_all_at(parent_fd, base_name)) == content_hash:
+                                return
+                            raise RuntimeError(change_err)
+                        try:
+                            with os.fdopen(excl_fd, "wb") as out_fh:
+                                out_fh.write(raw_bytes)
+                                out_fh.flush()
+                                os.fsync(out_fh.fileno())
+                        except BaseException:
+                            try:
+                                os.unlink(base_name, dir_fd=parent_fd)
+                            except OSError:
+                                pass
+                            raise
+                        return
+
+                if expected_hash is not None:
+                    try:
+                        existing_fd = os.open(
+                            base_name,
+                            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                            dir_fd=parent_fd,
+                        )
+                    except (FileNotFoundError, OSError):
+                        raise RuntimeError(change_err)
+                    try:
+                        if fcntl is not None:
+                            try:
+                                fcntl.flock(existing_fd, fcntl.LOCK_EX)
+                            except OSError as err:
+                                if err.errno not in (
+                                    errno.ENOTSUP,
+                                    errno.EOPNOTSUPP,
+                                    errno.ENOSYS,
+                                    errno.ENOLCK,
+                                    errno.EINVAL,
+                                ):
+                                    raise
+                        st_before = os.fstat(existing_fd)
+                        chunks = []
+                        while True:
+                            buf = os.read(existing_fd, 65536)
+                            if not buf:
+                                break
+                            chunks.append(buf)
+                        cur_hash = hash_bytes(b"".join(chunks))
+                        if cur_hash != expected_hash and cur_hash != content_hash:
+                            raise RuntimeError(change_err)
+                        try:
+                            st_now = os.lstat(base_name, dir_fd=parent_fd)
+                        except FileNotFoundError:
+                            raise RuntimeError(change_err)
+                        if (
+                            st_now.st_dev != st_before.st_dev
+                            or st_now.st_ino != st_before.st_ino
+                            or st_now.st_size != st_before.st_size
+                            or st_now.st_mtime_ns != st_before.st_mtime_ns
+                        ):
+                            raise RuntimeError(change_err)
+
+                        if atomic_swap_files_at(parent_fd, tmp_name, base_name):
+                            # tmp_name in parent_fd now holds the exact inode that lived at base_name.
+                            try:
+                                swapped_hash = hash_bytes(self._read_all_at(parent_fd, tmp_name))
+                            except OSError:
+                                swapped_hash = ""
+                            if swapped_hash != expected_hash and swapped_hash != content_hash:
+                                if atomic_swap_files_at(parent_fd, tmp_name, base_name):
+                                    if not self._same_inode_at(parent_fd, tmp_name, our_tmp_stat):
+                                        if atomic_swap_files_at(parent_fd, tmp_name, base_name):
+                                            if not self._same_inode_at(parent_fd, tmp_name, our_tmp_stat):
+                                                try:
+                                                    fin_hash = hash_bytes(self._read_all_at(parent_fd, tmp_name))
+                                                except OSError:
+                                                    fin_hash = ""
+                                                self._preserve_external_temp_at(parent_fd, tmp_name, base_name, fin_hash, default_ext=default_ext)
+                                                tmp_name = None
+                                        else:
+                                            try:
+                                                rb_hash = hash_bytes(self._read_all_at(parent_fd, tmp_name))
+                                            except OSError:
+                                                rb_hash = ""
+                                            self._preserve_external_temp_at(parent_fd, tmp_name, base_name, rb_hash, default_ext=default_ext)
+                                            tmp_name = None
+                                else:
+                                    self._preserve_external_temp_at(parent_fd, tmp_name, base_name, swapped_hash, default_ext=default_ext)
+                                    tmp_name = None
+                                raise RuntimeError(change_err)
+                            self._stash_replaced_inode_at(parent_fd, tmp_name, mirror_dir, rel_path)
+                            tmp_name = None
+                        else:
+                            # Non-swap filesystem (e.g. HFS+): preserve existing inode via same-volume hard link
+                            # BEFORE os.replace so an external editor holding an open fd never sees nlink drop to 0.
+                            stash_path, stash_dir, now_ms = self._link_existing_to_stash_at(
+                                parent_fd, base_name, mirror_dir, rel_path,
+                            )
+                            if not stash_path:
+                                raise RuntimeError(change_err)
+                            try:
+                                with open(stash_path, "rb") as sfh:
+                                    sbytes = sfh.read()
+                                    st_stash = os.fstat(sfh.fileno())
+                                if hash_bytes(sbytes) not in (expected_hash, content_hash):
+                                    raise RuntimeError(change_err)
+                                st_check = os.lstat(base_name, dir_fd=parent_fd)
+                                if (
+                                    st_check.st_dev != st_stash.st_dev
+                                    or st_check.st_ino != st_stash.st_ino
+                                    or st_check.st_size != st_stash.st_size
+                                    or st_check.st_mtime_ns != st_stash.st_mtime_ns
+                                ):
+                                    raise RuntimeError(change_err)
+                                os.replace(tmp_name, base_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                                tmp_name = None
+                                self._prune_stash_dir(stash_dir, os.path.basename(stash_path), now_ms)
+                            except BaseException:
+                                try:
+                                    os.unlink(stash_path)
+                                except OSError:
+                                    pass
+                                raise
+                    finally:
+                        os.close(existing_fd)
+                    return
+
+                os.replace(tmp_name, base_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                tmp_name = None
+                return
+            finally:
+                if tmp_name and parent_fd is not None and self._same_inode_at(parent_fd, tmp_name, our_tmp_stat):
+                    try:
+                        os.unlink(tmp_name, dir_fd=parent_fd)
+                    except OSError:
+                        pass
+                if parent_owned and parent_fd is not None:
+                    os.close(parent_fd)
+                if opened_root_fd is not None:
+                    os.close(opened_root_fd)
+
+        # Windows fallback path.
         parent = os.path.dirname(dest)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        content_hash = sha256_text(content)
-        change_err = self._tr(
-            f"目标文件已变更，已中止覆盖以避免数据丢失：{rel_path}",
-            f"Destination file changed during sync; aborted overwrite to protect data: {rel_path}",
-        )
         temp_path = None
         try:
             with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                newline="",
                 dir=parent or mirror_dir,
-                prefix=".block-sync-",
+                prefix=f".block-sync-{pid}-",
                 suffix=".tmp",
                 delete=False,
             ) as fh:
                 temp_path = fh.name
-                fh.write(content)
+                fh.write(raw_bytes)
                 fh.flush()
                 os.fsync(fh.fileno())
-            # Verify destination right before committing so edits or deletions after planning are never clobbered.
             if create_only:
                 try:
-                    os.link(temp_path, dest)
-                    return
+                    excl_fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
                 except FileExistsError:
-                    with open(dest, "r", encoding="utf-8", errors="replace", newline="") as existing_fh:
-                        if sha256_text(existing_fh.read()) == content_hash:
+                    with open(dest, "rb") as efh:
+                        if hash_bytes(efh.read()) == content_hash:
                             return
                     raise RuntimeError(change_err)
-                except OSError as err:
-                    # Only fall back to O_CREAT|O_EXCL when the filesystem lacks hardlink support.
-                    if err.errno not in (
-                        errno.EXDEV,
-                        errno.ENOTSUP,
-                        errno.EOPNOTSUPP,
-                        errno.ENOSYS,
-                        errno.EMLINK,
-                    ):
-                        raise
-                    try:
-                        excl_fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-                    except FileExistsError:
-                        with open(dest, "r", encoding="utf-8", errors="replace", newline="") as existing_fh:
-                            if sha256_text(existing_fh.read()) == content_hash:
-                                return
-                        raise RuntimeError(change_err)
-                    try:
-                        with os.fdopen(excl_fd, "w", encoding="utf-8", newline="") as out_fh:
-                            out_fh.write(content)
-                            out_fh.flush()
-                            os.fsync(out_fh.fileno())
-                    except BaseException:
-                        try:
-                            os.unlink(dest)
-                        except OSError:
-                            pass
-                        raise
-                    return
-            elif expected_hash is not None:
-                try:
-                    existing_fd = os.open(dest, os.O_RDONLY)
-                except FileNotFoundError:
-                    raise RuntimeError(change_err)
-                try:
-                    if fcntl is not None:
-                        try:
-                            fcntl.flock(existing_fd, fcntl.LOCK_EX)
-                        except OSError as err:
-                            if err.errno not in (
-                                errno.ENOTSUP,
-                                errno.EOPNOTSUPP,
-                                errno.ENOSYS,
-                                errno.ENOLCK,
-                                errno.EINVAL,
-                            ):
-                                raise
-                    st_before = os.fstat(existing_fd)
-                    chunks = []
-                    while True:
-                        buf = os.read(existing_fd, 65536)
-                        if not buf:
-                            break
-                        chunks.append(buf)
-                    cur_hash = sha256_text(b"".join(chunks).decode("utf-8", errors="replace"))
-                    if cur_hash != expected_hash and cur_hash != content_hash:
-                        raise RuntimeError(change_err)
-                    try:
-                        st_now = os.lstat(dest)
-                    except FileNotFoundError:
-                        raise RuntimeError(change_err)
-                    if (
-                        st_now.st_dev != st_before.st_dev
-                        or st_now.st_ino != st_before.st_ino
-                        or st_now.st_size != st_before.st_size
-                        or st_now.st_mtime_ns != st_before.st_mtime_ns
-                    ):
-                        raise RuntimeError(change_err)
-                    if os.name == "nt":
-                        os.close(existing_fd)
-                        existing_fd = -1
-                    if atomic_swap_files(temp_path, dest):
-                        # temp_path now holds the exact inode that lived at dest at the instant of swap.
-                        with open(temp_path, "r", encoding="utf-8", errors="replace", newline="") as swapped_fh:
-                            swapped_hash = sha256_text(swapped_fh.read())
-                        if swapped_hash != expected_hash and swapped_hash != content_hash:
-                            if atomic_swap_files(temp_path, dest):
-                                # Verify what came back into temp_path; if a second external save landed at dest
-                                # before rollback, restore that newest save to dest and preserve the other copy.
-                                with open(temp_path, "r", encoding="utf-8", errors="replace", newline="") as rb_fh:
-                                    rollback_hash = sha256_text(rb_fh.read())
-                                if rollback_hash != content_hash:
-                                    if atomic_swap_files(temp_path, dest):
-                                        with open(temp_path, "r", encoding="utf-8", errors="replace", newline="") as fin_fh:
-                                            final_hash = sha256_text(fin_fh.read())
-                                        if final_hash != content_hash:
-                                            self._preserve_external_temp(temp_path, dest, final_hash, default_ext=".md")
-                                            temp_path = None
-                                    else:
-                                        self._preserve_external_temp(temp_path, dest, rollback_hash, default_ext=".md")
-                                        temp_path = None
-                            else:
-                                self._preserve_external_temp(temp_path, dest, swapped_hash, default_ext=".md")
-                                temp_path = None
-                            raise RuntimeError(change_err)
-                        # Preserve the swapped-out old inode in a bounded same-volume recovery directory
-                        # rather than unlinking it, so any external editor holding an open fd that flushes
-                        # in-place writes after RENAME_SWAP remains recoverable on disk.
-                        self._stash_replaced_inode(temp_path, mirror_dir, rel_path)
-                        temp_path = None
-                    else:
-                        os.replace(temp_path, dest)
-                        temp_path = None
-                finally:
-                    if existing_fd >= 0:
-                        os.close(existing_fd)
+                with os.fdopen(excl_fd, "wb") as out_fh:
+                    out_fh.write(raw_bytes)
+                    out_fh.flush()
+                    os.fsync(out_fh.fileno())
                 return
+            if expected_hash is not None:
+                if not os.path.exists(dest):
+                    raise RuntimeError(change_err)
+                with open(dest, "rb") as efh:
+                    if hash_bytes(efh.read()) not in (expected_hash, content_hash):
+                        raise RuntimeError(change_err)
             os.replace(temp_path, dest)
             temp_path = None
         finally:
@@ -2123,6 +2562,49 @@ class SyncPlugin:
                     os.unlink(temp_path)
                 except OSError:
                     pass
+
+    def _write_mirror_file(
+        self,
+        mirror_dir,
+        rel_path,
+        content,
+        expected_hash=None,
+        create_only=False,
+        excluded_subdirs=(),
+        verify_target=None,
+        root_dir_fd=None,
+    ):
+        change_err = self._tr(
+            f"目标文件已变更，已中止覆盖以避免数据丢失：{rel_path}",
+            f"Destination file changed during sync; aborted overwrite to protect data: {rel_path}",
+        )
+        self._write_mirror_payload(
+            mirror_dir,
+            rel_path,
+            content.encode("utf-8"),
+            is_text=True,
+            expected_hash=expected_hash,
+            create_only=create_only,
+            excluded_subdirs=excluded_subdirs,
+            verify_target=verify_target,
+            root_dir_fd=root_dir_fd,
+            change_err=change_err,
+        )
+
+    def _pid_is_alive(self, pid):
+        if pid <= 0:
+            return False
+        if pid == os.getpid():
+            return True
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
 
     def _cleanup_stale_temp_files(self, root_dir, cfg=None):
         if not root_dir or not os.path.isdir(root_dir):
@@ -2164,18 +2646,25 @@ class SyncPlugin:
                 f"Could not scan directory; aborted commit: {detail}",
             ))
 
+        pid_tmp_re = re.compile(r"^\.block-sync-(\d+)-.*\.tmp$")
         for cur_root, dirs, file_names in os.walk(root_dir, onerror=on_walk_error):
-            dirs[:] = [d for d in dirs if d != ".git"]
+            # Skip .git metadata and any nested Git submodules or worktrees so their tracked files are never touched.
+            dirs[:] = [
+                d for d in dirs
+                if d != ".git" and not os.path.exists(os.path.join(cur_root, d, ".git"))
+            ]
             for name in file_names:
                 if name.startswith(".block-sync-") and name.endswith(".tmp"):
                     full = os.path.join(cur_root, name)
                     rel = os.path.relpath(full, root_dir).replace(os.sep, "/")
                     if rel in tracked_paths:
                         continue
+                    pm = pid_tmp_re.match(name)
+                    if pm and self._pid_is_alive(int(pm.group(1))):
+                        continue
                     try:
                         os.unlink(full)
                     except FileNotFoundError:
-                        # Already removed concurrently; nothing left to stage.
                         pass
                     except OSError as err:
                         detail = f"{rel} ({err})"
@@ -2184,146 +2673,33 @@ class SyncPlugin:
                             f"Could not clean up stale temporary files; aborted commit: {detail}",
                         ))
 
-    def _write_mirror_bytes(self, mirror_dir, rel_path, data, expected_hash=None, create_only=False, excluded_subdirs=(), verify_target=None):
-        if verify_target is not None:
-            verify_target()
-        dest = self._asset_file(mirror_dir, rel_path, excluded_subdirs=excluded_subdirs)
-        parent = os.path.dirname(dest)
-        os.makedirs(parent, exist_ok=True)
-        content_hash = sha256_bytes(data)
+    def _write_mirror_bytes(
+        self,
+        mirror_dir,
+        rel_path,
+        data,
+        expected_hash=None,
+        create_only=False,
+        excluded_subdirs=(),
+        verify_target=None,
+        root_dir_fd=None,
+    ):
         change_err = self._tr(
             f"附件在同步期间已变更，已中止覆盖以避免数据丢失：{rel_path}",
             f"Attachment changed during sync; aborted overwrite to protect data: {rel_path}",
         )
-        temp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                dir=parent,
-                prefix=".block-sync-",
-                suffix=".tmp",
-                delete=False,
-            ) as fh:
-                temp_path = fh.name
-                fh.write(data)
-                fh.flush()
-                os.fsync(fh.fileno())
-            if create_only:
-                try:
-                    os.link(temp_path, dest)
-                    return
-                except FileExistsError:
-                    with open(dest, "rb") as existing_fh:
-                        if sha256_bytes(existing_fh.read()) == content_hash:
-                            return
-                    raise RuntimeError(change_err)
-                except OSError as err:
-                    if err.errno not in (
-                        errno.EXDEV,
-                        errno.ENOTSUP,
-                        errno.EOPNOTSUPP,
-                        errno.ENOSYS,
-                        errno.EMLINK,
-                    ):
-                        raise
-                    try:
-                        excl_fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-                    except FileExistsError:
-                        with open(dest, "rb") as existing_fh:
-                            if sha256_bytes(existing_fh.read()) == content_hash:
-                                return
-                        raise RuntimeError(change_err)
-                    try:
-                        with os.fdopen(excl_fd, "wb") as out_fh:
-                            out_fh.write(data)
-                            out_fh.flush()
-                            os.fsync(out_fh.fileno())
-                    except BaseException:
-                        try:
-                            os.unlink(dest)
-                        except OSError:
-                            pass
-                        raise
-                    return
-            elif expected_hash is not None:
-                try:
-                    existing_fd = os.open(dest, os.O_RDONLY)
-                except FileNotFoundError:
-                    raise RuntimeError(change_err)
-                try:
-                    if fcntl is not None:
-                        try:
-                            fcntl.flock(existing_fd, fcntl.LOCK_EX)
-                        except OSError as err:
-                            if err.errno not in (
-                                errno.ENOTSUP,
-                                errno.EOPNOTSUPP,
-                                errno.ENOSYS,
-                                errno.ENOLCK,
-                                errno.EINVAL,
-                            ):
-                                raise
-                    st_before = os.fstat(existing_fd)
-                    chunks = []
-                    while True:
-                        buf = os.read(existing_fd, 65536)
-                        if not buf:
-                            break
-                        chunks.append(buf)
-                    cur_hash = sha256_bytes(b"".join(chunks))
-                    if cur_hash != expected_hash and cur_hash != content_hash:
-                        raise RuntimeError(change_err)
-                    try:
-                        st_now = os.lstat(dest)
-                    except FileNotFoundError:
-                        raise RuntimeError(change_err)
-                    if (
-                        st_now.st_dev != st_before.st_dev
-                        or st_now.st_ino != st_before.st_ino
-                        or st_now.st_size != st_before.st_size
-                        or st_now.st_mtime_ns != st_before.st_mtime_ns
-                    ):
-                        raise RuntimeError(change_err)
-                    if os.name == "nt":
-                        os.close(existing_fd)
-                        existing_fd = -1
-                    if atomic_swap_files(temp_path, dest):
-                        with open(temp_path, "rb") as swapped_fh:
-                            swapped_hash = sha256_bytes(swapped_fh.read())
-                        if swapped_hash != expected_hash and swapped_hash != content_hash:
-                            if atomic_swap_files(temp_path, dest):
-                                with open(temp_path, "rb") as rb_fh:
-                                    rollback_hash = sha256_bytes(rb_fh.read())
-                                if rollback_hash != content_hash:
-                                    if atomic_swap_files(temp_path, dest):
-                                        with open(temp_path, "rb") as fin_fh:
-                                            final_hash = sha256_bytes(fin_fh.read())
-                                        if final_hash != content_hash:
-                                            self._preserve_external_temp(temp_path, dest, final_hash)
-                                            temp_path = None
-                                    else:
-                                        self._preserve_external_temp(temp_path, dest, rollback_hash)
-                                        temp_path = None
-                            else:
-                                self._preserve_external_temp(temp_path, dest, swapped_hash)
-                                temp_path = None
-                            raise RuntimeError(change_err)
-                        self._stash_replaced_inode(temp_path, mirror_dir, rel_path)
-                        temp_path = None
-                    else:
-                        os.replace(temp_path, dest)
-                        temp_path = None
-                finally:
-                    if existing_fd >= 0:
-                        os.close(existing_fd)
-                return
-            os.replace(temp_path, dest)
-            temp_path = None
-        finally:
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                except OSError:
-                    pass
+        self._write_mirror_payload(
+            mirror_dir,
+            rel_path,
+            data,
+            is_text=False,
+            expected_hash=expected_hash,
+            create_only=create_only,
+            excluded_subdirs=excluded_subdirs,
+            verify_target=verify_target,
+            root_dir_fd=root_dir_fd,
+            change_err=change_err,
+        )
 
     # ---------- WebDAV Mode ----------
 
@@ -3279,6 +3655,50 @@ class SyncPlugin:
                     if fetch_proc.returncode != 0:
                         err = self._git_error_message(fetch_proc.stderr or fetch_proc.stdout, self._tr("fetch 失败", "Fetch failed"))
                         return False, self._tr(f"Git 拉取失败: {err}", f"Git pull failed: {err}")
+                    # Before resetting a managed clone to origin/<branch>, check for unpushed local commits
+                    # (e.g. from a prior push rejected by a receive hook or transient outage) so they are never lost.
+                    if self._is_managed_git_dir(repo_dir):
+                        local_ref = f"refs/heads/{branch}"
+                        remote_ref = f"refs/remotes/origin/{branch}"
+                        if self._run_git(["rev-parse", "--verify", local_ref], cwd=repo_dir, cfg=cfg).returncode == 0:
+                            ahead_p = self._run_git(["rev-list", "--count", f"{remote_ref}..{local_ref}"], cwd=repo_dir, cfg=cfg)
+                            behind_p = self._run_git(["rev-list", "--count", f"{local_ref}..{remote_ref}"], cwd=repo_dir, cfg=cfg)
+                            ahead_n = int((ahead_p.stdout or "0").strip() or "0") if ahead_p.returncode == 0 else 0
+                            behind_n = int((behind_p.stdout or "0").strip() or "0") if behind_p.returncode == 0 else 0
+                            if ahead_n > 0:
+                                if behind_n == 0:
+                                    retry_push = self._run_git_network(
+                                        ["push", "-u", "origin", f"{local_ref}:{local_ref}"],
+                                        cwd=repo_dir,
+                                        timeout=12,
+                                        cfg=cfg,
+                                        retries=2,
+                                        total_budget=22.0,
+                                    )
+                                    if retry_push.returncode == 0:
+                                        self._run_git_network(
+                                            ["fetch", "origin", f"refs/heads/{branch}:refs/remotes/origin/{branch}"],
+                                            cwd=repo_dir,
+                                            timeout=12,
+                                            cfg=cfg,
+                                            retries=1,
+                                            total_budget=15.0,
+                                        )
+                                    else:
+                                        backup_ref = f"pending-push-{branch}-{int(time.time())}"
+                                        self._run_git(["branch", "-f", backup_ref, local_ref], cwd=repo_dir, cfg=cfg)
+                                        err = self._git_error_message(retry_push.stderr or retry_push.stdout, self._tr("push 失败", "Push failed"))
+                                        return False, self._tr(
+                                            f"上次未推送的 Git 提交重试推送失败（已保留于分支 {backup_ref}）: {err}",
+                                            f"Retry push of pending Git commits failed (preserved on branch {backup_ref}): {err}",
+                                        )
+                                else:
+                                    backup_ref = f"pending-push-{branch}-{int(time.time())}"
+                                    self._run_git(["branch", "-f", backup_ref, local_ref], cwd=repo_dir, cfg=cfg)
+                                    return False, self._tr(
+                                        f"检测到 {ahead_n} 个尚未推送的本地提交与远端 {branch} 分叉，已保留于分支 {backup_ref}，请先处理分叉",
+                                        f"Found {ahead_n} unpushed local commits diverged from remote {branch}; preserved on branch {backup_ref}",
+                                    )
                     # Managed clone reflects remote HEAD directly; Block's 3-way sync planner resolves
                     # any divergence against the user's real notebook using the configured conflict_policy.
                     # Force-checkout when inside plugin-managed git-repos/ so leftover dirty files from an
@@ -3532,11 +3952,15 @@ class SyncPlugin:
             for np, txt in remote_notes.items():
                 referenced.update(note_asset_paths(np, txt))
             candidates = {p for p in candidates if self._matches_scope(p, scope)} | referenced
+        if excluded_subdirs:
+            candidates = {p for p in candidates if not in_sync_subdir(p, excluded_subdirs)}
 
         local_assets = {}
         remote_assets = {}
         remote_asset_etags = {}
         for rel in sorted(candidates):
+            if excluded_subdirs and in_sync_subdir(rel, excluded_subdirs):
+                continue
             ldata = self._read_asset_file(nb_root, rel)
             if ldata is not None:
                 local_assets[rel] = ldata
@@ -4077,6 +4501,45 @@ class SyncPlugin:
             items.append({"kind": "bulk_pull", "nb_label": nb_label, "count": m["pull_new"] + m["pull_total"]})
         return items
 
+    def _check_git_staged_conflicts(self, repo_root, rel_paths, cfg=None):
+        """Abort before writing or committing if any planned path already has independent staged changes in Git index."""
+        cleaned = sorted({p.replace("\\", "/").lstrip("/") for p in (rel_paths or []) if p})
+        if not cleaned or not repo_root or not self._has_git_marker(repo_root):
+            return
+        if self._is_managed_git_dir(repo_root):
+            return
+        # On unborn repo (no HEAD yet), diff --cached --name-only compares against empty tree via ls-files --cached.
+        has_head = self._run_git(["rev-parse", "--verify", "HEAD"], cwd=repo_root, cfg=cfg).returncode == 0
+        if has_head:
+            proc = subprocess.run(
+                ["git", "--literal-pathspecs", "diff", "--cached", "--name-only", "-z", "--", *cleaned],
+                cwd=repo_root,
+                env=self._git_env(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=8,
+            )
+        else:
+            proc = subprocess.run(
+                ["git", "--literal-pathspecs", "ls-files", "--cached", "-z", "--", *cleaned],
+                cwd=repo_root,
+                env=self._git_env(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=8,
+            )
+        if proc.returncode != 0:
+            err_txt = (proc.stderr or proc.stdout or b"").decode("utf-8", errors="replace")
+            err = self._error_detail(err_txt or self._tr("git 暂存区检查失败", "git staged index check failed"))
+            raise RuntimeError(self._tr(f"Git 暂存区检查失败: {err}", f"Git staged index check failed: {err}"))
+        staged_hits = sorted({os.fsdecode(raw).replace("\\", "/") for raw in (proc.stdout or b"").split(b"\0") if raw})
+        if staged_hits:
+            sample = ", ".join(staged_hits[:3]) + ("..." if len(staged_hits) > 3 else "")
+            raise RuntimeError(self._tr(
+                f"Git 暂存区已有这些文件的待提交改动，请先提交或取消暂存后再同步：{sample}",
+                f"Git index already has staged changes for planned sync files; commit or unstage them first: {sample}",
+            ))
+
     def _commit_and_push_git(self, repo_root, cfg, staged_rel_paths=None, tracked_plan_paths=None):
         # Remove any stale untracked atomic-write temp files left behind by a prior SIGKILL cancellation
         # so they can never be staged or pushed to the remote repository.
@@ -4157,6 +4620,7 @@ class SyncPlugin:
                     i += 1
 
         rel_paths = sorted(written | dirty_tracked)
+        self._check_git_staged_conflicts(repo_root, rel_paths, cfg=cfg)
         did_commit = False
         if rel_paths:
             # Find which planned paths are untracked so we can intent-to-add ONLY those,
@@ -4275,27 +4739,45 @@ class SyncPlugin:
                         f"笔记本「{self._notebook_label(prev_nb)}」与「{self._notebook_label(nb)}」的同步目标目录指向同一或嵌套物理目录，已中止同步",
                         f"Sync folders for {self._notebook_label(prev_nb)} and {self._notebook_label(nb)} resolve to the same or nested directory; sync aborted",
                     )
-            stat_id = None
+            lstat_id = None
             try:
-                st = os.lstat(tdir)
-                stat_id = (st.st_dev, st.st_ino)
+                lst = os.lstat(tdir)
+                lstat_id = (lst.st_dev, lst.st_ino)
             except FileNotFoundError:
-                stat_id = None
+                lstat_id = None
+            real_stat_id = None
+            try:
+                rst = os.stat(treal)
+                real_stat_id = (rst.st_dev, rst.st_ino)
+            except FileNotFoundError:
+                real_stat_id = None
             if expected_identities and nb in expected_identities:
                 exp = expected_identities[nb]
                 exp_real = exp.get("real")
-                exp_stat = exp.get("stat_id")
+                exp_lstat = exp.get("lstat_id")
+                exp_real_stat = exp.get("real_stat_id")
                 if exp_real and treal != exp_real:
                     return {}, self._tr(
                         f"笔记本「{self._notebook_label(nb)}」的同步目标目录在执行期间已变更，已中止同步",
                         f"Sync target folder for {self._notebook_label(nb)} changed during execution; sync aborted",
                     )
-                if exp_stat is not None and stat_id != exp_stat:
+                if exp_lstat is not None and lstat_id != exp_lstat:
                     return {}, self._tr(
                         f"笔记本「{self._notebook_label(nb)}」的同步目标目录已被替换，已中止同步",
                         f"Sync target folder for {self._notebook_label(nb)} was replaced during execution; sync aborted",
                     )
-            identities[nb] = {"sub": sub, "tdir": tdir, "real": treal, "stat_id": stat_id}
+                if exp_real_stat is not None and real_stat_id != exp_real_stat:
+                    return {}, self._tr(
+                        f"笔记本「{self._notebook_label(nb)}」的同步目标实体目录已被替换，已中止同步",
+                        f"Physical sync target directory for {self._notebook_label(nb)} was replaced during execution; sync aborted",
+                    )
+            identities[nb] = {
+                "sub": sub,
+                "tdir": tdir,
+                "real": treal,
+                "lstat_id": lstat_id,
+                "real_stat_id": real_stat_id,
+            }
             resolved_targets.append((nb, sub, treal))
         return identities, ""
 
@@ -4318,6 +4800,7 @@ class SyncPlugin:
         batch_bindings = plan.get("batch_bindings") or {}
         target_identities = dict(plan.get("target_identities") or {})
         written_remote_paths = []
+        active_target_fd = [None]
 
         def verify_target():
             if protocol not in ("local_mirror", "git") or not batch_base_root:
@@ -4328,10 +4811,15 @@ class SyncPlugin:
                 )
                 if v_err:
                     raise RuntimeError(v_err)
-                # Once target_dir exists, pin its stat_id so any later swap during execution is also caught.
+                # Once target_dir exists, pin its lstat_id & real_stat_id so any later swap is caught.
                 for k_nb, info in fresh_ids.items():
-                    if k_nb in target_identities and target_identities[k_nb].get("stat_id") is None and info.get("stat_id") is not None:
-                        target_identities[k_nb] = dict(info)
+                    if k_nb in target_identities:
+                        cur = dict(target_identities[k_nb])
+                        if cur.get("lstat_id") is None and info.get("lstat_id") is not None:
+                            cur["lstat_id"] = info["lstat_id"]
+                        if cur.get("real_stat_id") is None and info.get("real_stat_id") is not None:
+                            cur["real_stat_id"] = info["real_stat_id"]
+                        target_identities[k_nb] = cur
             elif subdir and os.path.islink(target_dir):
                 raise RuntimeError(self._tr(
                     f"同步目标子目录是符号链接，已中止同步：{subdir}",
@@ -4352,6 +4840,7 @@ class SyncPlugin:
                     create_only=create_only,
                     excluded_subdirs=excluded_subdirs,
                     verify_target=verify_target,
+                    root_dir_fd=active_target_fd[0],
                 )
                 record_remote_path(rel)
             def write_remote_asset(rel, data, expected_hash=None, create_only=False):
@@ -4363,6 +4852,7 @@ class SyncPlugin:
                     create_only=create_only,
                     excluded_subdirs=excluded_subdirs,
                     verify_target=verify_target,
+                    root_dir_fd=active_target_fd[0],
                 )
                 record_remote_path(rel)
         elif protocol == "webdav":
@@ -4401,6 +4891,7 @@ class SyncPlugin:
                     create_only=create_only,
                     excluded_subdirs=excluded_subdirs,
                     verify_target=verify_target,
+                    root_dir_fd=active_target_fd[0],
                 )
                 record_remote_path(rel)
             def write_remote_asset(rel, data, expected_hash=None, create_only=False):
@@ -4412,6 +4903,7 @@ class SyncPlugin:
                     create_only=create_only,
                     excluded_subdirs=excluded_subdirs,
                     verify_target=verify_target,
+                    root_dir_fd=active_target_fd[0],
                 )
                 record_remote_path(rel)
 
@@ -4434,6 +4926,34 @@ class SyncPlugin:
                     verify_target()
                     os.makedirs(target_dir, exist_ok=True)
                     verify_target()
+                    exp_info = target_identities.get(nb_root) or {}
+                    active_target_fd[0] = self._open_verified_dir_fd(
+                        target_dir,
+                        expected_real=exp_info.get("real"),
+                        expected_real_stat=exp_info.get("real_stat_id"),
+                        disallow_symlink=bool(subdir),
+                    )
+                if protocol == "git" and plan.get("repo_root"):
+                    sub_prefix = f"{subdir.strip('/')}/" if subdir.strip("/") else ""
+                    planned_git_writes = []
+                    for p in plan["to_push_new"]:
+                        planned_git_writes.append(f"{sub_prefix}{p}")
+                    for p in plan["to_push_overwrite"]:
+                        planned_git_writes.append(f"{sub_prefix}{p}")
+                    for p, cp, _ in plan["conflicts"]:
+                        planned_git_writes.append(f"{sub_prefix}{p}")
+                        planned_git_writes.append(f"{sub_prefix}{cp}")
+                    for _, cp, _ in (plan.get("asset_view_copies") or ()):
+                        planned_git_writes.append(f"{sub_prefix}{cp}")
+                    for p in (plan.get("assets_to_push_new") or ()):
+                        planned_git_writes.append(f"{sub_prefix}{p}")
+                    for p, _ in (plan.get("assets_to_push_overwrite") or ()):
+                        planned_git_writes.append(f"{sub_prefix}{p}")
+                    for p, cp in (plan.get("asset_conflicts") or ()):
+                        planned_git_writes.append(f"{sub_prefix}{p}")
+                        planned_git_writes.append(f"{sub_prefix}{cp}")
+                    if planned_git_writes:
+                        self._check_git_staged_conflicts(plan["repo_root"], planned_git_writes, cfg=cfg)
                 # 1. Planned attachment sync (with conditional verification and conflict-copy mapping).
                 for rel in plan.get("assets_synced") or ():
                     if rel in local_assets:
@@ -4639,6 +5159,13 @@ class SyncPlugin:
                 except Exception:
                     pass
             raise
+        finally:
+            if active_target_fd[0] is not None:
+                try:
+                    os.close(active_target_fd[0])
+                except OSError:
+                    pass
+                active_target_fd[0] = None
 
         synced_repo_paths = []
         if protocol == "git":
@@ -4744,7 +5271,11 @@ class SyncPlugin:
             plan["target_identities"] = {k: dict(v) for k, v in target_identities.items()}
             plans.append(plan)
 
-        fp = sha256_text(json.dumps([p["fingerprint"] for p in plans], ensure_ascii=False))
+        phys_fp = [
+            [nb, info.get("real"), list(info["real_stat_id"]) if info.get("real_stat_id") is not None else None]
+            for nb, info in sorted(target_identities.items())
+        ]
+        fp = sha256_text(json.dumps({"plans": [p["fingerprint"] for p in plans], "targets": phys_fp}, ensure_ascii=False))
         return {
             "cfg": dict(cfg),
             "protocol": protocol,
@@ -4817,12 +5348,13 @@ class SyncPlugin:
                     total=total_items if total_items > 0 else None,
                     label=self._tr("推送 Git…", "Pushing Git…"),
                 )
-            did_push = self._commit_and_push_git(
-                batch["repo_root"],
-                cfg,
-                staged_rel_paths=staged_git_paths,
-                tracked_plan_paths=tracked_git_paths,
-            )
+            with self._target_lock(batch["repo_root"]):
+                did_push = self._commit_and_push_git(
+                    batch["repo_root"],
+                    cfg,
+                    staged_rel_paths=staged_git_paths,
+                    tracked_plan_paths=tracked_git_paths,
+                )
             for mk, updated_base in pending_base_maps:
                 self.sync_meta[mk] = updated_base
 
@@ -4993,6 +5525,7 @@ class SyncPlugin:
         return reason_items
 
     def _run_sync(self, bridge, only_path=None, only_nb_root=None, confirmed=False, approved_batch=None, report_progress=False):
+        self._last_sync_outcome = "skipped"
         self._refresh_known_notebooks(bridge)
         protocol = self.config.get("protocol", "local_mirror")
         target_error = self._target_error(self.config)
@@ -5048,6 +5581,7 @@ class SyncPlugin:
         if not confirmed:
             reason_items = self._assess_batch_dangerous_changes(batch, self.config, saved_path=only_path)
             if reason_items:
+                self._last_sync_outcome = "pending_confirm"
                 first_reason = self._format_reason_item(reason_items[0])
                 if only_path is not None:
                     cta = (
@@ -5096,6 +5630,7 @@ class SyncPlugin:
             self.last_status = msg
             raise RuntimeError(msg) from exc
 
+        self._last_sync_outcome = "synced"
         self._last_synced_notebooks = [p["nb_root"] for p in batch.get("plans") or () if p.get("nb_root")]
         self._save_runtime(bridge)
         self.last_status = msg
@@ -5827,13 +6362,15 @@ class SyncPlugin:
             event_name = str(params.get("event") or "")
             rel_path = str(params.get("path") or "").replace("\\", "/")
             event_nb = self._norm_nb_path(params.get("notebook_root") or self.notebook_root)
+            outcome = "skipped"
             if event_name == "note.saved" and self.config["auto_sync"] and is_safe_rel_md(rel_path) and self._matches_scope(rel_path):
                 self._refresh_known_notebooks(bridge)
                 if not self._target_error(self.config):
                     selected = self._selected_notebooks(self.config)
                     if not self.supports_multi_notebook or (event_nb and event_nb in selected):
                         self._run_sync(bridge, only_path=rel_path, only_nb_root=event_nb or None)
-            return {"handled": True}
+                        outcome = getattr(self, "_last_sync_outcome", "synced")
+            return {"handled": True, "outcome": outcome}
 
         if method == "plugin.shutdown":
             return {"ok": True}
