@@ -7785,6 +7785,8 @@ class SyncPlugin:
                 if not self._target_error(self.config):
                     selected = self._selected_notebooks(self.config)
                     if not self.supports_multi_notebook or (event_nb and event_nb in selected):
+                        if self.pending_confirm:
+                            return {"handled": True, "outcome": "pending_confirm"}
                         self._run_sync(bridge, only_path=rel_path, only_nb_root=event_nb or None)
                         outcome = getattr(self, "_last_sync_outcome", "synced")
             return {"handled": True, "outcome": outcome}
