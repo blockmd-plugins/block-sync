@@ -1740,11 +1740,25 @@ class SyncPlugin:
             cur = parent
         return "", ""
 
-    def _ensure_git_info_exclude(self, git_dir, pattern):
+    def _ensure_git_info_exclude(self, wt_root, git_dir, pattern):
         try:
-            info_dir = os.path.join(git_dir, "info")
-            os.makedirs(info_dir, exist_ok=True)
-            exclude_path = os.path.join(info_dir, "exclude")
+            exclude_path = ""
+            if wt_root and shutil.which("git"):
+                proc = subprocess.run(
+                    ["git", "rev-parse", "--git-path", "info/exclude"],
+                    cwd=wt_root,
+                    env=self._git_env(),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=5,
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    raw_path = proc.stdout.strip()
+                    exclude_path = raw_path if os.path.isabs(raw_path) else os.path.join(wt_root, raw_path)
+            if not exclude_path:
+                exclude_path = os.path.join(git_dir, "info", "exclude")
+            os.makedirs(os.path.dirname(exclude_path), exist_ok=True)
             existing = ""
             if os.path.isfile(exclude_path):
                 with open(exclude_path, "r", encoding="utf-8", errors="replace") as fh:
@@ -1762,62 +1776,86 @@ class SyncPlugin:
         """Move a swapped-out inode into a bounded same-volume recovery dir without unlinking it.
 
         Preserves the exact inode so an external editor holding an open fd that flushes in-place
-        writes after RENAME_SWAP still lands safely on disk inside the recovery directory.
+        writes after RENAME_SWAP still lands safely on disk. If the primary recovery directory is
+        blocked (e.g. a regular file named .block-sync-replaced exists), falls back to a dot-prefixed
+        recovery file beside temp_path that does not end with .tmp (avoiding stale temp cleanup).
         """
         if not temp_path or not os.path.exists(temp_path):
             return ""
         root_real = os.path.realpath(root_dir)
-        stash_dir = ""
+        now_ms = int(time.time() * 1000)
+        base_name = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(rel_path))[:48] or "file"
+        tag = f"{now_ms:015d}-{sha256_text(rel_path)[:8]}-{base_name}"
+
         try:
             root_dev = os.stat(root_real).st_dev
         except OSError:
             root_dev = None
+
+        candidate_dirs = []
         wt_root, git_dir = self._resolve_git_dir(root_real)
         if git_dir:
             try:
                 if root_dev is None or os.stat(git_dir).st_dev == root_dev:
-                    stash_dir = os.path.join(git_dir, "block-sync-replaced")
+                    candidate_dirs.append((os.path.join(git_dir, "block-sync-replaced"), False, ""))
             except OSError:
                 pass
-            if not stash_dir:
-                # Cross-volume separate git dir: stash on same volume and exclude from git status locally.
-                stash_dir = os.path.join(wt_root or root_real, ".block-sync-replaced")
-                self._ensure_git_info_exclude(git_dir, "/.block-sync-replaced/")
-        if not stash_dir:
-            stash_dir = os.path.join(root_real, ".block-sync-replaced")
-        try:
-            os.makedirs(stash_dir, exist_ok=True)
-            now_ms = int(time.time() * 1000)
-            base_name = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(rel_path))[:48] or "file"
-            tag = f"{now_ms:015d}-{sha256_text(rel_path)[:8]}-{base_name}"
-            dest_stash = os.path.join(stash_dir, tag)
-            for idx in range(50):
-                cand = dest_stash if idx == 0 else f"{dest_stash}-{idx}"
-                if not os.path.exists(cand):
-                    os.replace(temp_path, cand)
-                    # Prune oldest stashed entries by stash-entry timestamp (filename prefix), never pruning
-                    # the freshly stashed inode or entries stashed within the last 60 seconds.
-                    try:
-                        cutoff_ms = now_ms - 60000
-                        names = sorted(os.listdir(stash_dir))
-                        cand_name = os.path.basename(cand)
-                        if len(names) > 64:
-                            for old_name in names[:-64]:
-                                if old_name == cand_name:
-                                    continue
-                                ts_part = old_name.split("-", 1)[0]
-                                if ts_part.isdigit() and int(ts_part) >= cutoff_ms:
-                                    continue
-                                try:
-                                    os.unlink(os.path.join(stash_dir, old_name))
-                                except OSError:
-                                    pass
-                    except OSError:
-                        pass
-                    return cand
-        except OSError:
-            return ""
-        return ""
+            stash_wt = wt_root or root_real
+            candidate_dirs.append((os.path.join(stash_wt, ".block-sync-replaced"), True, "/.block-sync-replaced/"))
+            candidate_dirs.append((os.path.join(stash_wt, ".block-sync-recovery"), True, "/.block-sync-recovery/"))
+        else:
+            candidate_dirs.append((os.path.join(root_real, ".block-sync-replaced"), False, ""))
+            candidate_dirs.append((os.path.join(root_real, ".block-sync-recovery"), False, ""))
+
+        for stash_dir, needs_exclude, excl_pat in candidate_dirs:
+            try:
+                if os.path.exists(stash_dir) and not os.path.isdir(stash_dir):
+                    continue
+                os.makedirs(stash_dir, exist_ok=True)
+                if needs_exclude and git_dir and excl_pat:
+                    self._ensure_git_info_exclude(wt_root, git_dir, excl_pat)
+                dest_stash = os.path.join(stash_dir, tag)
+                for idx in range(50):
+                    cand = dest_stash if idx == 0 else f"{dest_stash}-{idx}"
+                    if not os.path.exists(cand):
+                        os.replace(temp_path, cand)
+                        # Prune oldest entries beyond 64 by stash-entry timestamp prefix, never pruning
+                        # the freshly stashed inode or entries stashed within the last 60 seconds.
+                        try:
+                            cutoff_ms = now_ms - 60000
+                            names = sorted(os.listdir(stash_dir))
+                            cand_name = os.path.basename(cand)
+                            if len(names) > 64:
+                                for old_name in names[:-64]:
+                                    if old_name == cand_name:
+                                        continue
+                                    ts_part = old_name.split("-", 1)[0]
+                                    if ts_part.isdigit() and int(ts_part) >= cutoff_ms:
+                                        continue
+                                    try:
+                                        os.unlink(os.path.join(stash_dir, old_name))
+                                    except OSError:
+                                        pass
+                        except OSError:
+                            pass
+                        return cand
+            except OSError:
+                continue
+
+        # Final same-directory fallback: rename temp_path to a dot-prefixed recovery filename that does NOT
+        # end with ".tmp" so _cleanup_stale_temp_files will never delete it.
+        fallback_dir = os.path.dirname(temp_path) or root_real
+        for idx in range(50):
+            fb = os.path.join(fallback_dir, f".block-sync-keep-{tag}" + ("" if idx == 0 else f"-{idx}"))
+            if not os.path.exists(fb):
+                try:
+                    os.replace(temp_path, fb)
+                    if git_dir:
+                        self._ensure_git_info_exclude(wt_root, git_dir, ".block-sync-keep-*")
+                    return fb
+                except OSError:
+                    break
+        return temp_path
 
     def _preserve_external_temp(self, temp_path, dest, hash_hex, default_ext=""):
         stem, ext = os.path.splitext(dest)
@@ -2060,8 +2098,8 @@ class SyncPlugin:
                         # Preserve the swapped-out old inode in a bounded same-volume recovery directory
                         # rather than unlinking it, so any external editor holding an open fd that flushes
                         # in-place writes after RENAME_SWAP remains recoverable on disk.
-                        if self._stash_replaced_inode(temp_path, mirror_dir, rel_path):
-                            temp_path = None
+                        self._stash_replaced_inode(temp_path, mirror_dir, rel_path)
+                        temp_path = None
                     else:
                         os.replace(temp_path, dest)
                         temp_path = None
@@ -2082,11 +2120,13 @@ class SyncPlugin:
         if not root_dir or not os.path.isdir(root_dir):
             return
         tracked_paths = set()
-        if os.path.isdir(os.path.join(root_dir, ".git")):
+        wt_root, git_dir = self._resolve_git_dir(root_dir)
+        if git_dir:
             # Read git ls-files -z in binary mode so filenames containing '\r' are preserved verbatim.
+            # Supports both regular .git directories and .git pointer files (--separate-git-dir / worktrees).
             ls_proc = subprocess.run(
                 ["git", "ls-files", "-z"],
-                cwd=root_dir,
+                cwd=wt_root or root_dir,
                 env=self._git_env(),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -2097,9 +2137,17 @@ class SyncPlugin:
                 stderr_txt = (ls_proc.stderr or ls_proc.stdout or b"").decode("utf-8", errors="replace")
                 err = self._error_detail(stderr_txt or self._tr("git ls-files 失败", "git ls-files failed"))
                 raise RuntimeError(self._tr(f"Git 文件列表检查失败: {err}", f"Git file list check failed: {err}"))
+            wt_real = os.path.realpath(wt_root or root_dir)
+            root_real = os.path.realpath(root_dir)
             for raw_entry in (ls_proc.stdout or b"").split(b"\0"):
                 if raw_entry:
-                    tracked_paths.add(os.fsdecode(raw_entry).replace(os.sep, "/"))
+                    full_tracked = os.path.join(wt_real, os.fsdecode(raw_entry))
+                    try:
+                        rel_tracked = os.path.relpath(full_tracked, root_real).replace(os.sep, "/")
+                    except ValueError:
+                        continue
+                    if not rel_tracked.startswith("../"):
+                        tracked_paths.add(rel_tracked)
 
         def on_walk_error(err):
             detail = f"{err.filename or root_dir} ({err})"
@@ -2249,8 +2297,8 @@ class SyncPlugin:
                                 self._preserve_external_temp(temp_path, dest, swapped_hash)
                                 temp_path = None
                             raise RuntimeError(change_err)
-                        if self._stash_replaced_inode(temp_path, mirror_dir, rel_path):
-                            temp_path = None
+                        self._stash_replaced_inode(temp_path, mirror_dir, rel_path)
+                        temp_path = None
                     else:
                         os.replace(temp_path, dest)
                         temp_path = None
