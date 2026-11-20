@@ -101,6 +101,10 @@ class SyncStateError(RuntimeError):
     pass
 
 
+class SyncReportedError(RuntimeError):
+    pass
+
+
 class HostBridge:
     """Line-delimited JSON-RPC 2.0 bridge between plugin and Block host."""
 
@@ -162,10 +166,11 @@ class HostBridge:
                 if method == "plugin.shutdown":
                     break
             except Exception as exc:
+                code = -32008 if isinstance(exc, (SyncReportedError, SyncStateError)) else -32000
                 self.send({
                     "jsonrpc": "2.0",
                     "id": req_id,
-                    "error": {"code": -32000, "message": localize_error(str(exc))},
+                    "error": {"code": code, "message": localize_error(str(exc))},
                 })
 
 
@@ -1736,16 +1741,21 @@ class SyncPlugin:
                     bridge.call_host("host.storage.set", {"key": key, "value": value})
         except (RuntimeError, OSError) as exc:
             if self._result_notice:
-                status, conflicts = self._result_notice
-                if status not in ("失败", "待确认") and not conflicts:
-                    self._result_notice = ("失败", 0)
+                status, _ = self._result_notice
+                if status == "待确认":
+                    self._clear_pending_confirm()
+                self._result_notice = ("状态未保存", 0)
             self.last_status = self._tr("同步状态未保存，请检查后重试", "Sync state could not be saved. Check settings and retry.")
             raise SyncStateError(self.last_status) from exc
         finally:
             self._send_result_notice(bridge)
 
     def _result_key(self):
-        return "__multi__" if self.supports_multi_notebook else self._notebook_key()
+        if self.supports_multi_notebook and (
+            "selected_notebooks" in (self._stored_global or {}) or "__multi__" in self.pending_confirms
+        ):
+            return "__multi__"
+        return self._notebook_key()
 
     def _record_result(self, status, summary, protocol=None, target="", pushed=0, pulled=0, conflicts=0, assets=0):
         nb_key = self._result_key()
@@ -1800,8 +1810,10 @@ class SyncPlugin:
         if not notice or not self.supports_system or not self.config["system_notifications"]:
             return
         status, conflicts = notice
-        if status == "失败":
+        if status in ("失败", "状态未保存"):
             title = self._tr("同步失败", "Sync failed")
+            if status == "状态未保存":
+                title = self._tr("同步状态未保存", "Sync state could not be saved")
             body = self._tr("打开 Block 同步设置查看详情。", "Open Block Sync settings for details.")
             tone = "error"
         elif conflicts:
@@ -6977,7 +6989,7 @@ class SyncPlugin:
                 self._record_result("失败", msg, protocol=protocol)
                 self._save_runtime(bridge)
                 self.last_status = msg
-                raise RuntimeError(msg) from exc
+                raise SyncReportedError(msg) from exc
 
         if batch.get("remote_error"):
             msg = batch["remote_error"]
@@ -6985,7 +6997,7 @@ class SyncPlugin:
             self._record_result("失败", msg, protocol=protocol, target=batch["target_display"])
             self._save_runtime(bridge)
             self.last_status = msg
-            raise RuntimeError(msg)
+            raise SyncReportedError(msg)
 
         if not confirmed:
             reason_items = self._assess_batch_dangerous_changes(batch, self.config, saved_path=only_path)
@@ -7037,7 +7049,7 @@ class SyncPlugin:
             self._record_result("失败", msg, protocol=protocol, target=batch["target_display"])
             self._save_runtime(bridge)
             self.last_status = msg
-            raise RuntimeError(msg) from exc
+            raise SyncReportedError(msg) from exc
 
         self._last_sync_outcome = "synced"
         self._last_synced_notebooks = [p["nb_root"] for p in batch.get("plans") or () if p.get("nb_root")]
@@ -7597,16 +7609,18 @@ class SyncPlugin:
                 tone = "success"
             elif action_id == "forget_credential" and self.supports_system:
                 field = {"git": "git_token", "webdav": "webdav_pass"}.get(self.config["protocol"])
-                if field and values.get("protocol", self.config["protocol"]) == self.config["protocol"]:
+                draft = self._normalize_config(values)
+                if (field and draft["protocol"] == self.config["protocol"] and
+                        self._credential_target(draft, field) == self._credential_target(self.config, field)):
                     self._save_config(bridge, forget=field, clear_pending=True)
                     status = self._tr("已清除此目标的同步凭据", "Sync credential cleared for this destination")
                     if self._credential_cleanup:
                         status = self._tr("已取消使用此目标的凭据，系统凭据库中的删除将重试", "Sync will stop using this credential. Deletion from the system store will be retried.")
                     tone = "success"
                 else:
-                    status = self._tr("请先保存同步方式", "Save the sync method first")
-                    tone = "warning"
-                    ok = False
+                    status = self._tr("请先保存同步目标和账号", "Save the sync destination and account first")
+                    return {"ok": False, "tone": "warning", "status": status,
+                            "page": self.build_page(cfg=draft), "values": self._config_values(draft)}
                 self.last_status = status
             elif action_id == "test_conn":
                 next_cfg = self._normalize_config(values)
@@ -7821,6 +7835,39 @@ class SyncPlugin:
         raise RuntimeError(f"unsupported method: {method}")
 
     def _sync_after_system_event(self, bridge, event_name, params):
+        self._refresh_known_notebooks(bridge)
+        if not self.supports_multi_notebook or "selected_notebooks" in (self._stored_global or {}):
+            return self._sync_system_target(bridge, event_name, params)
+        if "__multi__" in self.pending_confirms:
+            return {"handled": True, "outcome": "skipped"}
+
+        active = self.notebook_root, self.config, self.pending_confirm, self.last_status
+        active_key = self._notebook_key()
+        outcomes = set()
+        synced = []
+        deadline = time.monotonic() + 95
+        try:
+            for notebook in self.known_notebooks:
+                root = notebook["path"]
+                key = self._notebook_key(root)
+                saved = self.notebook_configs.get(key, self._stored_global if key == active_key else None)
+                if saved is None:
+                    continue
+                if time.monotonic() >= deadline:
+                    break
+                self.notebook_root = root
+                self.config = dict(saved, selected_notebooks=[root])
+                self.pending_confirm = self.pending_confirms.get(self._result_key())
+                result = self._sync_system_target(bridge, event_name, params, deadline)
+                outcomes.add(result["outcome"])
+                synced.extend(result.get("synced_notebooks") or ())
+        finally:
+            self.notebook_root, self.config, self.pending_confirm, self.last_status = active
+            self.pending_confirm = self.pending_confirms.get(self._result_key())
+        outcome = next((value for value in ("state_error", "failed", "pending_confirm", "synced") if value in outcomes), "skipped")
+        return {"handled": True, "outcome": outcome, "synced_notebooks": synced}
+
+    def _sync_system_target(self, bridge, event_name, params, deadline=None):
         skipped = {"handled": True, "outcome": "skipped"}
         if not self.config["auto_sync"] or self.pending_confirm:
             return skipped
@@ -7833,20 +7880,19 @@ class SyncPlugin:
             return skipped
         if event_name == "system.wake" and params.get("online") is False and needs_network:
             return skipped
-        self._refresh_known_notebooks(bridge)
         if self._target_error(self.config) or not self._selected_notebooks(self.config):
             return skipped
         try:
-            self._run_background_sync(bridge)
+            self._run_background_sync(bridge, deadline=deadline)
         except SyncStateError:
             return {"handled": True, "outcome": "state_error"}
         except RuntimeError:
             return {"handled": True, "outcome": "failed"}
         return {"handled": True, "outcome": self._last_sync_outcome, "synced_notebooks": self._last_synced_notebooks}
 
-    def _run_background_sync(self, bridge, only_path=None, only_nb_root=None):
+    def _run_background_sync(self, bridge, only_path=None, only_nb_root=None, deadline=None):
         if self.config["protocol"] == "webdav":
-            self._webdav_deadline = time.monotonic() + 95
+            self._webdav_deadline = deadline if deadline is not None else time.monotonic() + 95
         try:
             self._run_sync(bridge, only_path=only_path, only_nb_root=only_nb_root)
         finally:
@@ -7854,6 +7900,8 @@ class SyncPlugin:
 
 
 def main():
+    sys.stdin.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8")
     plugin = SyncPlugin()
     HostBridge().serve(plugin.handle, plugin._localize_error)
 
