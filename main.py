@@ -2681,6 +2681,7 @@ class SyncPlugin:
         headers = {"Content-Type": content_type}
         lock_token = None
         created_lock_placeholder = False
+        put_outcome_unknown = False
         cleanup_err = ""
         try:
             if create_only:
@@ -2714,13 +2715,19 @@ class SyncPlugin:
                 except Exception as put_exc:
                     if lock_token and created_lock_placeholder:
                         is_transport_err = not isinstance(put_exc, urllib.error.HTTPError)
-                        # Handle lost-response PUT: verify under lock whether server saved our content.
+                        if is_transport_err:
+                            # PUT outcome is unknown (server may have committed before dropping response).
+                            # Verify under lock; if verification GET itself fails, keep the resource for retry
+                            # instead of deleting a potentially committed note.
+                            put_outcome_unknown = True
                         try:
                             found_after, after_bytes, _ = self._webdav_get_bytes_with_etag(
                                 file_url, cfg=cfg, treat_405_as_absent=True,
                             )
                         except Exception:
-                            found_after, after_bytes = False, b""
+                            if put_outcome_unknown:
+                                created_lock_placeholder = False
+                            raise put_exc
                         if found_after:
                             if len(after_bytes) > 0:
                                 created_lock_placeholder = False
@@ -2728,10 +2735,12 @@ class SyncPlugin:
                                     return
                                 raise RuntimeError(change_err) from put_exc
                             if is_transport_err and sha256_bytes(after_bytes) == content_hash:
-                                # Server has our exact intended empty note after a dropped transport response;
-                                # do not delete it.
+                                # Server holds our exact intended empty note after a dropped transport response;
+                                # treat as committed and never delete it.
                                 created_lock_placeholder = False
                                 return
+                        if put_outcome_unknown:
+                            created_lock_placeholder = False
                     raise
                 created_lock_placeholder = False
                 return
