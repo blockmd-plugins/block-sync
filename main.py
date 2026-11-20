@@ -4582,8 +4582,10 @@ class SyncPlugin:
                 if only_path is not None and sync_assets_on:
                     for ap in note_asset_paths(only_path, local_notes.get(only_path, "")):
                         only_asset_cfs.add(ap.casefold())
-                    for ap in note_asset_paths(only_path, remote_notes.get(only_path, "")):
-                        only_asset_cfs.add(ap.casefold())
+                    for rnp, rtxt in remote_notes.items():
+                        if rnp.casefold() == only_cf:
+                            for ap in note_asset_paths(rnp, rtxt):
+                                only_asset_cfs.add(ap.casefold())
                     if is_safe_rel_asset(only_path):
                         only_asset_cfs.add(only_path.casefold())
                 for tp in sorted(git_tree_paths):
