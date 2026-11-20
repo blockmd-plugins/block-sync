@@ -2020,6 +2020,15 @@ class SyncPlugin:
                 except OSError:
                     pass
 
+    def _decode_note_bytes(self, raw_bytes, rel_path):
+        try:
+            return raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(self._tr(
+                f"笔记 {rel_path} 不是有效的 UTF-8 编码，为避免损坏内容已中止同步",
+                f"Note {rel_path} is not valid UTF-8; sync aborted to avoid corrupting content",
+            )) from exc
+
     def _scan_mirror_files(self, mirror_dir, only_path=None, scope=None, excluded_subdirs=()):
         remote_files = {}
         if not os.path.isdir(mirror_dir):
@@ -2034,8 +2043,8 @@ class SyncPlugin:
             except ValueError:
                 return remote_files
             if os.path.isfile(candidate):
-                with open(candidate, "r", encoding="utf-8", errors="replace", newline="") as fh:
-                    remote_files[only_path] = fh.read()
+                with open(candidate, "rb") as fh:
+                    remote_files[only_path] = self._decode_note_bytes(fh.read(), only_path)
             return remote_files
 
         for root, dirs, files in os.walk(mirror_dir):
@@ -2064,8 +2073,8 @@ class SyncPlugin:
                 rel = os.path.relpath(full, mirror_dir).replace(os.sep, "/")
                 if not is_safe_rel_md(rel) or in_sync_subdir(rel, excluded_subdirs) or not self._matches_scope(rel, scope):
                     continue
-                with open(full, "r", encoding="utf-8", errors="replace", newline="") as fh:
-                    remote_files[rel] = fh.read()
+                with open(full, "rb") as fh:
+                    remote_files[rel] = self._decode_note_bytes(fh.read(), rel)
         return remote_files
 
     def _open_verified_dir_fd(self, target_dir, expected_real=None, expected_real_stat=None, disallow_symlink=False):
@@ -2296,7 +2305,7 @@ class SyncPlugin:
             verify_target()
         if is_text:
             dest = self._safe_mirror_dest(mirror_dir, rel_path, excluded_subdirs=excluded_subdirs)
-            content_hash = sha256_text(raw_bytes.decode("utf-8", errors="replace"))
+            content_hash = sha256_bytes(raw_bytes)
             default_ext = ".md"
         else:
             dest = self._asset_file(mirror_dir, rel_path, excluded_subdirs=excluded_subdirs)
@@ -2304,7 +2313,7 @@ class SyncPlugin:
             default_ext = ""
 
         def hash_bytes(b):
-            return sha256_text(b.decode("utf-8", errors="replace")) if is_text else sha256_bytes(b)
+            return sha256_bytes(b)
 
         parts = rel_path.split("/")
         dir_parts = parts[:-1]
@@ -3865,12 +3874,14 @@ class SyncPlugin:
                 file_url = base_url + "/".join(urllib.parse.quote(p, safe="") for p in rel_path.split("/"))
                 found, raw_bytes, etag = self._webdav_get_bytes_with_etag(file_url, cfg=cfg, timeout=timeout)
                 if found:
-                    remote_notes[rel_path] = raw_bytes.decode("utf-8", errors="replace")
+                    remote_notes[rel_path] = self._decode_note_bytes(raw_bytes, rel_path)
                     if etag:
                         remote_etags[rel_path] = etag
             if only_path is None:
                 self._remote_preview_cache[cache_key] = (time.time(), dict(remote_notes), dict(remote_etags))
             return True, remote_notes, remote_etags, None
+        except ValueError as exc:
+            return False, {}, {}, str(exc)
         except Exception as exc:
             return False, {}, {}, self._tr(f"WebDAV 连接不可达: {self._error_detail(exc)}", f"WebDAV server is unreachable: {self._error_detail(exc)}")
 
@@ -4235,7 +4246,7 @@ class SyncPlugin:
                     def check_remote_note(cand):
                         cand_url = base_url + "/".join(urllib.parse.quote(p, safe="") for p in cand.split("/"))
                         found_c, raw_c, _ = self._webdav_get_bytes_with_etag(cand_url, cfg=cfg)
-                        return raw_c.decode("utf-8", errors="replace") if found_c else None
+                        return self._decode_note_bytes(raw_c, cand) if found_c else None
                 elif target_dir:
                     def check_remote_note(cand):
                         found_map = self._scan_mirror_files(target_dir, only_path=cand, scope=scope, excluded_subdirs=excluded_subdirs)
