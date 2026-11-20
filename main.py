@@ -900,6 +900,12 @@ class SyncPlugin:
         except FileNotFoundError:
             return None
 
+    def _asset_mtime(self, root_dir, rel_path):
+        try:
+            return os.stat(self._asset_file(root_dir, rel_path)).st_mtime_ns
+        except OSError:
+            return None
+
     def _list_dir_assets(self, root_dir, excluded_subdirs=()):
         names = set()
         for root, dirs, files in os.walk(root_dir):
@@ -912,7 +918,18 @@ class SyncPlugin:
                     names.add(rel)
         return names
 
-    def _sync_assets(self, paths, read_local, read_remote, write_local, write_remote, policy, base_map=None):
+    def _sync_assets(
+        self,
+        paths,
+        read_local,
+        read_remote,
+        write_local,
+        write_remote,
+        policy,
+        base_map=None,
+        local_mtime=None,
+        remote_mtime=None,
+    ):
         synced = 0
         for rel in sorted(paths):
             local_data = read_local(rel)
@@ -936,7 +953,15 @@ class SyncPlugin:
                 local_hash = sha256_bytes(local_data)
                 remote_hash = sha256_bytes(remote_data)
                 base_hash = base_map.get(base_key) if base_map is not None else None
-                if base_hash is not None and local_hash == base_hash and remote_hash != base_hash:
+                remote_strictly_newer = False
+                if base_hash is None and local_mtime is not None and remote_mtime is not None:
+                    lm = local_mtime(rel)
+                    rm = remote_mtime(rel)
+                    remote_strictly_newer = lm is not None and rm is not None and rm > lm
+                if (
+                    (base_hash is not None and local_hash == base_hash and remote_hash != base_hash)
+                    or (base_hash is None and policy == "local_first" and remote_strictly_newer)
+                ):
                     write_local(rel, remote_data)
                     if base_map is not None:
                         base_map[base_key] = remote_hash
@@ -1048,6 +1073,8 @@ class SyncPlugin:
             lambda rel, data: self._write_mirror_bytes(remote_dir, rel, data),
             c.get("conflict_policy", "keep_both"),
             base_map=base_map,
+            local_mtime=lambda rel: self._asset_mtime(root_dir, rel),
+            remote_mtime=lambda rel: self._asset_mtime(remote_dir, rel),
         )
 
     # ---------- Local Mirror Mode ----------
@@ -1187,7 +1214,15 @@ class SyncPlugin:
                         f"Saved a copy at {conflict_rel}",
                     ))
 
-        asset_count = self._sync_local_dir_assets(mirror_dir, base_map=base_map)
+        try:
+            asset_count = self._sync_local_dir_assets(mirror_dir, base_map=base_map)
+        except Exception:
+            self.sync_meta[meta_key] = base_map
+            try:
+                bridge.call_host("host.storage.set", {"key": "sync_meta", "value": self.sync_meta})
+            except Exception:
+                pass
+            raise
         if asset_count > 0:
             self._append_log(self._tr(f"同步 {asset_count} 个附件", f"Synced attachments: {asset_count}"), "成功", tone="success")
 
