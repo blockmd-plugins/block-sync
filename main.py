@@ -3976,6 +3976,21 @@ class SyncPlugin:
                 heads.append(parts[1][len("refs/heads/"):])
         return True, heads
 
+    def _verify_git_push_history(self, repo, branch, head, remote, cfg):
+        rev_range = f"{remote}..{head}" if remote else head
+        commits = self._run_git(["rev-list", rev_range], cwd=repo, cfg=cfg)
+        reflog = self._run_git(["reflog", "show", "--format=%H%x00%gs", f"refs/heads/{branch}"], cwd=repo, cfg=cfg)
+        owned = {
+            oid for line in reflog.stdout.splitlines()
+            for oid, _, message in [line.partition("\x00")]
+            if message == "sync: update markdown notes"
+        }
+        if commits.returncode != 0 or reflog.returncode != 0 or not set(commits.stdout.splitlines()) <= owned:
+            raise RuntimeError(self._tr(
+                "Git 分支包含尚未推送的非同步提交。请先在 Git 中检查并处理这些提交，再重试同步。",
+                "The Git branch has unpushed commits outside Block Sync. Review and handle them in Git, then retry sync.",
+            ))
+
     def _git_path(self, repo_dir, rel, cfg=None):
         proc = self._run_git(["rev-parse", "--git-path", rel], cwd=repo_dir, cfg=cfg)
         if proc.returncode == 0 and proc.stdout.strip():
@@ -4191,6 +4206,7 @@ class SyncPlugin:
                         local_oid_proc = self._run_git(["rev-parse", "--verify", local_ref], cwd=repo_dir, cfg=cfg)
                         local_oid = local_oid_proc.stdout.strip() if local_oid_proc.returncode == 0 else ""
                         if local_oid:
+                            self._verify_git_push_history(repo_dir, branch, local_oid, "", cfg)
                             retry_push = self._run_git_network(
                                 ["push", f"--force-with-lease=refs/heads/{branch}:", "-u", "origin", f"{local_oid}:refs/heads/{branch}"],
                                 cwd=repo_dir,
@@ -4301,6 +4317,7 @@ class SyncPlugin:
                                 if behind_n == 0:
                                     exp_oid_p = self._run_git(["rev-parse", "--verify", remote_ref], cwd=repo_dir, cfg=cfg)
                                     exp_oid = exp_oid_p.stdout.strip() if exp_oid_p.returncode == 0 else ""
+                                    self._verify_git_push_history(repo_dir, branch, local_oid, exp_oid, cfg)
                                     lease_arg = f"--force-with-lease=refs/heads/{branch}:{exp_oid}"
                                     retry_push = self._run_git_network(
                                         ["push", lease_arg, "-u", "origin", f"{local_oid}:refs/heads/{branch}"],
@@ -6068,6 +6085,7 @@ class SyncPlugin:
                         needs_push = True
 
                 if needs_push:
+                    self._verify_git_push_history(repo_root, branch, head_oid, expected_remote_oid, cfg)
                     if expected_remote_oid:
                         anc_proc = self._run_git(["merge-base", "--is-ancestor", expected_remote_oid, head_oid], cwd=repo_root, cfg=cfg)
                         if anc_proc.returncode != 0:
@@ -7927,8 +7945,26 @@ class SyncPlugin:
             return skipped
         protocol = self.config["protocol"]
         git_target = self.config["git_remote"]
+        local_remote_uses_network = False
+        if protocol == "git" and not self._is_remote_git_url(git_target):
+            repo = self._resolve_local_git_dir(self.config)
+            if self._has_git_marker(repo):
+                try:
+                    remotes = self._run_git(["remote"], cwd=repo, timeout=1).stdout.splitlines()
+                    if remotes:
+                        name = "origin" if "origin" in remotes else remotes[0]
+                        git_target = self._run_git(["remote", "get-url", name], cwd=repo, timeout=1).stdout.strip()
+                        local_remote_uses_network = git_target.startswith("\\\\") or (
+                            not re.match(r"^[A-Za-z]:", git_target) and
+                            bool(re.match(r"^(?:[^/@:\\]+@)?[^/\\:]+:", git_target)) and
+                            not git_target.lower().startswith("file://")
+                        )
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
         needs_network = protocol == "webdav" or (
-            protocol == "git" and self._is_remote_git_url(git_target) and not git_target.lower().startswith("file://")
+            protocol == "git" and (local_remote_uses_network or (
+                self._is_remote_git_url(git_target) and not git_target.lower().startswith("file://")
+            ))
         )
         if event_name == "network.changed" and (params.get("online") is not True or not needs_network):
             return skipped
