@@ -28,6 +28,28 @@
     "network",
     "events:note_saved"
   ],
+  "permission_reasons": {
+    "storage": {
+      "zh": "保存各笔记本的同步配置、同步状态元信息与近期同步日志",
+      "en": "Save per-notebook sync settings, sync state metadata, and recent logs"
+    },
+    "notes:read": {
+      "zh": "读取待同步笔记与附件内容，用于增量比对与上传",
+      "en": "Read notes and attachments for incremental comparison and upload"
+    },
+    "notes:write": {
+      "zh": "将远端拉取的新增或更新笔记、冲突副本写入本地工作区",
+      "en": "Write remote note updates and conflict copies into the local workspace"
+    },
+    "network": {
+      "zh": "连接 WebDAV 服务器或远程 Git 仓库执行双向同步",
+      "en": "Connect to WebDAV servers or remote Git repositories for sync"
+    },
+    "events:note_saved": {
+      "zh": "在笔记保存后自动触发增量同步",
+      "en": "Automatically trigger incremental sync when a note is saved"
+    }
+  },
   "surfaces": [
     "settings_page"
   ],
