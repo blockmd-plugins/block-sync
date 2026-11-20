@@ -7811,7 +7811,7 @@ class SyncPlugin:
                     if not self.supports_multi_notebook or (event_nb and event_nb in selected):
                         if self.pending_confirm:
                             return {"handled": True, "outcome": "pending_confirm"}
-                        self._run_sync(bridge, only_path=rel_path, only_nb_root=event_nb or None)
+                        self._run_background_sync(bridge, only_path=rel_path, only_nb_root=event_nb or None)
                         outcome = getattr(self, "_last_sync_outcome", "synced")
             return {"handled": True, "outcome": outcome}
 
@@ -7836,17 +7836,21 @@ class SyncPlugin:
         self._refresh_known_notebooks(bridge)
         if self._target_error(self.config) or not self._selected_notebooks(self.config):
             return skipped
-        if protocol == "webdav":
-            self._webdav_deadline = time.monotonic() + 95
         try:
-            self._run_sync(bridge)
+            self._run_background_sync(bridge)
         except SyncStateError:
             return {"handled": True, "outcome": "state_error"}
         except RuntimeError:
             return {"handled": True, "outcome": "failed"}
+        return {"handled": True, "outcome": self._last_sync_outcome, "synced_notebooks": self._last_synced_notebooks}
+
+    def _run_background_sync(self, bridge, only_path=None, only_nb_root=None):
+        if self.config["protocol"] == "webdav":
+            self._webdav_deadline = time.monotonic() + 95
+        try:
+            self._run_sync(bridge, only_path=only_path, only_nb_root=only_nb_root)
         finally:
             self._webdav_deadline = 0.0
-        return {"handled": True, "outcome": self._last_sync_outcome, "synced_notebooks": self._last_synced_notebooks}
 
 
 def main():
