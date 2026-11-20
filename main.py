@@ -912,37 +912,68 @@ class SyncPlugin:
                     names.add(rel)
         return names
 
-    def _sync_assets(self, paths, read_local, read_remote, write_local, write_remote, policy):
+    def _sync_assets(self, paths, read_local, read_remote, write_local, write_remote, policy, base_map=None):
         synced = 0
         for rel in sorted(paths):
             local_data = read_local(rel)
             remote_data = read_remote(rel)
-            if local_data == remote_data:
+            base_key = f"asset:{rel}"
+            if local_data is None and remote_data is None:
                 continue
-            if local_data is None or (remote_data is not None and policy == "remote_first"):
+            if local_data == remote_data:
+                if base_map is not None:
+                    base_map[base_key] = sha256_bytes(local_data)
+                continue
+            if local_data is None:
                 write_local(rel, remote_data)
-            else:
-                if remote_data is not None and policy == "keep_both":
-                    stem, ext = posixpath.splitext(rel)
-                    fingerprint = sha256_bytes(remote_data)[:16]
-                    suffix = ""
-                    attempt = 1
-                    while True:
-                        copy_rel = f"{stem}.conflict-{fingerprint}{suffix}{ext}"
-                        local_copy = read_local(copy_rel)
-                        remote_copy = read_remote(copy_rel)
-                        if local_copy in (None, remote_data) and remote_copy in (None, remote_data):
-                            break
-                        attempt += 1
-                        suffix = f"-{attempt}"
-
-                    # Keep a copy on each side before replacing the original. The
-                    # content-based name also works when just one copy was saved.
-                    if local_copy is None:
-                        write_local(copy_rel, remote_data)
-                    if remote_copy is None:
-                        write_remote(copy_rel, remote_data)
+                if base_map is not None:
+                    base_map[base_key] = sha256_bytes(remote_data)
+            elif remote_data is None:
                 write_remote(rel, local_data)
+                if base_map is not None:
+                    base_map[base_key] = sha256_bytes(local_data)
+            else:
+                local_hash = sha256_bytes(local_data)
+                remote_hash = sha256_bytes(remote_data)
+                base_hash = base_map.get(base_key) if base_map is not None else None
+                if base_hash is not None and local_hash == base_hash and remote_hash != base_hash:
+                    write_local(rel, remote_data)
+                    if base_map is not None:
+                        base_map[base_key] = remote_hash
+                elif base_hash is not None and remote_hash == base_hash and local_hash != base_hash:
+                    write_remote(rel, local_data)
+                    if base_map is not None:
+                        base_map[base_key] = local_hash
+                elif policy == "remote_first":
+                    write_local(rel, remote_data)
+                    if base_map is not None:
+                        base_map[base_key] = remote_hash
+                else:
+                    if policy == "keep_both":
+                        stem, ext = posixpath.splitext(rel)
+                        fingerprint = remote_hash[:16]
+                        suffix = ""
+                        attempt = 1
+                        while True:
+                            copy_rel = f"{stem}.conflict-{fingerprint}{suffix}{ext}"
+                            local_copy = read_local(copy_rel)
+                            remote_copy = read_remote(copy_rel)
+                            if local_copy in (None, remote_data) and remote_copy in (None, remote_data):
+                                break
+                            attempt += 1
+                            suffix = f"-{attempt}"
+
+                        # Keep a copy on each side before replacing the original. The
+                        # content-based name also works when just one copy was saved.
+                        if local_copy is None:
+                            write_local(copy_rel, remote_data)
+                        if remote_copy is None:
+                            write_remote(copy_rel, remote_data)
+                        if base_map is not None:
+                            base_map[f"asset:{copy_rel}"] = remote_hash
+                    write_remote(rel, local_data)
+                    if base_map is not None:
+                        base_map[base_key] = local_hash
             synced += 1
         return synced
 
@@ -1002,7 +1033,7 @@ class SyncPlugin:
         conflict_rel = make_conflict_path(rel_path, conflict_stamp())
         return "keep_both", local_text, (conflict_rel, remote_text), local_hash
 
-    def _sync_local_dir_assets(self, remote_dir, nb_root=None, paths=None, excluded_subdirs=(), cfg=None):
+    def _sync_local_dir_assets(self, remote_dir, nb_root=None, paths=None, excluded_subdirs=(), cfg=None, base_map=None):
         c = cfg or self.config
         root_dir = nb_root or self.notebook_root
         if not c.get("sync_assets", True) or not root_dir:
@@ -1016,6 +1047,7 @@ class SyncPlugin:
             lambda rel, data: self._write_mirror_bytes(root_dir, rel, data),
             lambda rel, data: self._write_mirror_bytes(remote_dir, rel, data),
             c.get("conflict_policy", "keep_both"),
+            base_map=base_map,
         )
 
     # ---------- Local Mirror Mode ----------
@@ -1155,7 +1187,7 @@ class SyncPlugin:
                         f"Saved a copy at {conflict_rel}",
                     ))
 
-        asset_count = self._sync_local_dir_assets(mirror_dir)
+        asset_count = self._sync_local_dir_assets(mirror_dir, base_map=base_map)
         if asset_count > 0:
             self._append_log(self._tr(f"同步 {asset_count} 个附件", f"Synced attachments: {asset_count}"), "成功", tone="success")
 
@@ -1382,7 +1414,7 @@ class SyncPlugin:
             cfg=cfg,
         )
 
-    def _sync_webdav_assets(self, base_url, nb_root=None, paths=None, excluded_subdirs=(), cfg=None):
+    def _sync_webdav_assets(self, base_url, nb_root=None, paths=None, excluded_subdirs=(), cfg=None, base_map=None):
         c = cfg or self.config
         root_dir = nb_root or self.notebook_root
         if not c.get("sync_assets", True) or not root_dir:
@@ -1405,6 +1437,7 @@ class SyncPlugin:
             lambda rel, data: self._write_mirror_bytes(root_dir, rel, data),
             lambda rel, data: self._webdav_put_bytes(base_url, rel, data, cfg=c),
             c.get("conflict_policy", "keep_both"),
+            base_map=base_map,
         )
 
     def _sync_webdav(self, bridge, only_path=None):
@@ -1501,7 +1534,7 @@ class SyncPlugin:
                             f"Saved a WebDAV conflict copy at {conflict_rel}",
                         ))
 
-            asset_count = 0 if only_path else self._sync_webdav_assets(base_url)
+            asset_count = 0 if only_path else self._sync_webdav_assets(base_url, base_map=base_map)
             if asset_count > 0:
                 self._append_log(self._tr(f"同步 {asset_count} 个附件", f"Synced attachments: {asset_count}"), "成功", tone="success")
 
@@ -2068,11 +2101,11 @@ class SyncPlugin:
             excluded_subdirs = plan["excluded_subdirs"]
             if protocol == "webdav":
                 asset_count = self._sync_webdav_assets(
-                    base_url, nb_root=nb_root, paths=paths, excluded_subdirs=excluded_subdirs, cfg=cfg,
+                    base_url, nb_root=nb_root, paths=paths, excluded_subdirs=excluded_subdirs, cfg=cfg, base_map=base_map,
                 )
             else:
                 asset_count = self._sync_local_dir_assets(
-                    target_dir, nb_root=nb_root, paths=paths, excluded_subdirs=excluded_subdirs, cfg=cfg,
+                    target_dir, nb_root=nb_root, paths=paths, excluded_subdirs=excluded_subdirs, cfg=cfg, base_map=base_map,
                 )
             if asset_count > 0:
                 self._append_log(self._tr(f"{prefix}同步 {asset_count} 个附件", f"{prefix}Synced attachments: {asset_count}"), "成功", tone="success")
