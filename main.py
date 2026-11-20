@@ -3,6 +3,7 @@
 
 import base64
 from contextlib import contextmanager
+import ctypes
 from datetime import datetime
 import errno
 try:
@@ -236,7 +237,38 @@ def make_conflict_path(rel_path, tag):
     return f"{stem}.conflict-{tag}{extension or '.md'}"
 
 
-def make_unique_conflict_path(rel_path, remote_text, existing_local=None, existing_remote=None, reserved=None):
+def atomic_swap_files(path_a, path_b):
+    """Atomically exchange two existing paths on macOS via renamex_np(RENAME_SWAP).
+
+    Returns True on success, False if the platform/filesystem does not support atomic swap.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        fn = libc.renamex_np
+        fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        fn.restype = ctypes.c_int
+    except Exception:
+        return False
+    rc = fn(os.fsencode(path_a), os.fsencode(path_b), 0x00000002)
+    if rc == 0:
+        return True
+    err = ctypes.get_errno()
+    if err in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV, errno.EINVAL):
+        return False
+    raise OSError(err, os.strerror(err), path_b)
+
+
+def make_unique_conflict_path(
+    rel_path,
+    remote_text,
+    existing_local=None,
+    existing_remote=None,
+    reserved=None,
+    check_local=None,
+    check_remote=None,
+):
     """Choose a deterministic content-based conflict path that never collides across retries or same-second saves."""
     norm = rel_path.replace("\\", "/")
     stem, extension = os.path.splitext(norm)
@@ -251,7 +283,11 @@ def make_unique_conflict_path(rel_path, remote_text, existing_local=None, existi
         candidate = f"{stem}.conflict-{fingerprint}{suffix}{ext}"
         if candidate not in used:
             loc_cur = local_map.get(candidate)
+            if loc_cur is None and check_local is not None:
+                loc_cur = check_local(candidate)
             rem_cur = remote_map.get(candidate)
+            if rem_cur is None and check_remote is not None:
+                rem_cur = check_remote(candidate)
             if loc_cur in (None, remote_text) and rem_cur in (None, remote_text):
                 used.add(candidate)
                 return candidate
@@ -259,7 +295,10 @@ def make_unique_conflict_path(rel_path, remote_text, existing_local=None, existi
 
 
 def rewrite_note_asset_links(note_path, text, asset_copy_map):
-    """Rewrite relative references in a conflict note copy so it opens the remote conflict asset copies."""
+    """Rewrite relative references in a remote-adopted note so it opens the remote conflict asset copies.
+
+    Preserves fenced code blocks and inline code spans verbatim.
+    """
     if not asset_copy_map or not text:
         return text
     note_dir = posixpath.dirname(note_path.replace("\\", "/"))
@@ -311,14 +350,43 @@ def rewrite_note_asset_links(note_path, text, asset_copy_map):
             return f"{prefix}'{updated}'"
         return f"{prefix}{updated}"
 
-    out = re.sub(rf"(\]\(\s*)(?:<([^>\n]+)>|({bare_dest}))(?=[\s)])", repl_md, text)
-    out = re.sub(
-        rf"(?m)^((?: {{0,3}})\[(?:\\.|[^\]\\\n])+\]:[ \t]*(?:\r?\n[ \t]*)?)(?:<([^>\n]+)>|({bare_dest}))(?=[ \t\r]|$)",
-        repl_md,
-        out,
-    )
-    out = re.sub(r"""(?is)(\b(?:src|href)\s*=\s*)(?:"([^"]+)"|'([^']+)'|([^\s>]+))""", repl_attr, out)
-    return out
+    def rewrite_plain_segment(segment):
+        out = re.sub(rf"(\]\(\s*)(?:<([^>\n]+)>|({bare_dest}))(?=[\s)])", repl_md, segment)
+        out = re.sub(
+            rf"(?m)^((?: {{0,3}})\[(?:\\.|[^\]\\\n])+\]:[ \t]*(?:\r?\n[ \t]*)?)(?:<([^>\n]+)>|({bare_dest}))(?=[ \t\r]|$)",
+            repl_md,
+            out,
+        )
+        out = re.sub(r"""(?is)(\b(?:src|href)\s*=\s*)(?:"([^"]+)"|'([^']+)'|([^\s>]+))""", repl_attr, out)
+        return out
+
+    code_span_re = re.compile(r"(\x60+)(?!\x60)(.+?)(?<!\x60)\1(?!\x60)")
+    fence = ""
+    out_lines = []
+    for raw_line in text.splitlines(keepends=True):
+        body = raw_line.rstrip("\r\n")
+        eol = raw_line[len(body):]
+        marker = re.match(r"^\s*(\x60{3,}|~{3,})(.*)$", body)
+        if fence:
+            if marker and marker[1].startswith(fence) and not marker[2].strip():
+                fence = ""
+            out_lines.append(raw_line)
+            continue
+        if marker:
+            fence = marker[1]
+            out_lines.append(raw_line)
+            continue
+        parts = []
+        pos = 0
+        for span in code_span_re.finditer(body):
+            if span.start() > pos:
+                parts.append(rewrite_plain_segment(body[pos:span.start()]))
+            parts.append(span.group(0))
+            pos = span.end()
+        if pos < len(body):
+            parts.append(rewrite_plain_segment(body[pos:]))
+        out_lines.append("".join(parts) + eol)
+    return "".join(out_lines)
 
 
 def safe_parse_url(raw):
@@ -1563,8 +1631,24 @@ class SyncPlugin:
                     if os.name == "nt":
                         os.close(existing_fd)
                         existing_fd = -1
-                    os.replace(temp_path, dest)
-                    temp_path = None
+                    if atomic_swap_files(temp_path, dest):
+                        # temp_path now holds the exact inode that lived at dest at the instant of swap.
+                        with open(temp_path, "r", encoding="utf-8", errors="replace", newline="") as swapped_fh:
+                            swapped_hash = sha256_text(swapped_fh.read())
+                        if swapped_hash != expected_hash and swapped_hash != content_hash:
+                            if not atomic_swap_files(temp_path, dest):
+                                stem, ext = os.path.splitext(dest)
+                                backup = f"{stem}.conflict-external-{swapped_hash[:8]}{ext or '.md'}"
+                                try:
+                                    os.replace(temp_path, backup)
+                                    temp_path = None
+                                except OSError:
+                                    pass
+                            raise RuntimeError(change_err)
+                        # Expected old file is in temp_path; finally block cleans it up.
+                    else:
+                        os.replace(temp_path, dest)
+                        temp_path = None
                 finally:
                     if existing_fd >= 0:
                         os.close(existing_fd)
@@ -1728,8 +1812,22 @@ class SyncPlugin:
                     if os.name == "nt":
                         os.close(existing_fd)
                         existing_fd = -1
-                    os.replace(temp_path, dest)
-                    temp_path = None
+                    if atomic_swap_files(temp_path, dest):
+                        with open(temp_path, "rb") as swapped_fh:
+                            swapped_hash = sha256_bytes(swapped_fh.read())
+                        if swapped_hash != expected_hash and swapped_hash != content_hash:
+                            if not atomic_swap_files(temp_path, dest):
+                                stem, ext = os.path.splitext(dest)
+                                backup = f"{stem}.conflict-external-{swapped_hash[:8]}{ext}"
+                                try:
+                                    os.replace(temp_path, backup)
+                                    temp_path = None
+                                except OSError:
+                                    pass
+                            raise RuntimeError(change_err)
+                    else:
+                        os.replace(temp_path, dest)
+                        temp_path = None
                 finally:
                     if existing_fd >= 0:
                         os.close(existing_fd)
@@ -1984,6 +2082,74 @@ class SyncPlugin:
         found, body, _ = self._webdav_get_bytes_with_etag(file_url, cfg=cfg, timeout=timeout)
         return found, body
 
+    def _is_strong_etag(self, etag):
+        raw = str(etag or "").strip()
+        return bool(raw) and not raw.lower().startswith("w/")
+
+    def _webdav_lock(self, file_url, cfg=None, timeout=6):
+        lock_body = (
+            b'<?xml version="1.0" encoding="utf-8"?>'
+            b'<D:lockinfo xmlns:D="DAV:">'
+            b'<D:lockscope><D:exclusive/></D:lockscope>'
+            b'<D:locktype><D:write/></D:locktype>'
+            b'<D:owner><D:href>block-sync</D:href></D:owner>'
+            b'</D:lockinfo>'
+        )
+        try:
+            status, body, headers = self._webdav_request_full(
+                "LOCK",
+                file_url,
+                body=lock_body,
+                extra_headers={
+                    "Content-Type": "application/xml; charset=utf-8",
+                    "Depth": "0",
+                    "Timeout": "Second-30",
+                },
+                timeout=timeout,
+                cfg=cfg,
+                retries=0,
+            )
+            if status not in (200, 201):
+                return None
+            token = str(headers.get("lock-token") or "").strip()
+            if not token and body:
+                try:
+                    root = ET.fromstring(body)
+                    for elem in root.iter():
+                        if elem.tag in ("{DAV:}locktoken", "locktoken"):
+                            for sub in elem.iter():
+                                if sub.tag in ("{DAV:}href", "href") and sub.text:
+                                    token = sub.text.strip()
+                                    break
+                        if token:
+                            break
+                except ET.ParseError:
+                    pass
+            if not token:
+                return None
+            if not (token.startswith("<") and token.endswith(">")):
+                token = f"<{token}>"
+            return token
+        except urllib.error.HTTPError as exc:
+            if exc.code in (405, 501, 400, 403, 404, 412, 423):
+                return None
+            raise
+
+    def _webdav_unlock(self, file_url, lock_token, cfg=None, timeout=6):
+        if not lock_token:
+            return
+        try:
+            self._webdav_request_full(
+                "UNLOCK",
+                file_url,
+                extra_headers={"Lock-Token": lock_token},
+                timeout=timeout,
+                cfg=cfg,
+                retries=0,
+            )
+        except Exception:
+            pass
+
     def _webdav_put_conditional(
         self,
         base_url,
@@ -2002,22 +2168,55 @@ class SyncPlugin:
             f"WebDAV 远端文件已变更，已中止覆盖以避免数据丢失：{rel_path}",
             f"WebDAV remote file changed during sync; aborted overwrite to protect data: {rel_path}",
         )
+        unsafe_err = self._tr(
+            f"WebDAV 服务器不支持强 ETag 或写入锁，无法安全执行条件写入：{rel_path}",
+            f"WebDAV server lacks strong ETag or write LOCK support for safe conditional write: {rel_path}",
+        )
         headers = {"Content-Type": content_type}
-        if create_only:
-            headers["If-None-Match"] = "*"
-        elif expected_hash is not None:
-            if expected_etag:
-                headers["If-Match"] = expected_etag
-            else:
-                found, cur_bytes, cur_etag = self._webdav_get_bytes_with_etag(file_url, cfg=cfg)
-                if not found:
-                    raise RuntimeError(change_err)
-                cur_hash = sha256_bytes(cur_bytes)
-                if cur_hash != expected_hash and cur_hash != content_hash:
-                    raise RuntimeError(change_err)
-                if cur_etag:
-                    headers["If-Match"] = cur_etag
+        lock_token = None
         try:
+            if create_only:
+                found, cur_bytes, cur_etag = self._webdav_get_bytes_with_etag(file_url, cfg=cfg)
+                if found:
+                    if sha256_bytes(cur_bytes) == content_hash:
+                        return
+                    raise RuntimeError(change_err)
+                lock_token = self._webdav_lock(file_url, cfg=cfg)
+                if lock_token:
+                    headers["If"] = f"({lock_token})"
+                    found2, cur_bytes2, _ = self._webdav_get_bytes_with_etag(file_url, cfg=cfg)
+                    if found2:
+                        if sha256_bytes(cur_bytes2) == content_hash:
+                            return
+                        raise RuntimeError(change_err)
+                headers["If-None-Match"] = "*"
+                status, _, put_headers = self._webdav_request_full(
+                    "PUT", file_url, body=payload_bytes, extra_headers=headers, cfg=cfg,
+                )
+                return
+            elif expected_hash is not None:
+                if self._is_strong_etag(expected_etag):
+                    headers["If-Match"] = expected_etag
+                else:
+                    lock_token = self._webdav_lock(file_url, cfg=cfg)
+                    if lock_token:
+                        headers["If"] = f"({lock_token})"
+                        found, cur_bytes, _ = self._webdav_get_bytes_with_etag(file_url, cfg=cfg)
+                        if not found:
+                            raise RuntimeError(change_err)
+                        cur_hash = sha256_bytes(cur_bytes)
+                        if cur_hash != expected_hash and cur_hash != content_hash:
+                            raise RuntimeError(change_err)
+                    else:
+                        found, cur_bytes, cur_etag = self._webdav_get_bytes_with_etag(file_url, cfg=cfg)
+                        if not found:
+                            raise RuntimeError(change_err)
+                        cur_hash = sha256_bytes(cur_bytes)
+                        if cur_hash != expected_hash and cur_hash != content_hash:
+                            raise RuntimeError(change_err)
+                        if not self._is_strong_etag(cur_etag):
+                            raise RuntimeError(unsafe_err)
+                        headers["If-Match"] = cur_etag
             self._webdav_request("PUT", file_url, body=payload_bytes, extra_headers=headers, cfg=cfg)
         except urllib.error.HTTPError as exc:
             if exc.code == 412:
@@ -2026,6 +2225,9 @@ class SyncPlugin:
                     return
                 raise RuntimeError(change_err) from exc
             raise
+        finally:
+            if lock_token:
+                self._webdav_unlock(file_url, lock_token, cfg=cfg)
 
     def _webdav_put_text(self, base_url, rel_path, content, cfg=None, expected_hash=None, expected_etag=None, create_only=False):
         self._webdav_put_conditional(
@@ -2117,7 +2319,8 @@ class SyncPlugin:
         if not target:
             return [os.path.join(base, self._notebook_slug())]
 
-        canonical = os.path.join(base, f"repo-{sha256_text(f'{target}\\n{branch}')[:12]}")
+        repo_key = f"{target}\n{branch}"
+        canonical = os.path.join(base, f"repo-{sha256_text(repo_key)[:12]}")
         legacy = []
         legacy_unbranched = os.path.join(base, f"repo-{sha256_text(target)[:12]}")
         if os.path.isdir(base) and shutil.which("git"):
@@ -2563,6 +2766,19 @@ class SyncPlugin:
 
         return True, repo_dir
 
+    def _webdav_list_scoped(self, base_url, filter_fn, scope="all", cfg=None, timeout=6, excluded_subdirs=(), skip_assets=False):
+        sc = str(scope or "all").strip().strip("/")
+        if not sc or sc == "all":
+            return self._webdav_list_files(
+                base_url, filter_fn, cfg=cfg, timeout=timeout, excluded_subdirs=excluded_subdirs, skip_assets=skip_assets,
+            )
+        scope_prefix = "/".join(urllib.parse.quote(p, safe="") for p in sc.split("/") if p)
+        scope_url = base_url + scope_prefix + "/"
+        sub_items = self._webdav_list_files(
+            scope_url, lambda rel: filter_fn(f"{sc}/{rel}"), cfg=cfg, timeout=timeout, skip_assets=skip_assets,
+        )
+        return [f"{sc}/{rel}" for rel in sub_items if not in_sync_subdir(f"{sc}/{rel}", excluded_subdirs)]
+
     def _fetch_webdav_notes(self, cfg, only_path=None, scope="all", timeout=6, force_refresh=False, subdir="", excluded_subdirs=()):
         root_url = self._webdav_root_url(cfg)
         base_url = self._webdav_base_url(cfg, subdir=subdir)
@@ -2579,13 +2795,10 @@ class SyncPlugin:
             remote_paths = (
                 [only_path]
                 if only_path
-                else [
-                    p for p in self._webdav_list_files(
-                        base_url, is_safe_rel_md, cfg=cfg, timeout=timeout,
-                        excluded_subdirs=excluded_subdirs, skip_assets=True,
-                    )
-                    if self._matches_scope(p, scope)
-                ]
+                else self._webdav_list_scoped(
+                    base_url, is_safe_rel_md, scope=scope, cfg=cfg, timeout=timeout,
+                    excluded_subdirs=excluded_subdirs, skip_assets=True,
+                )
             )
             remote_notes = {}
             remote_etags = {}
@@ -2662,8 +2875,8 @@ class SyncPlugin:
         remote_candidates = set()
         if explicit_paths is None:
             if protocol == "webdav":
-                remote_candidates.update(self._webdav_list_files(
-                    base_url, is_safe_rel_asset, cfg=cfg, excluded_subdirs=excluded_subdirs,
+                remote_candidates.update(self._webdav_list_scoped(
+                    base_url, is_safe_rel_asset, scope=scope, cfg=cfg, excluded_subdirs=excluded_subdirs,
                 ))
             elif target_dir and os.path.isdir(target_dir):
                 remote_candidates.update(self._list_dir_assets(target_dir, excluded_subdirs=excluded_subdirs))
@@ -2677,7 +2890,7 @@ class SyncPlugin:
                 referenced.update(note_asset_paths(np, txt))
             for np, txt in remote_notes.items():
                 referenced.update(note_asset_paths(np, txt))
-            candidates = {p for p in candidates if self._matches_scope(p, scope) or p in referenced}
+            candidates = {p for p in candidates if self._matches_scope(p, scope)} | referenced
 
         local_assets = {}
         remote_assets = {}
@@ -2731,14 +2944,7 @@ class SyncPlugin:
             elif base_hash is not None and rhash == base_hash and lhash != base_hash:
                 push_ow.append((rel, False))
             else:
-                remote_strictly_newer = False
-                if base_hash is None and protocol != "webdav" and target_dir:
-                    lm = self._asset_mtime(nb_root, rel)
-                    rm = self._asset_mtime(target_dir, rel)
-                    remote_strictly_newer = lm is not None and rm is not None and rm > lm
-                if base_hash is None and policy == "local_first" and remote_strictly_newer:
-                    pull_ow.append((rel, True))
-                elif policy == "remote_first":
+                if policy == "remote_first":
                     pull_ow.append((rel, True))
                 elif policy == "local_first":
                     push_ow.append((rel, True))
@@ -2754,8 +2960,13 @@ class SyncPlugin:
                             if lcopy is None:
                                 lcopy = self._read_asset_file(nb_root, copy_rel)
                             rcopy = remote_assets.get(copy_rel)
-                            if rcopy is None and protocol != "webdav" and target_dir:
-                                rcopy = self._read_asset_file(target_dir, copy_rel)
+                            if rcopy is None:
+                                if protocol == "webdav":
+                                    copy_url = base_url + "/".join(urllib.parse.quote(p, safe="") for p in copy_rel.split("/"))
+                                    found_rc, rcopy_bytes, _ = self._webdav_get_bytes_with_etag(copy_url, cfg=cfg)
+                                    rcopy = rcopy_bytes if found_rc else None
+                                elif target_dir:
+                                    rcopy = self._read_asset_file(target_dir, copy_rel)
                             if lcopy in (None, rdata) and rcopy in (None, rdata):
                                 reserved_copies.add(copy_rel)
                                 break
@@ -2901,6 +3112,22 @@ class SyncPlugin:
         reserved_conflict_paths = set()
 
         if remote_inspected:
+            check_local_note = None
+            check_remote_note = None
+            if only_path is not None:
+                def check_local_note(cand):
+                    found_map = self._read_local_notes(bridge, only_path=cand, scope=scope, nb_root=nb_root)
+                    return found_map.get(cand)
+                if protocol == "webdav":
+                    def check_remote_note(cand):
+                        cand_url = base_url + "/".join(urllib.parse.quote(p, safe="") for p in cand.split("/"))
+                        found_c, raw_c, _ = self._webdav_get_bytes_with_etag(cand_url, cfg=cfg)
+                        return raw_c.decode("utf-8", errors="replace") if found_c else None
+                elif target_dir:
+                    def check_remote_note(cand):
+                        found_map = self._scan_mirror_files(target_dir, only_path=cand, scope=scope, excluded_subdirs=excluded_subdirs)
+                        return found_map.get(cand)
+
             all_paths = sorted(set(local_notes.keys()) | set(remote_notes.keys()))
             for rel_path in all_paths:
                 in_local = rel_path in local_notes
@@ -2928,6 +3155,8 @@ class SyncPlugin:
                             existing_local=local_notes,
                             existing_remote=remote_notes,
                             reserved=reserved_conflict_paths,
+                            check_local=check_local_note,
+                            check_remote=check_remote_note,
                         )
                         conflicts.append((rel_path, conflict_rel, remote_notes[rel_path]))
                     else:
@@ -3175,7 +3404,7 @@ class SyncPlugin:
             items.append({"kind": "bulk_pull", "nb_label": nb_label, "count": m["pull_new"] + m["pull_total"]})
         return items
 
-    def _commit_and_push_git(self, repo_root, cfg, staged_rel_paths=None):
+    def _commit_and_push_git(self, repo_root, cfg, staged_rel_paths=None, tracked_plan_paths=None):
         # Remove any stale untracked atomic-write temp files left behind by a prior SIGKILL cancellation
         # so they can never be staged or pushed to the remote repository.
         self._cleanup_stale_temp_files(repo_root, cfg=cfg)
@@ -3187,14 +3416,17 @@ class SyncPlugin:
                 f"Git checkout is on branch {cur_branch} instead of {branch}; push aborted",
             ))
 
-        rel_paths = sorted({p.replace("\\", "/").lstrip("/") for p in (staged_rel_paths or []) if p})
-        if rel_paths:
-            # Fail loudly if .gitignore blocks any file that Block planned to sync.
+        written = {p.replace("\\", "/").lstrip("/") for p in (staged_rel_paths or []) if p}
+        candidate_tracked = {p.replace("\\", "/").lstrip("/") for p in (tracked_plan_paths or []) if p} - written
+        all_check_paths = sorted(written | candidate_tracked)
+
+        # Fail loudly if .gitignore / .git/info/exclude blocks any file in the sync plan.
+        if all_check_paths:
             chk = subprocess.run(
                 ["git", "check-ignore", "-z", "--stdin"],
                 cwd=repo_root,
                 env=self._git_env(),
-                input=b"\0".join(os.fsencode(p) for p in rel_paths) + b"\0",
+                input=b"\0".join(os.fsencode(p) for p in all_check_paths) + b"\0",
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 timeout=8,
@@ -3203,30 +3435,83 @@ class SyncPlugin:
             if ignored:
                 sample = ", ".join(ignored[:3]) + ("..." if len(ignored) > 3 else "")
                 raise RuntimeError(self._tr(
-                    f"Git 仓库的 .gitignore 忽略了待同步文件，无法上传：{sample}",
-                    f"Files planned for sync are ignored by .gitignore: {sample}",
+                    f"Git 仓库的忽略规则阻止了待同步文件，无法上传：{sample}",
+                    f"Files planned for sync are ignored by Git ignore rules: {sample}",
                 ))
 
-            add_proc = self._run_git(["add", "--", *rel_paths], cwd=repo_root, cfg=cfg)
-            if add_proc.returncode != 0:
-                err = self._error_detail(add_proc.stderr or add_proc.stdout or self._tr("git add 失败", "git add failed"))
-                raise RuntimeError(self._tr(f"Git 暂存失败: {err}", f"Git staging failed: {err}"))
+        # Also include any previously-written synced files that remain untracked/modified in the working tree
+        # (e.g., retrying after removing a .gitignore / .git/info/exclude rule).
+        dirty_tracked = set()
+        if candidate_tracked:
+            st_proc = subprocess.run(
+                ["git", "--literal-pathspecs", "status", "--porcelain", "-z", "--untracked-files=all", "--", *sorted(candidate_tracked)],
+                cwd=repo_root,
+                env=self._git_env(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=8,
+            )
+            if st_proc.returncode == 0 and st_proc.stdout:
+                tokens = st_proc.stdout.split(b"\0")
+                i = 0
+                while i < len(tokens):
+                    tok = tokens[i]
+                    if len(tok) >= 4:
+                        xy = tok[:2].decode("ascii", errors="replace")
+                        p_str = os.fsdecode(tok[3:]).replace("\\", "/")
+                        if p_str in candidate_tracked:
+                            dirty_tracked.add(p_str)
+                        if "R" in xy or "C" in xy:
+                            i += 1
+                    i += 1
 
-            diff_proc = self._run_git(["diff", "--cached", "--quiet"], cwd=repo_root, cfg=cfg)
-            if diff_proc.returncode == 1:
+        rel_paths = sorted(written | dirty_tracked)
+        did_commit = False
+        if rel_paths:
+            # Find which planned paths are untracked so we can intent-to-add ONLY those,
+            # leaving any user pre-staged files in the index completely untouched.
+            oth_proc = subprocess.run(
+                ["git", "--literal-pathspecs", "ls-files", "--others", "-z", "--", *rel_paths],
+                cwd=repo_root,
+                env=self._git_env(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=8,
+            )
+            untracked_new = sorted({os.fsdecode(raw).replace("\\", "/") for raw in (oth_proc.stdout or b"").split(b"\0") if raw})
+            if untracked_new:
+                add_proc = self._run_git(["--literal-pathspecs", "add", "-N", "--", *untracked_new], cwd=repo_root, cfg=cfg)
+                if add_proc.returncode != 0:
+                    err = self._error_detail(add_proc.stderr or add_proc.stdout or self._tr("git add 失败", "git add failed"))
+                    raise RuntimeError(self._tr(f"Git 暂存失败: {err}", f"Git staging failed: {err}"))
+
+            st_plan = subprocess.run(
+                ["git", "--literal-pathspecs", "status", "--porcelain", "-z", "--", *rel_paths],
+                cwd=repo_root,
+                env=self._git_env(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=8,
+            )
+            has_plan_changes = bool(st_plan.returncode == 0 and st_plan.stdout.strip(b"\0"))
+            if has_plan_changes:
                 commit_proc = self._run_git(
                     [
+                        "--literal-pathspecs",
                         "-c", "user.name=Block Sync",
                         "-c", "user.email=sync@blockmd.local",
                         "commit", "-m", "sync: update markdown notes",
+                        "--only", "--", *rel_paths,
                     ],
                     cwd=repo_root,
                     cfg=cfg,
                 )
                 if commit_proc.returncode != 0:
-                    self._run_git(["reset"], cwd=repo_root, cfg=cfg)
+                    if untracked_new:
+                        self._run_git(["--literal-pathspecs", "reset", "--", *untracked_new], cwd=repo_root, cfg=cfg)
                     err = self._error_detail(commit_proc.stderr or commit_proc.stdout or self._tr("git commit 失败", "git commit failed"))
                     raise RuntimeError(self._tr(f"Git 提交失败: {err}", f"Git commit failed: {err}"))
+                did_commit = True
 
         remote_proc = self._run_git(["remote"], cwd=repo_root, cfg=cfg)
         if remote_proc.returncode != 0:
@@ -3268,7 +3553,7 @@ class SyncPlugin:
                         err = self._git_error_message(push_proc.stderr or push_proc.stdout, self._tr("push 失败", "Push failed"))
                         raise RuntimeError(self._tr(f"已提交到本地 Git，但远端推送未完成: {err}", f"Committed locally. Git push failed: {err}"))
                     return True
-        return False
+        return did_commit
 
     def _apply_notebook_plan(self, bridge, plan, only_path=None, progress_state=None):
         protocol = plan["protocol"]
@@ -3459,8 +3744,11 @@ class SyncPlugin:
                     step_progress()
 
                 for rel_path in plan["to_pull_new"]:
-                    text = remote_notes[rel_path]
+                    orig_text = remote_notes[rel_path]
+                    text = rewrite_note_asset_links(rel_path, orig_text, asset_copy_map)
                     self._write_local_note(bridge, rel_path, text, nb_root=nb_root)
+                    if text != orig_text:
+                        write_remote_note(rel_path, text, expected_hash=sha256_text(orig_text))
                     base_map[rel_path] = sha256_text(text)
                     pulled += 1
                     self._append_log(
@@ -3474,12 +3762,15 @@ class SyncPlugin:
                     step_progress()
 
                 for rel_path in plan["to_pull_overwrite"]:
-                    text = remote_notes[rel_path]
+                    orig_text = remote_notes[rel_path]
+                    text = rewrite_note_asset_links(rel_path, orig_text, asset_copy_map)
                     local_hash = sha256_text(local_notes[rel_path])
                     is_conflict = base_map.get(rel_path) != local_hash
                     self._write_local_note(
                         bridge, rel_path, text, nb_root=nb_root, expected_revision=local_hash
                     )
+                    if text != orig_text:
+                        write_remote_note(rel_path, text, expected_hash=sha256_text(orig_text))
                     base_map[rel_path] = sha256_text(text)
                     pulled += 1
                     if is_conflict:
@@ -3529,7 +3820,14 @@ class SyncPlugin:
                     pass
             raise
 
-        return pushed, pulled, conflict_count, asset_count, base_map, written_remote_paths
+        synced_repo_paths = []
+        if protocol == "git":
+            sub_prefix = f"{subdir.strip('/')}/" if subdir.strip("/") else ""
+            for rel_path in plan["synced"]:
+                synced_repo_paths.append(f"{sub_prefix}{rel_path}")
+            for rel_path in plan.get("assets_synced") or ():
+                synced_repo_paths.append(f"{sub_prefix}{rel_path}")
+        return pushed, pulled, conflict_count, asset_count, base_map, written_remote_paths, synced_repo_paths
 
     def _compute_batch_plan(self, bridge, cfg, notebooks, only_path=None, inspect_remote=True, force_refresh=False):
         protocol = cfg.get("protocol", "local_mirror")
@@ -3560,6 +3858,49 @@ class SyncPlugin:
                     "fingerprint": "",
                 }
             prepared_repo_dir = res
+
+        # Validate physical target directories (catching symlink escapes and cross-notebook target aliasing).
+        if protocol in ("local_mirror", "git"):
+            base_root = self._resolve_mirror_dir(cfg) if protocol == "local_mirror" else (prepared_repo_dir or repo_dir)
+            if base_root:
+                base_real = os.path.realpath(base_root)
+                resolved_targets = []
+                for nb in notebooks:
+                    sub = bindings[nb]
+                    tdir = os.path.join(base_root, sub) if sub else base_root
+                    treal = os.path.realpath(tdir)
+                    if sub:
+                        if treal == base_real or not treal.startswith(base_real + os.sep):
+                            return {
+                                "cfg": dict(cfg),
+                                "protocol": protocol,
+                                "target_display": target_display,
+                                "repo_root": prepared_repo_dir or "",
+                                "plans": [],
+                                "remote_error": self._tr(
+                                    f"笔记本「{self._notebook_label(nb)}」的同步子目录超出同步根目录，已中止同步",
+                                    f"Sync subfolder for notebook {self._notebook_label(nb)} resolves outside the sync root; sync aborted",
+                                ),
+                                "fingerprint": "",
+                            }
+                    for prev_nb, prev_sub, prev_real in resolved_targets:
+                        same_or_nested = treal == prev_real or (
+                            bool(sub) and bool(prev_sub) and paths_overlap(treal, prev_real)
+                        )
+                        if same_or_nested:
+                            return {
+                                "cfg": dict(cfg),
+                                "protocol": protocol,
+                                "target_display": target_display,
+                                "repo_root": prepared_repo_dir or "",
+                                "plans": [],
+                                "remote_error": self._tr(
+                                    f"笔记本「{self._notebook_label(prev_nb)}」与「{self._notebook_label(nb)}」的同步目标目录指向同一或嵌套物理目录，已中止同步",
+                                    f"Sync folders for {self._notebook_label(prev_nb)} and {self._notebook_label(nb)} resolve to the same or nested directory; sync aborted",
+                                ),
+                                "fingerprint": "",
+                            }
+                    resolved_targets.append((nb, sub, treal))
 
         plans = []
         for nb in notebooks:
@@ -3636,8 +3977,9 @@ class SyncPlugin:
 
         pending_base_maps = []
         staged_git_paths = []
+        tracked_git_paths = []
         for plan in batch["plans"]:
-            pushed, pulled, conflicts, assets, updated_base, written_paths = self._apply_notebook_plan(
+            pushed, pulled, conflicts, assets, updated_base, written_paths, synced_paths = self._apply_notebook_plan(
                 bridge, plan, only_path=only_path, progress_state=progress_state
             )
             total_pushed += pushed
@@ -3646,6 +3988,7 @@ class SyncPlugin:
             total_assets += assets
             pending_base_maps.append((plan["meta_key"], updated_base))
             staged_git_paths.extend(written_paths)
+            tracked_git_paths.extend(synced_paths)
             if protocol != "git":
                 self.sync_meta[plan["meta_key"]] = updated_base
 
@@ -3658,7 +4001,12 @@ class SyncPlugin:
                     total=total_items if total_items > 0 else None,
                     label=self._tr("推送 Git…", "Pushing Git…"),
                 )
-            did_push = self._commit_and_push_git(batch["repo_root"], cfg, staged_rel_paths=staged_git_paths)
+            did_push = self._commit_and_push_git(
+                batch["repo_root"],
+                cfg,
+                staged_rel_paths=staged_git_paths,
+                tracked_plan_paths=tracked_git_paths,
+            )
             for mk, updated_base in pending_base_maps:
                 self.sync_meta[mk] = updated_base
 
