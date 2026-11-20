@@ -1,13 +1,11 @@
-# Sync (block-sync)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/card-en-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/card-en-light.png">
+  <img alt="Sync" src="assets/card-en-light.png">
+</picture>
 
-Incrementally sync notebooks across devices using a local folder mirror, WebDAV, or a Git repository.
+- **Three backends**: Sync multiple notebooks over Local Mirror, WebDAV, or Git.
+- **Auto on save**: Incremental sync runs automatically on save, plus one-click Sync Now.
+- **Conflict-safe**: Choose conflict copy, local-first, or remote-first with destructive guardrails.
 
-## Features
-
-- Select multiple open notebooks to sync using a local folder mirror, WebDAV, or a Git repository.
-- After you set and save a sync destination, notes sync automatically on save by default. You can also click **Sync Now**.
-- Resolve conflicts by keeping both copies, preferring the local version, or preferring the remote version. The plugin asks for confirmation before applying risky changes and shows recent sync activity.
-
-## Installation
-
-In Block, open **Settings → App Store** and search for Sync. You can also install it directly by entering `blockmd-plugins/block-sync`.
+**Install**: Open Block Settings -> App Store and search **Sync**, or enter `blockmd-plugins/block-sync`.

@@ -1,13 +1,11 @@
-# 同步 (block-sync)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/card-zh-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/card-zh-light.png">
+  <img alt="同步" src="assets/card-zh-light.png">
+</picture>
 
-支持本地目录镜像、WebDAV 与 Git 仓库的多端增量同步
+- **三通道同步**：支持本地目录镜像、WebDAV 与 Git 仓库，可同时管多个笔记本。
+- **保存即同步**：写完自动增量同步，也支持随时点「立即同步」。
+- **冲突有兜底**：冲突副本 / 优先本地 / 优先远端任选，危险变更二次确认。
 
-## 功能说明
-
-- 支持选择多个已打开的笔记本同步，覆盖本地目录镜像、WebDAV 与 Git 仓库三种同步通道
-- 设置同步目标并保存后，默认在每次保存笔记时自动同步，也可点击「立即同步」
-- 支持「生成冲突副本」「优先本地」「优先远端」三种双端冲突策略，并内置危险变更二次确认与最近同步记录展示
-
-## 安装方式
-
-在 Block 中打开「设置 → 应用商店」，搜索并安装本插件，或直接填入 `blockmd-plugins/block-sync` 安装。
+**安装**：打开 Block「设置 → 应用商店」搜索 **同步**，或手动填入 `blockmd-plugins/block-sync`。
