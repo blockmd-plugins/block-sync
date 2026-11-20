@@ -1420,7 +1420,7 @@ class SyncPlugin:
         sample_items = [s for s in (raw.get("sample_items") or []) if isinstance(s, dict) and s.get("kind") and s.get("path")][:MAX_STORED_CONFIRM_SAMPLES]
         sample_lines = [str(s).strip() for s in (raw.get("sample_lines") or []) if str(s or "").strip()][:MAX_STORED_CONFIRM_SAMPLES]
         total_samples = int(raw.get("total_samples") or len(sample_items) or len(sample_lines) or 0)
-        return {
+        pending = {
             "scope_key": scope_key,
             "fingerprint": fingerprint,
             "protocol": protocol,
@@ -1432,6 +1432,10 @@ class SyncPlugin:
             "sample_lines": sample_lines,
             "total_samples": total_samples,
         }
+        only_path, only_nb_root = raw.get("only_path"), raw.get("only_nb_root")
+        if isinstance(only_path, str) and is_safe_rel_md(only_path) and isinstance(only_nb_root, str) and only_nb_root:
+            pending.update(only_path=only_path, only_nb_root=self._norm_nb_path(only_nb_root))
+        return pending
 
     def _set_pending_confirm(self, pending, bridge=None):
         norm = self._normalize_pending_confirm(pending) if pending else None
@@ -4291,7 +4295,7 @@ class SyncPlugin:
         except Exception as exc:
             return False, self._tr(f"Git 检测异常: {self._error_detail(exc)}", f"Git connection test failed: {self._error_detail(exc)}")
 
-    def _prepare_git_repo(self, cfg, allow_init_or_clone=True, allow_pull=True, repo_dir=None):
+    def _prepare_git_repo(self, cfg, allow_init_or_clone=True, allow_pull=True, repo_dir=None, propose_update=False):
         if not shutil.which("git"):
             return False, self._tr("当前环境未安装 git 命令", "Git is not installed")
         target = str(cfg.get("git_remote") or "").strip()
@@ -4531,23 +4535,10 @@ class SyncPlugin:
                 cur_branch = self._git_current_branch(repo_dir, cfg=cfg)
                 if cur_branch != branch:
                     cur_label = cur_branch or "detached HEAD"
-                    st_proc = self._run_git(["status", "--porcelain"], cwd=repo_dir, cfg=cfg)
-                    if st_proc.returncode == 0 and st_proc.stdout.strip():
-                        return False, self._tr(
-                            f"本地 Git 仓库当前位于 {cur_label} 且有未提交改动，无法切换到 {branch}",
-                            f"Local Git repository is at {cur_label} with uncommitted changes; cannot switch to {branch}",
-                        )
-                    chk_ref = self._run_git(["rev-parse", "--verify", f"refs/heads/{branch}"], cwd=repo_dir, cfg=cfg)
-                    if chk_ref.returncode == 0:
-                        co_proc = self._run_git(["checkout", branch], cwd=repo_dir, cfg=cfg)
-                        if co_proc.returncode != 0:
-                            err = self._git_error_message(co_proc.stderr or co_proc.stdout, self._tr("切换分支失败", "Checkout failed"))
-                            return False, self._tr(f"Git 切换分支失败: {err}", f"Git branch checkout failed: {err}")
-                    else:
-                        return False, self._tr(
-                            f"本地 Git 仓库当前位于 {cur_label}，目标分支 {branch} 不存在",
-                            f"Local Git repository is at {cur_label} and target branch {branch} does not exist",
-                        )
+                    return False, self._tr(
+                        f"本地 Git 仓库当前位于 {cur_label}，请先切换到 {branch}",
+                        f"Local Git repository is at {cur_label}. Switch to {branch} before syncing.",
+                    )
                 if allow_pull:
                     remote_proc = self._run_git(["remote"], cwd=repo_dir, cfg=cfg)
                     remotes = [r.strip() for r in (remote_proc.stdout or "").splitlines() if r.strip()] if remote_proc.returncode == 0 else []
@@ -4579,22 +4570,54 @@ class SyncPlugin:
                             if fetch_proc.returncode != 0:
                                 err = self._git_error_message(fetch_proc.stderr or fetch_proc.stdout, self._tr("fetch 失败", "Fetch failed"))
                                 return False, self._tr(f"Git 拉取失败: {err}", f"Git pull failed: {err}")
-                            oid_p = self._run_git(["rev-parse", "--verify", f"refs/remotes/{remote_name}/{branch}"], cwd=repo_dir, cfg=cfg)
-                            if oid_p.returncode == 0 and oid_p.stdout.strip():
-                                self._record_git_synced_branch(repo_dir, branch, oid_p.stdout.strip(), remote_name=remote_name, cfg=cfg)
+                            remote_ref = f"refs/remotes/{remote_name}/{branch}"
+                            oid_p = self._run_git(["rev-parse", "--verify", remote_ref], cwd=repo_dir, cfg=cfg)
+                            remote_oid = oid_p.stdout.strip() if oid_p.returncode == 0 else ""
+                            if not remote_oid:
+                                return False, self._tr("无法读取 Git 远端提交", "Could not read the fetched Git commit")
+                            self._record_git_synced_branch(repo_dir, branch, remote_oid, remote_name=remote_name, cfg=cfg)
                             head_chk = self._run_git(["rev-parse", "--verify", "HEAD"], cwd=repo_dir, cfg=cfg)
-                            if head_chk.returncode != 0:
-                                self._run_git(["checkout", "-B", branch, f"refs/remotes/{remote_name}/{branch}"], cwd=repo_dir, cfg=cfg)
-                            else:
-                                ff_proc = self._run_git(["merge", "--ff-only", f"refs/remotes/{remote_name}/{branch}"], cwd=repo_dir, cfg=cfg)
-                                if ff_proc.returncode != 0:
-                                    err = self._git_error_message(ff_proc.stderr or ff_proc.stdout, self._tr("分支已分叉", "Branches diverged"))
-                                    return False, self._tr(
-                                        f"本地 Git 仓库与远端 {remote_name}/{branch} 已分叉，请先手动合并：{err}",
-                                        f"Local Git repository diverged from {remote_name}/{branch}; resolve manually: {err}",
-                                    )
+                            head = head_chk.stdout.strip() if head_chk.returncode == 0 else ""
+                            if head == remote_oid or (head and self._run_git(
+                                ["merge-base", "--is-ancestor", remote_oid, head], cwd=repo_dir, cfg=cfg,
+                            ).returncode == 0):
+                                return True, repo_dir
+                            if head and self._run_git(
+                                ["merge-base", "--is-ancestor", head, remote_oid], cwd=repo_dir, cfg=cfg,
+                            ).returncode != 0:
+                                return False, self._tr(
+                                    f"本地 Git 仓库与远端 {remote_name}/{branch} 已分叉，请先手动合并",
+                                    f"Local Git repository diverged from {remote_name}/{branch}; resolve manually.",
+                                )
+                            if not propose_update:
+                                return False, self._tr("更新本地 Git 工作区前需要确认", "Confirm before updating the local Git worktree")
+                            status = self._run_git(["status", "--porcelain"], cwd=repo_dir, cfg=cfg)
+                            if status.returncode != 0 or status.stdout.strip():
+                                return False, self._tr("请先处理本地 Git 工作区未提交的改动", "Resolve uncommitted changes in the local Git worktree first")
+                            info = os.stat(repo_dir)
+                            return True, {"repo": repo_dir, "branch": branch, "head": head,
+                                          "remote_ref": remote_ref, "remote_oid": remote_oid,
+                                          "identity": [info.st_dev, info.st_ino]}
 
         return True, repo_dir
+
+    def _advance_git_worktree(self, update, cfg):
+        repo, branch = update["repo"], update["branch"]
+        changed = self._tr("Git 工作区已变化，请重新预览", "The Git worktree changed. Review it again.")
+        with self._target_lock(repo):
+            info = os.stat(repo)
+            head = self._run_git(["rev-parse", "--verify", "HEAD"], cwd=repo, cfg=cfg)
+            actual_head = head.stdout.strip() if head.returncode == 0 else ""
+            status = self._run_git(["status", "--porcelain"], cwd=repo, cfg=cfg)
+            remote = self._run_git(["rev-parse", "--verify", update["remote_ref"]], cwd=repo, cfg=cfg)
+            if ([info.st_dev, info.st_ino] != update["identity"] or self._git_current_branch(repo, cfg=cfg) != branch
+                    or actual_head != update["head"] or status.returncode != 0 or status.stdout.strip()
+                    or remote.returncode != 0 or remote.stdout.strip() != update["remote_oid"]):
+                raise RuntimeError(changed)
+            args = ["merge", "--ff-only", update["remote_oid"]] if actual_head else ["checkout", "-B", branch, update["remote_oid"]]
+            advanced = self._run_git(args, cwd=repo, cfg=cfg)
+            if advanced.returncode != 0:
+                raise RuntimeError(self._git_error_message(advanced.stderr or advanced.stdout, changed))
 
     def _webdav_list_dir_entries(self, base_url, dir_parts, cfg=None, timeout=6):
         """Return (rel_path, is_collection) direct children of base_url/dir_parts via one Depth: 1 PROPFIND."""
@@ -5637,6 +5660,12 @@ class SyncPlugin:
                 f"已同步笔记在远端已缺失（{p}），需确认是否重新上传",
                 f"Previously synced note is missing remotely ({p}); confirm before re-uploading",
             )
+        if kind == "git_worktree_update":
+            branch, commit = item.get("branch", ""), item.get("commit", "")
+            return self._tr(
+                f"将本地 Git 工作区的 {branch} 更新到 {commit}，请先确认",
+                f"Confirm updating the local Git worktree on {branch} to {commit}",
+            )
         if kind == "bulk_pull":
             n = int(item.get("count") or 0)
             return prefix + self._tr(
@@ -5692,7 +5721,7 @@ class SyncPlugin:
             "local_missing": n_loc_miss,
         }
 
-    def _assess_dangerous_changes(self, plan, cfg, saved_path=None, nb_label=""):
+    def _assess_dangerous_changes(self, plan, cfg, nb_label=""):
         if not plan.get("remote_inspected"):
             return []
         items = []
@@ -5716,8 +5745,9 @@ class SyncPlugin:
                 items.append({"kind": "pull_conflict", "nb_label": nb_label, "count": m["pull_conflict"]})
             if m["push_conflict"] > 0 and (policy != "local_first" or m["push_conflict"] > DELETE_GUARD_THRESHOLD):
                 items.append({"kind": "push_conflict", "nb_label": nb_label, "count": m["push_conflict"]})
-            if saved_path is not None and cfg.get("delete_guard", True) and m["remote_missing"] > 0:
-                items.append({"kind": "remote_missing_single", "nb_label": nb_label, "path": saved_path})
+            if cfg.get("delete_guard", True) and 0 < m["remote_missing"] <= DELETE_GUARD_THRESHOLD:
+                for path in plan["remote_missing"]:
+                    items.append({"kind": "remote_missing_single", "nb_label": nb_label, "path": path})
 
         if cfg.get("delete_guard", True) and (m["remote_missing"] > DELETE_GUARD_THRESHOLD or m["local_missing"] > DELETE_GUARD_THRESHOLD):
             items.append({
@@ -6773,7 +6803,7 @@ class SyncPlugin:
 
         prepared_repo_dir = None
         if protocol == "git" and inspect_remote:
-            ok, res = self._prepare_git_repo(cfg, repo_dir=repo_dir, allow_init_or_clone=True, allow_pull=True)
+            ok, res = self._prepare_git_repo(cfg, repo_dir=repo_dir, propose_update=True)
             if not ok:
                 return {
                     "cfg": dict(cfg),
@@ -6783,6 +6813,12 @@ class SyncPlugin:
                     "plans": [],
                     "remote_error": res,
                     "fingerprint": "",
+                }
+            if isinstance(res, dict):
+                return {
+                    "cfg": dict(cfg), "protocol": protocol, "target_display": target_display,
+                    "repo_root": res["repo"], "plans": [], "git_worktree_update": res,
+                    "fingerprint": sha256_text(json.dumps(res, sort_keys=True)),
                 }
             prepared_repo_dir = res
 
@@ -6874,6 +6910,12 @@ class SyncPlugin:
         protocol = batch["protocol"]
         cfg = batch["cfg"]
         repo = batch.get("repo_root")
+        update = batch.get("git_worktree_update")
+        if update:
+            self._advance_git_worktree(update, cfg)
+            summary = self._tr("已更新 Git 工作区，可以继续同步笔记", "Git worktree updated. Sync can now continue.")
+            self._record_result("已更新", summary, protocol=protocol, target=batch["target_display"])
+            return summary
         if protocol == "git" and repo and not self._is_remote_git_url(cfg.get("git_remote") or ""):
             branch = self._git_branch(cfg)
             remotes = self._run_git(["remote"], cwd=repo, cfg=cfg)
@@ -7060,7 +7102,7 @@ class SyncPlugin:
 
     # ---------- Dispatch & UI ----------
 
-    def _build_pending_confirm(self, batch, reason_items):
+    def _build_pending_confirm(self, batch, reason_items, only_path=None, only_nb_root=None):
         sample_items = []
         total_samples = 0
 
@@ -7113,9 +7155,14 @@ class SyncPlugin:
             "reasons": [self._format_reason_item(r) for r in reason_items[:30]],
             "sample_items": sample_items,
             "total_samples": total_samples,
+            "only_path": only_path,
+            "only_nb_root": only_nb_root,
         }
 
-    def _assess_batch_dangerous_changes(self, batch, cfg, saved_path=None):
+    def _assess_batch_dangerous_changes(self, batch, cfg):
+        update = batch.get("git_worktree_update")
+        if update:
+            return [{"kind": "git_worktree_update", "branch": update["branch"], "commit": update["remote_oid"][:12]}]
         reason_items = []
         multi = len(batch["plans"]) > 1
         policy = cfg.get("conflict_policy", "keep_both")
@@ -7131,7 +7178,7 @@ class SyncPlugin:
 
         for plan in batch["plans"]:
             nb_lbl = plan["nb_label"] if multi else ""
-            nb_items = self._assess_dangerous_changes(plan, cfg, saved_path=saved_path, nb_label=nb_lbl)
+            nb_items = self._assess_dangerous_changes(plan, cfg, nb_label=nb_lbl)
             for it in nb_items:
                 if it.get("kind") == "delete_guard":
                     has_delete_guard = True
@@ -7226,16 +7273,15 @@ class SyncPlugin:
             raise self._sync_failure(msg)
 
         if not confirmed:
-            reason_items = self._assess_batch_dangerous_changes(batch, self.config, saved_path=only_path)
+            reason_items = self._assess_batch_dangerous_changes(batch, self.config)
             if reason_items:
                 self._last_sync_outcome = "pending_confirm"
                 first_reason = self._format_reason_item(reason_items[0])
+                self._set_pending_confirm(self._build_pending_confirm(
+                    batch, reason_items, only_path=only_path, only_nb_root=only_nb_root or self.notebook_root,
+                ))
                 if only_path is not None:
-                    cta = (
-                        self._tr("请前往同步页确认或重新同步", "Open Sync settings to review and confirm")
-                        if self.pending_confirm
-                        else self._tr("请点击立即同步确认", "Click Sync Now to confirm")
-                    )
+                    cta = self._tr("请前往同步页确认", "Open Sync settings to review and confirm")
                     msg = self._tr(f"自动同步暂停（{first_reason}），{cta}", f"Auto-sync paused ({first_reason}). {cta}.")
                     self._append_log(
                         self._tr(f"自动同步暂停 ({only_path})", f"Auto-sync paused ({only_path})"),
@@ -7249,7 +7295,6 @@ class SyncPlugin:
                     self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root)
                     self.last_status = msg
                     return msg
-                self._set_pending_confirm(self._build_pending_confirm(batch, reason_items))
                 msg = self._tr("检测到危险变更，请先确认后执行", "Risky changes detected. Confirm to continue.")
                 self._append_log(
                     first_reason,
@@ -7881,8 +7926,12 @@ class SyncPlugin:
                     self.last_status = status
                     ok = False
                     tone = "danger"
+                elif self.pending_confirm:
+                    status = self._tr("请先确认或取消已暂停的同步", "Confirm or cancel the paused sync first")
+                    self.last_status = status
+                    ok = False
+                    tone = "warning"
                 else:
-                    self._clear_pending_confirm(bridge)
                     status = self._run_sync(bridge, report_progress=True)
                     if self.pending_confirm:
                         ok = True
@@ -7917,8 +7966,16 @@ class SyncPlugin:
                 else:
                     protocol = self.config.get("protocol", "local_mirror")
                     notebooks = self._selected_notebooks(self.config)
+                    only_path = pc.get("only_path")
+                    only_nb_root = pc.get("only_nb_root")
+                    if only_nb_root:
+                        if only_nb_root not in notebooks:
+                            self._clear_pending_confirm(bridge)
+                            self.last_status = self._tr("待确认的笔记本已移除，请重新同步", "The pending notebook was removed. Start sync again.")
+                            return {"ok": False, "tone": "warning", "page": self.build_page(), "status": self.last_status}
+                        notebooks = [only_nb_root]
                     try:
-                        batch = self._compute_batch_plan(bridge, self.config, notebooks, inspect_remote=True, force_refresh=True)
+                        batch = self._compute_batch_plan(bridge, self.config, notebooks, only_path=only_path, inspect_remote=True, force_refresh=True)
                     except Exception as exc:
                         msg = self._tr(
                             f"{self._protocol_label(protocol)}同步未完成: {self._error_detail(exc)}",
@@ -7947,7 +8004,7 @@ class SyncPlugin:
                     if batch["fingerprint"] != pc.get("fingerprint"):
                         reason_items = self._assess_batch_dangerous_changes(batch, self.config)
                         if reason_items:
-                            self._set_pending_confirm(self._build_pending_confirm(batch, reason_items))
+                            self._set_pending_confirm(self._build_pending_confirm(batch, reason_items, only_path, only_nb_root))
                             self._append_log(
                                 self._format_reason_item(reason_items[0]),
                                 "待确认",
@@ -7998,7 +8055,8 @@ class SyncPlugin:
                             ok = False
                             tone = "danger"
                         else:
-                            status = self._run_sync(bridge, confirmed=True, approved_batch=batch, report_progress=True)
+                            status = self._run_sync(bridge, only_path=only_path, only_nb_root=only_nb_root,
+                                                    confirmed=True, approved_batch=batch, report_progress=True)
                             self._clear_pending_confirm(bridge)
                             ok = True
                             tone = "success"
