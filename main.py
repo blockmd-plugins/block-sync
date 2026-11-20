@@ -1892,7 +1892,7 @@ class SyncPlugin:
         if last_success is not None:
             entry["last_success"] = last_success
         self.notebook_results[nb_key] = entry
-        self._result_notice = (status_str, int(conflicts or 0), notice_key or (uuid.uuid4().hex if conflicts else ""))
+        self._result_notice = (status_str, int(conflicts or 0), notice_key or (uuid.uuid4().hex if conflicts or status_str == "失败" else ""))
 
     def _send_result_notice(self, bridge):
         notice, self._result_notice = self._result_notice, None
@@ -1929,7 +1929,7 @@ class SyncPlugin:
             fingerprint = (self.pending_confirm or {}).get("fingerprint") or notice_key
             if fingerprint:
                 params["dedup_key"] = fingerprint
-        elif conflicts and notice_key:
+        elif notice_key:
             params["dedup_key"] = notice_key
         if self.notebook_root and self._result_key() != "__multi__":
             root_key = self._notebook_key()
@@ -1979,6 +1979,8 @@ class SyncPlugin:
             params = dict(params, timeout_ms=min(remaining, 500))
             if fingerprint:
                 params["dedup_key"] = fingerprint
+            elif notice.get("status") == "失败" and not params.get("dedup_key"):
+                params["dedup_key"] = "legacy-failure:" + sha256_text(key)
             if self._deliver_result_notice(bridge, params):
                 done.append(key)
         self._ack_result_notices(bridge, done)
