@@ -189,38 +189,236 @@ def in_sync_subdir(rel_path, subdirs):
     return sync_dir_key(rel_path.split("/", 1)[0]) in subdirs
 
 
+def split_markdown_code_segments(text):
+    """Split Markdown text into alternating (is_code, segment) chunks.
+
+    Recognizes CommonMark fenced code blocks (top-level, inside blockquotes, and inside list items),
+    4-space/tab indented code blocks, and inline/multi-line backtick code spans (respecting
+    backslash-escaped opening backticks and whitespace-only paragraph separators).
+    """
+    if not text:
+        return []
+
+    def expand_indent_cols(s):
+        cols = 0
+        for ch in s:
+            if ch == " ":
+                cols += 1
+            elif ch == "\t":
+                cols += 4 - (cols % 4)
+            else:
+                break
+        return cols
+
+    def split_inline_code_spans(chunk):
+        out = []
+        n = len(chunk)
+        i = 0
+        plain_start = 0
+        para_sep_re = re.compile(r"\r?\n[ \t]*\r?\n")
+        while i < n:
+            if chunk[i] == "`":
+                bs = 0
+                p = i - 1
+                while p >= 0 and chunk[p] == "\\":
+                    bs += 1
+                    p -= 1
+                if bs % 2 == 1:
+                    i += 1
+                    continue
+                j = i
+                while j < n and chunk[j] == "`":
+                    j += 1
+                ticks = j - i
+                sep_m = para_sep_re.search(chunk, j)
+                limit = sep_m.start() if sep_m else n
+                k = j
+                matched_end = -1
+                while k < limit:
+                    if chunk[k] == "`":
+                        m = k
+                        while m < limit and chunk[m] == "`":
+                            m += 1
+                        if m - k == ticks:
+                            matched_end = m
+                            break
+                        k = m
+                    else:
+                        k += 1
+                if matched_end != -1:
+                    if i > plain_start:
+                        out.append((False, chunk[plain_start:i]))
+                    out.append((True, chunk[i:matched_end]))
+                    i = matched_end
+                    plain_start = matched_end
+                    continue
+                i = j
+            else:
+                i += 1
+        if plain_start < n:
+            out.append((False, chunk[plain_start:]))
+        return out
+
+    bq_prefix_re = re.compile(r"^((?: {0,3}>[ \t]?)*)(.*)$")
+    list_marker_re = re.compile(r"^( {0,3}(?:[*+-]|\d{1,9}[.)])(?:[ \t]+|$))(.*)$")
+    fence_re = re.compile(r"^([ \t]*)(\x60{3,}|~{3,})(.*)$")
+
+    block_segments = []
+    buf = []
+    fence_char = ""
+    fence_len = 0
+    fence_bq_depth = 0
+    fence_min_indent = 0
+    in_indented_code = False
+    indented_bq_depth = 0
+    indented_min_cols = 4
+    prev_line_blank = True
+    active_list_indent = 0
+    active_list_bq_depth = 0
+
+    for raw_line in text.splitlines(keepends=True):
+        body = raw_line.rstrip("\r\n")
+        bq_match = bq_prefix_re.match(body)
+        cur_depth = bq_match.group(1).count(">") if bq_match else 0
+        rest_after_bq = bq_match.group(2) if bq_match else body
+        is_blank = (rest_after_bq.strip() == "")
+        indent_cols = expand_indent_cols(rest_after_bq)
+
+        if fence_char:
+            dropped_container = (cur_depth < fence_bq_depth) or (
+                not is_blank and fence_min_indent > 0 and indent_cols < fence_min_indent
+            )
+            if dropped_container:
+                block_segments.append((True, "".join(buf)))
+                buf = []
+                fence_char = ""
+                fence_len = 0
+                fence_bq_depth = 0
+                fence_min_indent = 0
+                prev_line_blank = False
+            else:
+                close_m = re.match(r"^([ \t]*)(\x60{3,}|~{3,})[ \t]*$", rest_after_bq)
+                buf.append(raw_line)
+                if (
+                    cur_depth == fence_bq_depth
+                    and close_m
+                    and expand_indent_cols(close_m.group(1)) <= fence_min_indent + 3
+                    and close_m.group(2)[0] == fence_char
+                    and len(close_m.group(2)) >= fence_len
+                ):
+                    block_segments.append((True, "".join(buf)))
+                    buf = []
+                    fence_char = ""
+                    fence_len = 0
+                    fence_bq_depth = 0
+                    fence_min_indent = 0
+                    prev_line_blank = False
+                continue
+
+        if in_indented_code:
+            if cur_depth == indented_bq_depth and (is_blank or indent_cols >= indented_min_cols):
+                buf.append(raw_line)
+                prev_line_blank = is_blank
+                continue
+            block_segments.append((True, "".join(buf)))
+            buf = []
+            in_indented_code = False
+
+        if not is_blank and (cur_depth != active_list_bq_depth or indent_cols < active_list_indent):
+            active_list_indent = 0
+            active_list_bq_depth = 0
+
+        # Check for list-item container(s) on this line (e.g. "1. ~~~md" or "- ```").
+        list_rest = rest_after_bq
+        line_list_indent = active_list_indent if cur_depth == active_list_bq_depth else 0
+        opened_list_on_line = False
+        while True:
+            lm = list_marker_re.match(list_rest)
+            if not lm:
+                break
+            marker_str = lm.group(1)
+            line_list_indent = (line_list_indent if opened_list_on_line else 0) + expand_indent_cols(marker_str)
+            # If marker had no trailing space (empty list item), content indent is marker + 1.
+            if not marker_str.endswith((" ", "\t")):
+                line_list_indent += 1
+            list_rest = lm.group(2)
+            opened_list_on_line = True
+        if opened_list_on_line:
+            active_list_indent = line_list_indent
+            active_list_bq_depth = cur_depth
+
+        # Check fenced code block opening (either right after list marker or at container indent + 0..3).
+        fence_target = list_rest if opened_list_on_line else rest_after_bq
+        fence_base_indent = line_list_indent if opened_list_on_line else (active_list_indent if cur_depth == active_list_bq_depth else 0)
+        max_fence_lead = 3 if opened_list_on_line else (fence_base_indent + 3)
+        fm = fence_re.match(fence_target)
+        if fm and expand_indent_cols(fm.group(1)) <= max_fence_lead:
+            ch = fm.group(2)[0]
+            info = fm.group(3)
+            if ch != "`" or "`" not in info:
+                if buf:
+                    block_segments.append((False, "".join(buf)))
+                    buf = []
+                fence_char = ch
+                fence_len = len(fm.group(2))
+                fence_bq_depth = cur_depth
+                fence_min_indent = fence_base_indent
+                buf.append(raw_line)
+                prev_line_blank = False
+                continue
+
+        # Indented code block (CommonMark §4.4: 4 cols beyond container indent, not interrupting paragraph).
+        min_indented_cols = (active_list_indent + 4) if (cur_depth == active_list_bq_depth and active_list_indent > 0) else 4
+        if prev_line_blank and not is_blank and not opened_list_on_line and indent_cols >= min_indented_cols:
+            if buf:
+                block_segments.append((False, "".join(buf)))
+                buf = []
+            in_indented_code = True
+            indented_bq_depth = cur_depth
+            indented_min_cols = min_indented_cols
+            buf.append(raw_line)
+            prev_line_blank = False
+            continue
+
+        buf.append(raw_line)
+        prev_line_blank = is_blank
+
+    if buf:
+        block_segments.append((bool(fence_char or in_indented_code), "".join(buf)))
+
+    final_segments = []
+    for is_code, seg in block_segments:
+        if is_code:
+            final_segments.append((True, seg))
+        else:
+            final_segments.extend(split_inline_code_spans(seg))
+    return final_segments
+
+
 def note_asset_paths(note_path, text):
     # Block emits Markdown links/images and HTML src attributes for resized media.
-    fence = ""
-    visible = []
-    for line in text.splitlines():
-        marker = re.match(r"^\s*(\x60{3,}|~{3,})(.*)$", line)
-        if fence:
-            if marker and marker[1].startswith(fence) and not marker[2].strip():
-                fence = ""
-            visible.append("")
-        elif marker:
-            fence = marker[1]
-            visible.append("")
+    # Reuse the exact same CommonMark code scanner as rewrite_note_asset_links.
+    visible_parts = []
+    for is_code, seg in split_markdown_code_segments(text):
+        if is_code:
+            # Preserve line breaks so line-anchored reference-link regexes keep accurate boundaries.
+            visible_parts.append(re.sub(r"[^\r\n]", " ", seg))
         else:
-            visible.append(re.sub(
-                r"(\x60+)(?!\x60)(.+?)(?<!\x60)\1(?!\x60)",
-                lambda span: " " * len(span[0]), line,
-            ))
-    text = "\n".join(visible)
+            visible_parts.append(seg)
+    visible_text = "".join(visible_parts)
     bare_dest = r"(?:\\.|[^\s()<>\\]|\((?:\\.|[^\s()<>\\])*\))+"
     link_dest = rf"<([^>\n]+)>|({bare_dest})"
-    links = re.findall(rf"\]\(\s*(?:{link_dest})(?=[\s)])", text)
+    links = re.findall(rf"\]\(\s*(?:{link_dest})(?=[\s)])", visible_text)
     refs = re.findall(
         rf"(?m)^ {{0,3}}\[(?:\\.|[^\]\\\n])+\]:[ \t]*(?:\r?\n[ \t]*)?(?:{link_dest})(?=[ \t\r]|$)",
-        text,
+        visible_text,
     )
-    attrs = re.findall(r"""(?is)\b(?:src|href)\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))""", text)
+    attrs = re.findall(r"""(?is)\b(?:src|href)\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))""", visible_text)
     note_dir = posixpath.dirname(note_path)
     paths = set()
     for dest in (*links, *refs, *attrs):
         value = html.unescape(next(part for part in dest if part))
-        value = re.sub(r"\\([()<>])", r"\1", value)
+        value = re.sub(r"\\([()<>\\])", r"\1", value)
         decoded = urllib.parse.unquote(value.split("#", 1)[0].split("?", 1)[0])
         for candidate in {value, decoded}:
             if candidate.startswith(("/", "\\")) or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", candidate):
@@ -307,7 +505,7 @@ def rewrite_note_asset_links(note_path, text, asset_copy_map):
         if not raw_dest:
             return None
         unesc = html.unescape(raw_dest)
-        unesc = re.sub(r"\\([()<>])", r"\1", unesc)
+        unesc = re.sub(r"\\([()<>\\])", r"\1", unesc)
         base_part, sep_q, rest_q = unesc.partition("?")
         base_part, sep_h, rest_h = base_part.partition("#")
         tail = (sep_h + rest_h) + (sep_q + rest_q)
@@ -326,6 +524,15 @@ def rewrite_note_asset_links(note_path, text, asset_copy_map):
                 return rel_from_note + tail
         return None
 
+    def encode_md_bare_dest(dest_str):
+        out = dest_str.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)").replace("<", "\\<").replace(">", "\\>")
+        if re.search(r"\s", out):
+            return f"<{dest_str.replace('<', '%3C').replace('>', '%3E')}>"
+        return out
+
+    def encode_md_angle_dest(dest_str):
+        return dest_str.replace("\\", "\\\\").replace("<", "\\<").replace(">", "\\>")
+
     bare_dest = r"(?:\\.|[^\s()<>\\]|\((?:\\.|[^\s()<>\\])*\))+"
 
     def repl_md(match):
@@ -335,8 +542,8 @@ def rewrite_note_asset_links(note_path, text, asset_copy_map):
         if not updated:
             return match.group(0)
         if angle is not None:
-            return f"{prefix}<{updated}>"
-        return f"{prefix}{updated}"
+            return f"{prefix}<{encode_md_angle_dest(updated)}>"
+        return f"{prefix}{encode_md_bare_dest(updated)}"
 
     def repl_attr(match):
         prefix, q1, q2, bare = match.group(1), match.group(2), match.group(3), match.group(4)
@@ -345,9 +552,9 @@ def rewrite_note_asset_links(note_path, text, asset_copy_map):
         if not updated:
             return match.group(0)
         if q1 is not None:
-            return f'{prefix}"{updated}"'
+            return f'{prefix}"{html.escape(updated, quote=True)}"'
         if q2 is not None:
-            return f"{prefix}'{updated}'"
+            return f"{prefix}'{html.escape(updated, quote=True)}'"
         return f"{prefix}{updated}"
 
     def rewrite_plain_segment(segment):
@@ -360,161 +567,9 @@ def rewrite_note_asset_links(note_path, text, asset_copy_map):
         out = re.sub(r"""(?is)(\b(?:src|href)\s*=\s*)(?:"([^"]+)"|'([^']+)'|([^\s>]+))""", repl_attr, out)
         return out
 
-    def rewrite_non_code_chunk(chunk):
-        # Scan CommonMark backtick code spans (including multi-line spans within the same paragraph)
-        # respecting backslash-escaped opening backticks and whitespace-only paragraph separators.
-        out = []
-        n = len(chunk)
-        i = 0
-        plain_start = 0
-        para_sep_re = re.compile(r"\r?\n[ \t]*\r?\n")
-        while i < n:
-            if chunk[i] == "`":
-                # CommonMark §2.4: odd number of preceding backslashes escapes the opening backtick.
-                bs = 0
-                p = i - 1
-                while p >= 0 and chunk[p] == "\\":
-                    bs += 1
-                    p -= 1
-                if bs % 2 == 1:
-                    i += 1
-                    continue
-                j = i
-                while j < n and chunk[j] == "`":
-                    j += 1
-                ticks = j - i
-                # Find matching run of exact length `ticks` before any blank (whitespace-only) line.
-                sep_m = para_sep_re.search(chunk, j)
-                limit = sep_m.start() if sep_m else n
-                k = j
-                matched_end = -1
-                while k < limit:
-                    if chunk[k] == "`":
-                        m = k
-                        while m < limit and chunk[m] == "`":
-                            m += 1
-                        if m - k == ticks:
-                            matched_end = m
-                            break
-                        k = m
-                    else:
-                        k += 1
-                if matched_end != -1:
-                    if i > plain_start:
-                        out.append(rewrite_plain_segment(chunk[plain_start:i]))
-                    out.append(chunk[i:matched_end])
-                    i = matched_end
-                    plain_start = matched_end
-                    continue
-                i = j
-            else:
-                i += 1
-        if plain_start < n:
-            out.append(rewrite_plain_segment(chunk[plain_start:]))
-        return "".join(out)
-
-    # Split into code-block (fenced, blockquoted-fenced, or 4-space indented) vs non-code chunks.
-    fence_open_re = re.compile(r"^((?: {0,3}>[ \t]?)*) {0,3}(\x60{3,}|~{3,})(.*)$")
-    bq_prefix_re = re.compile(r"^((?: {0,3}>[ \t]?)*)(.*)$")
-    segments = []
-    buf = []
-    fence_char = ""
-    fence_len = 0
-    fence_bq_depth = 0
-    in_indented_code = False
-    indented_bq_depth = 0
-    prev_line_blank = True
-
-    def bq_depth(prefix):
-        return prefix.count(">")
-
-    def leading_indent_cols(s):
-        cols = 0
-        for ch in s:
-            if ch == " ":
-                cols += 1
-            elif ch == "\t":
-                cols += 4 - (cols % 4)
-            else:
-                break
-        return cols
-
-    for raw_line in text.splitlines(keepends=True):
-        body = raw_line.rstrip("\r\n")
-        if fence_char:
-            bq_match = bq_prefix_re.match(body)
-            cur_depth = bq_depth(bq_match.group(1)) if bq_match else 0
-            if cur_depth < fence_bq_depth:
-                segments.append((True, "".join(buf)))
-                buf = []
-                fence_char = ""
-                fence_len = 0
-                fence_bq_depth = 0
-                prev_line_blank = False
-            else:
-                rest_after_bq = bq_match.group(2) if bq_match else body
-                close_m = re.match(r"^ {0,3}(\x60{3,}|~{3,})[ \t]*$", rest_after_bq)
-                buf.append(raw_line)
-                if (
-                    cur_depth == fence_bq_depth
-                    and close_m
-                    and close_m.group(1)[0] == fence_char
-                    and len(close_m.group(1)) >= fence_len
-                ):
-                    segments.append((True, "".join(buf)))
-                    buf = []
-                    fence_char = ""
-                    fence_len = 0
-                    fence_bq_depth = 0
-                    prev_line_blank = False
-                continue
-
-        bq_match = bq_prefix_re.match(body)
-        cur_depth = bq_depth(bq_match.group(1)) if bq_match else 0
-        rest_after_bq = bq_match.group(2) if bq_match else body
-        is_blank = (rest_after_bq.strip() == "")
-
-        if in_indented_code:
-            if cur_depth == indented_bq_depth and (is_blank or leading_indent_cols(rest_after_bq) >= 4):
-                buf.append(raw_line)
-                prev_line_blank = is_blank
-                continue
-            segments.append((True, "".join(buf)))
-            buf = []
-            in_indented_code = False
-
-        if prev_line_blank and not is_blank and leading_indent_cols(rest_after_bq) >= 4:
-            if buf:
-                segments.append((False, "".join(buf)))
-                buf = []
-            in_indented_code = True
-            indented_bq_depth = cur_depth
-            buf.append(raw_line)
-            prev_line_blank = False
-            continue
-
-        open_m = fence_open_re.match(body)
-        if open_m:
-            ch = open_m.group(2)[0]
-            info = open_m.group(3)
-            if ch != "`" or "`" not in info:
-                if buf:
-                    segments.append((False, "".join(buf)))
-                    buf = []
-                fence_char = ch
-                fence_len = len(open_m.group(2))
-                fence_bq_depth = bq_depth(open_m.group(1))
-                buf.append(raw_line)
-                prev_line_blank = False
-                continue
-        buf.append(raw_line)
-        prev_line_blank = is_blank
-    if buf:
-        segments.append((bool(fence_char or in_indented_code), "".join(buf)))
-
     out_parts = []
-    for is_code, seg in segments:
-        out_parts.append(seg if is_code else rewrite_non_code_chunk(seg))
+    for is_code, seg in split_markdown_code_segments(text):
+        out_parts.append(seg if is_code else rewrite_plain_segment(seg))
     return "".join(out_parts)
 
 
