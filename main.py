@@ -1415,6 +1415,8 @@ class SyncPlugin:
         protocol = str(raw.get("protocol") or "").strip()
         reasons = [str(r).strip() for r in (raw.get("reasons") or []) if str(r or "").strip()]
         reason_items = [r for r in (raw.get("reason_items") or []) if isinstance(r, dict) and r.get("kind")]
+        if any(item["kind"] == "git_worktree_update" for item in reason_items):
+            return None
         if not scope_key or not fingerprint or protocol not in VALID_PROTOCOLS or (not reasons and not reason_items):
             return None
         sample_items = [s for s in (raw.get("sample_items") or []) if isinstance(s, dict) and s.get("kind") and s.get("path")][:MAX_STORED_CONFIRM_SAMPLES]
@@ -4295,7 +4297,7 @@ class SyncPlugin:
         except Exception as exc:
             return False, self._tr(f"Git 检测异常: {self._error_detail(exc)}", f"Git connection test failed: {self._error_detail(exc)}")
 
-    def _prepare_git_repo(self, cfg, allow_init_or_clone=True, allow_pull=True, repo_dir=None, propose_update=False):
+    def _prepare_git_repo(self, cfg, allow_init_or_clone=True, allow_pull=True, repo_dir=None):
         if not shutil.which("git"):
             return False, self._tr("当前环境未安装 git 命令", "Git is not installed")
         target = str(cfg.get("git_remote") or "").strip()
@@ -4589,35 +4591,12 @@ class SyncPlugin:
                                     f"本地 Git 仓库与远端 {remote_name}/{branch} 已分叉，请先手动合并",
                                     f"Local Git repository diverged from {remote_name}/{branch}; resolve manually.",
                                 )
-                            if not propose_update:
-                                return False, self._tr("更新本地 Git 工作区前需要确认", "Confirm before updating the local Git worktree")
-                            status = self._run_git(["status", "--porcelain"], cwd=repo_dir, cfg=cfg)
-                            if status.returncode != 0 or status.stdout.strip():
-                                return False, self._tr("请先处理本地 Git 工作区未提交的改动", "Resolve uncommitted changes in the local Git worktree first")
-                            info = os.stat(repo_dir)
-                            return True, {"repo": repo_dir, "branch": branch, "head": head,
-                                          "remote_ref": remote_ref, "remote_oid": remote_oid,
-                                          "identity": [info.st_dev, info.st_ino]}
+                            return False, self._tr(
+                                f"请先在 Git 中将本地工作区的 {branch} 更新到 {remote_name}/{branch}，再重试同步",
+                                f"Update the local Git worktree on {branch} to {remote_name}/{branch} in Git, then retry sync.",
+                            )
 
         return True, repo_dir
-
-    def _advance_git_worktree(self, update, cfg):
-        repo, branch = update["repo"], update["branch"]
-        changed = self._tr("Git 工作区已变化，请重新预览", "The Git worktree changed. Review it again.")
-        with self._target_lock(repo):
-            info = os.stat(repo)
-            head = self._run_git(["rev-parse", "--verify", "HEAD"], cwd=repo, cfg=cfg)
-            actual_head = head.stdout.strip() if head.returncode == 0 else ""
-            status = self._run_git(["status", "--porcelain"], cwd=repo, cfg=cfg)
-            remote = self._run_git(["rev-parse", "--verify", update["remote_ref"]], cwd=repo, cfg=cfg)
-            if ([info.st_dev, info.st_ino] != update["identity"] or self._git_current_branch(repo, cfg=cfg) != branch
-                    or actual_head != update["head"] or status.returncode != 0 or status.stdout.strip()
-                    or remote.returncode != 0 or remote.stdout.strip() != update["remote_oid"]):
-                raise RuntimeError(changed)
-            args = ["merge", "--ff-only", update["remote_oid"]] if actual_head else ["checkout", "-B", branch, update["remote_oid"]]
-            advanced = self._run_git(args, cwd=repo, cfg=cfg)
-            if advanced.returncode != 0:
-                raise RuntimeError(self._git_error_message(advanced.stderr or advanced.stdout, changed))
 
     def _webdav_list_dir_entries(self, base_url, dir_parts, cfg=None, timeout=6):
         """Return (rel_path, is_collection) direct children of base_url/dir_parts via one Depth: 1 PROPFIND."""
@@ -5659,12 +5638,6 @@ class SyncPlugin:
             return prefix + self._tr(
                 f"已同步笔记在远端已缺失（{p}），需确认是否重新上传",
                 f"Previously synced note is missing remotely ({p}); confirm before re-uploading",
-            )
-        if kind == "git_worktree_update":
-            branch, commit = item.get("branch", ""), item.get("commit", "")
-            return self._tr(
-                f"将本地 Git 工作区的 {branch} 更新到 {commit}，请先确认",
-                f"Confirm updating the local Git worktree on {branch} to {commit}",
             )
         if kind == "bulk_pull":
             n = int(item.get("count") or 0)
@@ -6803,7 +6776,7 @@ class SyncPlugin:
 
         prepared_repo_dir = None
         if protocol == "git" and inspect_remote:
-            ok, res = self._prepare_git_repo(cfg, repo_dir=repo_dir, propose_update=True)
+            ok, res = self._prepare_git_repo(cfg, repo_dir=repo_dir)
             if not ok:
                 return {
                     "cfg": dict(cfg),
@@ -6813,12 +6786,6 @@ class SyncPlugin:
                     "plans": [],
                     "remote_error": res,
                     "fingerprint": "",
-                }
-            if isinstance(res, dict):
-                return {
-                    "cfg": dict(cfg), "protocol": protocol, "target_display": target_display,
-                    "repo_root": res["repo"], "plans": [], "git_worktree_update": res,
-                    "fingerprint": sha256_text(json.dumps(res, sort_keys=True)),
                 }
             prepared_repo_dir = res
 
@@ -6910,12 +6877,6 @@ class SyncPlugin:
         protocol = batch["protocol"]
         cfg = batch["cfg"]
         repo = batch.get("repo_root")
-        update = batch.get("git_worktree_update")
-        if update:
-            self._advance_git_worktree(update, cfg)
-            summary = self._tr("已更新 Git 工作区，可以继续同步笔记", "Git worktree updated. Sync can now continue.")
-            self._record_result("已更新", summary, protocol=protocol, target=batch["target_display"])
-            return summary
         if protocol == "git" and repo and not self._is_remote_git_url(cfg.get("git_remote") or ""):
             branch = self._git_branch(cfg)
             remotes = self._run_git(["remote"], cwd=repo, cfg=cfg)
@@ -7160,9 +7121,6 @@ class SyncPlugin:
         }
 
     def _assess_batch_dangerous_changes(self, batch, cfg):
-        update = batch.get("git_worktree_update")
-        if update:
-            return [{"kind": "git_worktree_update", "branch": update["branch"], "commit": update["remote_oid"][:12]}]
         reason_items = []
         multi = len(batch["plans"]) > 1
         policy = cfg.get("conflict_policy", "keep_both")
