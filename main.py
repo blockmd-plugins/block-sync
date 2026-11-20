@@ -3725,6 +3725,11 @@ class SyncPlugin:
         target = str(cfg.get("git_remote") or "").strip()
         branch = self._git_branch(cfg)
         repo_dir = repo_dir or self._resolve_local_git_dir(cfg)
+        if repo_dir and self._has_git_marker(repo_dir):
+            try:
+                self._recover_abandoned_git_index(repo_dir, cfg=cfg)
+            except RuntimeError as exc:
+                return False, str(exc)
 
         if target and self._is_remote_git_url(target):
             ok_heads, heads_or_err = self._git_remote_heads(target, cfg=cfg, timeout=10, retries=2, total_budget=22.0)
@@ -3770,9 +3775,11 @@ class SyncPlugin:
                         # Before resetting a managed cache against an empty remote, check if our target branch
                         # already has unpushed local commits (e.g. first push rejected by a receive hook).
                         local_ref = f"refs/heads/{branch}"
-                        if self._run_git(["rev-parse", "--verify", local_ref], cwd=repo_dir, cfg=cfg).returncode == 0:
+                        local_oid_proc = self._run_git(["rev-parse", "--verify", local_ref], cwd=repo_dir, cfg=cfg)
+                        local_oid = local_oid_proc.stdout.strip() if local_oid_proc.returncode == 0 else ""
+                        if local_oid:
                             retry_push = self._run_git_network(
-                                ["push", f"--force-with-lease=refs/heads/{branch}:", "-u", "origin", f"{local_ref}:{local_ref}"],
+                                ["push", f"--force-with-lease=refs/heads/{branch}:", "-u", "origin", f"{local_oid}:refs/heads/{branch}"],
                                 cwd=repo_dir,
                                 timeout=12,
                                 cfg=cfg,
@@ -3870,9 +3877,11 @@ class SyncPlugin:
                     if self._is_managed_git_dir(repo_dir):
                         local_ref = f"refs/heads/{branch}"
                         remote_ref = f"refs/remotes/origin/{branch}"
-                        if self._run_git(["rev-parse", "--verify", local_ref], cwd=repo_dir, cfg=cfg).returncode == 0:
-                            ahead_p = self._run_git(["rev-list", "--count", f"{remote_ref}..{local_ref}"], cwd=repo_dir, cfg=cfg)
-                            behind_p = self._run_git(["rev-list", "--count", f"{local_ref}..{remote_ref}"], cwd=repo_dir, cfg=cfg)
+                        local_oid_proc = self._run_git(["rev-parse", "--verify", local_ref], cwd=repo_dir, cfg=cfg)
+                        local_oid = local_oid_proc.stdout.strip() if local_oid_proc.returncode == 0 else ""
+                        if local_oid:
+                            ahead_p = self._run_git(["rev-list", "--count", f"{remote_ref}..{local_oid}"], cwd=repo_dir, cfg=cfg)
+                            behind_p = self._run_git(["rev-list", "--count", f"{local_oid}..{remote_ref}"], cwd=repo_dir, cfg=cfg)
                             ahead_n = int((ahead_p.stdout or "0").strip() or "0") if ahead_p.returncode == 0 else 0
                             behind_n = int((behind_p.stdout or "0").strip() or "0") if behind_p.returncode == 0 else 0
                             if ahead_n > 0:
@@ -3881,7 +3890,7 @@ class SyncPlugin:
                                     exp_oid = exp_oid_p.stdout.strip() if exp_oid_p.returncode == 0 else ""
                                     lease_arg = f"--force-with-lease=refs/heads/{branch}:{exp_oid}"
                                     retry_push = self._run_git_network(
-                                        ["push", lease_arg, "-u", "origin", f"{local_ref}:{local_ref}"],
+                                        ["push", lease_arg, "-u", "origin", f"{local_oid}:refs/heads/{branch}"],
                                         cwd=repo_dir,
                                         timeout=12,
                                         cfg=cfg,
@@ -5142,10 +5151,14 @@ class SyncPlugin:
             items.append({"kind": "bulk_pull", "nb_label": nb_label, "count": m["pull_new"] + m["pull_total"]})
         return items
 
-    def _check_git_staged_conflicts(self, repo_root, rel_paths, cfg=None):
+    def _check_git_staged_conflicts(self, repo_root, rel_paths, cfg=None, recover=True):
         """Abort before writing or committing if any planned path already has independent staged changes in Git index."""
         cleaned = sorted({p.replace("\\", "/").lstrip("/") for p in (rel_paths or []) if p})
-        if not cleaned or not repo_root or not self._has_git_marker(repo_root):
+        if not repo_root or not self._has_git_marker(repo_root):
+            return
+        if recover:
+            self._recover_abandoned_git_index(repo_root, cfg=cfg)
+        if not cleaned:
             return
         if self._is_managed_git_dir(repo_root):
             return
@@ -5179,6 +5192,139 @@ class SyncPlugin:
             raise RuntimeError(self._tr(
                 f"Git 暂存区已有这些文件的待提交改动，请先提交或取消暂存后再同步：{sample}",
                 f"Git index already has staged changes for planned sync files; commit or unstage them first: {sample}",
+            ))
+
+    def _git_index_owner_path(self, repo_root, cfg=None):
+        return self._git_path(repo_root, "block-sync-index.owner", cfg=cfg)
+
+    def _write_git_index_owner(self, repo_root, cfg=None):
+        path = self._git_index_owner_path(repo_root, cfg=cfg)
+        if not path:
+            return ""
+        fd = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+        try:
+            os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return path
+
+    def _clear_git_index_owner(self, path):
+        if not path:
+            return
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    def _recover_abandoned_git_index(self, repo_root, cfg=None):
+        owner_path = self._git_index_owner_path(repo_root, cfg=cfg)
+        if not owner_path or not os.path.exists(owner_path):
+            return
+        try:
+            owner_pid = int(open(owner_path, encoding="ascii").read().strip() or "0")
+        except (OSError, ValueError):
+            owner_pid = 0
+        if owner_pid and owner_pid != os.getpid() and self._pid_is_alive(owner_pid):
+            return
+        index_path = self._git_path(repo_root, "index", cfg=cfg)
+        if index_path:
+            try:
+                os.unlink(index_path + ".lock")
+            except OSError:
+                pass
+        self._repair_git_index_to_head(repo_root, cfg=cfg)
+        self._clear_git_index_owner(owner_path)
+
+    def _repair_git_index_to_head(self, repo_root, cfg=None):
+        head = self._run_git(["rev-parse", "--verify", "HEAD"], cwd=repo_root, cfg=cfg)
+        if head.returncode != 0 or not head.stdout.strip():
+            return
+        head_oid = head.stdout.strip()
+        parent = self._run_git(["rev-parse", "--verify", "HEAD^"], cwd=repo_root, cfg=cfg)
+        parent_oid = parent.stdout.strip() if parent.returncode == 0 else ""
+        parent_entries = {}
+        if parent_oid:
+            listed = subprocess.run(
+                ["git", "ls-tree", "-r", "-z", parent_oid],
+                cwd=repo_root,
+                env=self._git_env(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=8,
+            )
+            if listed.returncode != 0:
+                err_txt = (listed.stderr or listed.stdout or b"").decode("utf-8", errors="replace")
+                raise RuntimeError(self._tr(
+                    f"Git 索引修复失败: {self._error_detail(err_txt)}",
+                    f"Git index repair failed: {self._error_detail(err_txt)}",
+                ))
+            for entry in (listed.stdout or b"").split(b"\0"):
+                if not entry or b"\t" not in entry:
+                    continue
+                meta, path_b = entry.split(b"\t", 1)
+                parts = meta.split()
+                if len(parts) >= 3:
+                    parent_entries[os.fsdecode(path_b).replace("\\", "/")] = parts[2].decode("ascii", errors="replace")
+        diff = subprocess.run(
+            ["git", "diff-index", "--cached", "-z", head_oid],
+            cwd=repo_root,
+            env=self._git_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=8,
+        )
+        if diff.returncode != 0:
+            err_txt = (diff.stderr or diff.stdout or b"").decode("utf-8", errors="replace")
+            raise RuntimeError(self._tr(
+                f"Git 索引修复失败: {self._error_detail(err_txt)}",
+                f"Git index repair failed: {self._error_detail(err_txt)}",
+            ))
+        raw_parts = (diff.stdout or b"").split(b"\0")
+        updates = []
+        cursor = 0
+        while cursor < len(raw_parts) - 1:
+            meta = raw_parts[cursor]
+            path_b = raw_parts[cursor + 1]
+            cursor += 2
+            if not meta.startswith(b":"):
+                continue
+            fields = meta[1:].split(b" ")
+            if len(fields) < 5:
+                continue
+            status = fields[4].decode("ascii", errors="replace")
+            if status[:1] in ("R", "C") and cursor < len(raw_parts):
+                cursor += 1
+                continue
+            path = os.fsdecode(path_b).replace("\\", "/")
+            head_mode = fields[0].decode("ascii", errors="replace")
+            head_sha = fields[2].decode("ascii", errors="replace")
+            index_sha = fields[3].decode("ascii", errors="replace")
+            parent_sha = parent_entries.get(path, "")
+            index_missing = set(index_sha) <= {"0"}
+            if index_sha == parent_sha or (index_missing and not parent_sha):
+                if head_mode and set(head_sha) - {"0"}:
+                    updates.append((head_mode, head_sha, path))
+        if not updates:
+            return
+        payload = b"".join(
+            f"{mode} {oid}\t".encode("ascii") + os.fsencode(path) + b"\0"
+            for mode, oid, path in updates
+        )
+        updated = subprocess.run(
+            ["git", "update-index", "-z", "--index-info"],
+            cwd=repo_root,
+            env=self._git_env(),
+            input=payload,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=8,
+        )
+        if updated.returncode != 0:
+            err_txt = (updated.stderr or updated.stdout or b"").decode("utf-8", errors="replace")
+            raise RuntimeError(self._tr(
+                f"Git 索引修复失败: {self._error_detail(err_txt)}",
+                f"Git index repair failed: {self._error_detail(err_txt)}",
             ))
 
     def _check_git_ignored(self, repo_root, rel_paths, cfg=None):
@@ -5219,6 +5365,7 @@ class SyncPlugin:
         # Remove any stale untracked atomic-write temp files left behind by a prior SIGKILL cancellation
         # so they can never be staged or pushed to the remote repository.
         self._cleanup_stale_temp_files(repo_root, cfg=cfg)
+        self._recover_abandoned_git_index(repo_root, cfg=cfg)
         branch = self._git_branch(cfg)
         cur_branch = self._git_current_branch(repo_root, cfg=cfg)
         if cur_branch != branch:
@@ -5290,7 +5437,7 @@ class SyncPlugin:
                 if fast_oid == prev_oid:
                     continue
             ho_proc = subprocess.run(
-                ["git", "hash-object", "-w", "--stdin"],
+                ["git", "hash-object", "-w", "--path", p, "--stdin"],
                 cwd=repo_root,
                 env=git_env,
                 input=raw_data,
@@ -5388,6 +5535,7 @@ class SyncPlugin:
                     raise RuntimeError(self._tr(f"Git 提交对象创建失败: {self._error_detail(err_txt)}", f"Git commit-tree failed: {self._error_detail(err_txt)}"))
                 new_commit = (ct_proc.stdout or b"").decode("ascii", errors="replace").strip()
 
+                owner_path = self._write_git_index_owner(repo_root, cfg=cfg)
                 # 2. Acquire .git/index.lock so no concurrent `git add` can mutate the real index between
                 #    our staged-conflict check, branch ref update, and atomic index replacement.
                 lock_fd = None
@@ -5405,9 +5553,10 @@ class SyncPlugin:
                         time.sleep(0.05)
 
                 replaced_index = False
+                ref_advanced = False
                 try:
                     # Re-check staged conflicts under index.lock (read-only against real_index).
-                    self._check_git_staged_conflicts(repo_root, all_check_paths, cfg=cfg)
+                    self._check_git_staged_conflicts(repo_root, all_check_paths, cfg=cfg, recover=False)
 
                     # Clone real_index (preserving any unrelated user-staged files) and update only changed_entries.
                     if os.path.isfile(real_index):
@@ -5439,6 +5588,7 @@ class SyncPlugin:
                     if ur_proc.returncode != 0:
                         err_txt = (ur_proc.stderr or ur_proc.stdout or b"").decode("utf-8", errors="replace")
                         raise RuntimeError(self._tr(f"Git 分支更新失败（可能存在并发提交）: {self._error_detail(err_txt)}", f"Git branch update failed (concurrent commit?): {self._error_detail(err_txt)}"))
+                    ref_advanced = True
 
                     # Atomically replace real_index via index_lock (Git's native atomic index-commit protocol).
                     with open(tmp_real_idx, "rb") as src_idx:
@@ -5463,6 +5613,10 @@ class SyncPlugin:
                             os.unlink(index_lock)
                         except OSError:
                             pass
+                    if ref_advanced and not replaced_index:
+                        self._repair_git_index_to_head(repo_root, cfg=cfg)
+                    if replaced_index or not ref_advanced:
+                        self._clear_git_index_owner(owner_path)
                 did_commit = True
             finally:
                 for p_tmp in (tmp_tree_idx, tmp_real_idx):
@@ -5493,7 +5647,7 @@ class SyncPlugin:
                     needs_push = True
                 else:
                     ahead_proc = self._run_git(
-                        ["rev-list", "--count", f"refs/remotes/{remote_name}/{branch}..HEAD"],
+                        ["rev-list", "--count", f"refs/remotes/{remote_name}/{branch}..{head_oid}"],
                         cwd=repo_root,
                         cfg=cfg,
                     )
@@ -5502,7 +5656,7 @@ class SyncPlugin:
 
                 if needs_push:
                     if expected_remote_oid:
-                        anc_proc = self._run_git(["merge-base", "--is-ancestor", expected_remote_oid, "HEAD"], cwd=repo_root, cfg=cfg)
+                        anc_proc = self._run_git(["merge-base", "--is-ancestor", expected_remote_oid, head_oid], cwd=repo_root, cfg=cfg)
                         if anc_proc.returncode != 0:
                             raise RuntimeError(self._tr(
                                 f"本地 Git 分支 {branch} 与远端记录分叉，为避免覆盖远端历史已中止推送",
@@ -5519,7 +5673,7 @@ class SyncPlugin:
                             self._record_git_pending_initial(repo_root, branch, head_oid, remote_name=remote_name, cfg=cfg)
                         lease_arg = f"--force-with-lease=refs/heads/{branch}:"
                     push_proc = self._run_git_network(
-                        ["push", lease_arg, "-u", remote_name, f"HEAD:refs/heads/{branch}"],
+                        ["push", lease_arg, "-u", remote_name, f"{head_oid}:refs/heads/{branch}"],
                         cwd=repo_root,
                         timeout=12,
                         cfg=cfg,
