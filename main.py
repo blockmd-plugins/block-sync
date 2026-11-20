@@ -1668,6 +1668,171 @@ class SyncPlugin:
             return self._webdav_base_url(cfg) or "unconfigured"
         return f"{self._resolve_local_git_dir(cfg)}:{self._git_branch(cfg)}"
 
+    def _is_transient_git_error(self, raw_text):
+        lower = str(raw_text or "").lower()
+        if not lower:
+            return False
+        non_transient = (
+            "permission denied (publickey)",
+            "authentication failed",
+            "invalid username or token",
+            "invalid username or password",
+            "http basic: access denied",
+            "repository not found",
+            "could not read username",
+            "terminal prompts disabled",
+            "returned error: 401",
+            "returned error: 403",
+            "returned error: 404",
+            "non-fast-forward",
+            "could not apply",
+        )
+        if any(token in lower for token in non_transient):
+            return False
+        transient = (
+            "connection closed",
+            "connection reset",
+            "broken pipe",
+            "timed out",
+            "timeout",
+            "could not resolve host",
+            "temporary failure in name resolution",
+            "failed to connect",
+            "couldn't connect to server",
+            "network is unreachable",
+            "no route to host",
+            "connection refused",
+            "unexpected disconnect",
+            "early eof",
+            "the remote end hung up unexpectedly",
+            "kex_exchange_identification",
+            "banner exchange",
+            "recv failure",
+            "empty reply from server",
+            "ssl_connect",
+            "gnutls_handshake",
+            "curl 7",
+            "curl 28",
+            "curl 35",
+            "curl 56",
+        )
+        return any(token in lower for token in transient)
+
+    def _git_error_message(self, raw_text, fallback):
+        lower = str(raw_text or "").lower()
+        if "permission denied (publickey)" in lower:
+            return self._tr(
+                "SSH 公钥认证失败，请检查本机 SSH 密钥配置",
+                "SSH public key authentication failed; check your SSH key setup",
+            )
+        if any(token in lower for token in (
+            "authentication failed",
+            "invalid username or token",
+            "invalid username or password",
+            "http basic: access denied",
+            "returned error: 401",
+            "returned error: 403",
+            "could not read username",
+            "terminal prompts disabled",
+        )):
+            return self._tr(
+                "身份认证失败，请检查访问令牌或仓库权限",
+                "Authentication failed; check your access token or repository permissions",
+            )
+        if any(token in lower for token in ("repository not found", "returned error: 404")):
+            return self._tr(
+                "未找到远端仓库，请检查仓库地址和访问权限",
+                "Remote repository not found; check the URL and access permissions",
+            )
+        if any(token in lower for token in ("timed out", "timeout", "curl 28")):
+            return self._tr(
+                "连接超时，请检查网络或代理设置后重试",
+                "Connection timed out; check your network or proxy and try again",
+            )
+        if any(token in lower for token in (
+            "connection closed",
+            "connection reset",
+            "broken pipe",
+            "kex_exchange_identification",
+            "banner exchange",
+            "early eof",
+            "unexpected disconnect",
+            "the remote end hung up unexpectedly",
+            "recv failure",
+            "empty reply from server",
+        )):
+            return self._tr(
+                "网络连接中断，请检查网络或代理后重试",
+                "Network connection was closed; check your network or proxy and try again",
+            )
+        if any(token in lower for token in (
+            "could not resolve host",
+            "temporary failure in name resolution",
+            "failed to connect",
+            "couldn't connect to server",
+            "network is unreachable",
+            "no route to host",
+            "connection refused",
+            "ssl_connect",
+            "gnutls_handshake",
+            "curl 7",
+            "curl 35",
+            "curl 56",
+        )):
+            return self._tr(
+                "无法连接远端服务器，请检查网络或代理设置",
+                "Could not reach the remote server; check your network or proxy",
+            )
+        return self._error_detail(raw_text or fallback)
+
+    def _run_git_network(
+        self,
+        args,
+        cwd=None,
+        timeout=12,
+        cfg=None,
+        retries=2,
+        retry_delay=1.0,
+        total_budget=22.0,
+        on_retry=None,
+    ):
+        started = time.monotonic()
+        last_proc = None
+        for attempt in range(retries + 1):
+            elapsed = time.monotonic() - started
+            if attempt > 0:
+                remaining = total_budget - elapsed
+                if remaining <= 2.0:
+                    break
+                step_timeout = min(timeout, max(3.0, remaining))
+            else:
+                step_timeout = timeout
+            try:
+                proc = self._run_git(args, cwd=cwd, timeout=step_timeout, cfg=cfg)
+            except subprocess.TimeoutExpired:
+                proc = subprocess.CompletedProcess(
+                    ["git", *args],
+                    124,
+                    "",
+                    f"Connection timed out after {int(step_timeout)}s",
+                )
+            last_proc = proc
+            if proc.returncode == 0:
+                return proc
+            raw_err = proc.stderr or proc.stdout or ""
+            if attempt >= retries or not self._is_transient_git_error(raw_err):
+                return proc
+            delay = min(retry_delay * (attempt + 1), 2.5)
+            if (time.monotonic() - started) + delay + 2.0 >= total_budget:
+                return proc
+            if on_retry is not None:
+                try:
+                    on_retry()
+                except Exception:
+                    pass
+            time.sleep(delay)
+        return last_proc
+
     def _test_git(self):
         if not shutil.which("git"):
             return False, self._tr("当前环境未安装 git 命令", "Git is not installed")
@@ -1675,10 +1840,15 @@ class SyncPlugin:
         branch = self._git_branch()
         try:
             if target and self._is_remote_git_url(target):
-                proc = self._run_git(["ls-remote", "--heads", target, branch])
+                proc = self._run_git_network(
+                    ["ls-remote", "--heads", target, branch],
+                    timeout=10,
+                    retries=1,
+                    total_budget=20.0,
+                )
                 if proc.returncode == 0:
                     return True, self._tr(f"Git 远端仓库连接正常（分支 {branch}）", f"Git remote connection successful (branch: {branch})")
-                err = self._error_detail(proc.stderr or proc.stdout or self._tr("连接失败", "Connection failed"))
+                err = self._git_error_message(proc.stderr or proc.stdout, self._tr("连接失败", "Connection failed"))
                 return False, self._tr(f"Git 远端不可达: {err}", f"Git remote is unreachable: {err}")
 
             repo_dir = self._resolve_local_git_dir()
@@ -1690,7 +1860,13 @@ class SyncPlugin:
             remote_proc = self._run_git(["remote"], cwd=repo_dir)
             remotes = [r.strip() for r in remote_proc.stdout.splitlines() if r.strip()]
             if remotes:
-                ls_proc = self._run_git(["ls-remote", "--heads", remotes[0], branch], cwd=repo_dir)
+                ls_proc = self._run_git_network(
+                    ["ls-remote", "--heads", remotes[0], branch],
+                    cwd=repo_dir,
+                    timeout=10,
+                    retries=1,
+                    total_budget=20.0,
+                )
                 if ls_proc.returncode == 0:
                     return True, self._tr(f"Git 仓库及远端 {remotes[0]} 正常", f"Git repository and remote {remotes[0]} are available")
                 return True, self._tr(f"本地 Git 仓库可用（远端 {remotes[0]} 当前离线）", f"Local Git repository is available (remote {remotes[0]} is offline)")
@@ -1710,18 +1886,50 @@ class SyncPlugin:
                 if not allow_init_or_clone:
                     return False, None
                 os.makedirs(os.path.dirname(repo_dir), exist_ok=True)
-                clone_proc = self._run_git(["clone", "--branch", branch, target, repo_dir], timeout=12, cfg=cfg)
+                existed_before = os.path.exists(repo_dir)
+
+                def _cleanup_partial_clone():
+                    if not existed_before and os.path.exists(repo_dir):
+                        shutil.rmtree(repo_dir, ignore_errors=True)
+
+                clone_proc = self._run_git_network(
+                    ["clone", "--branch", branch, target, repo_dir],
+                    timeout=15,
+                    cfg=cfg,
+                    retries=2,
+                    total_budget=30.0,
+                    on_retry=_cleanup_partial_clone,
+                )
                 if clone_proc.returncode != 0:
-                    clone_proc = self._run_git(["clone", target, repo_dir], timeout=12, cfg=cfg)
+                    first_err = clone_proc.stderr or clone_proc.stdout or ""
+                    if not self._is_transient_git_error(first_err):
+                        _cleanup_partial_clone()
+                        clone_proc = self._run_git_network(
+                            ["clone", target, repo_dir],
+                            timeout=15,
+                            cfg=cfg,
+                            retries=1,
+                            total_budget=24.0,
+                            on_retry=_cleanup_partial_clone,
+                        )
                 if clone_proc.returncode != 0:
-                    err = self._error_detail(clone_proc.stderr or clone_proc.stdout or self._tr("clone 失败", "Clone failed"))
+                    _cleanup_partial_clone()
+                    err = self._git_error_message(clone_proc.stderr or clone_proc.stdout, self._tr("clone 失败", "Clone failed"))
                     return False, self._tr(f"Git 远端不可达: {err}", f"Git remote is unreachable: {err}")
             else:
                 url_proc = self._run_git(["remote", "get-url", "origin"], cwd=repo_dir, cfg=cfg)
                 if url_proc.returncode == 0 and url_proc.stdout.strip() != target:
                     self._run_git(["remote", "set-url", "origin", target], cwd=repo_dir, cfg=cfg)
                 if allow_pull:
-                    pull_proc = self._run_git(["pull", "--rebase", "--autostash", "origin", branch], cwd=repo_dir, timeout=10, cfg=cfg)
+                    pull_proc = self._run_git_network(
+                        ["pull", "--rebase", "--autostash", "origin", branch],
+                        cwd=repo_dir,
+                        timeout=12,
+                        cfg=cfg,
+                        retries=2,
+                        total_budget=22.0,
+                        on_retry=lambda: self._run_git(["rebase", "--abort"], cwd=repo_dir, cfg=cfg),
+                    )
                     if pull_proc.returncode != 0:
                         err_lower = (pull_proc.stderr or pull_proc.stdout or "").lower()
                         self._run_git(["rebase", "--abort"], cwd=repo_dir, cfg=cfg)
@@ -1730,7 +1938,7 @@ class SyncPlugin:
                             and "does not have any commits" not in err_lower
                             and "no such ref" not in err_lower
                         ):
-                            err = self._error_detail(pull_proc.stderr or pull_proc.stdout or self._tr("pull 失败", "Pull failed"))
+                            err = self._git_error_message(pull_proc.stderr or pull_proc.stdout, self._tr("pull 失败", "Pull failed"))
                             return False, self._tr(f"Git 拉取失败: {err}", f"Git pull failed: {err}")
         else:
             if not os.path.isdir(os.path.join(repo_dir, ".git")):
@@ -2083,14 +2291,16 @@ class SyncPlugin:
                         needs_push = True
 
                 if needs_push:
-                    push_proc = self._run_git(
+                    push_proc = self._run_git_network(
                         ["push", "-u", remote_name, f"HEAD:{branch}"],
                         cwd=repo_root,
                         timeout=12,
                         cfg=cfg,
+                        retries=2,
+                        total_budget=22.0,
                     )
                     if push_proc.returncode != 0:
-                        err = self._error_detail(push_proc.stderr or push_proc.stdout or self._tr("push 失败", "Push failed"))
+                        err = self._git_error_message(push_proc.stderr or push_proc.stdout, self._tr("push 失败", "Push failed"))
                         raise RuntimeError(self._tr(f"已提交到本地 Git，但远端推送未完成: {err}", f"Committed locally. Git push failed: {err}"))
                     return True
         return False
