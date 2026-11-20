@@ -3594,6 +3594,24 @@ class SyncPlugin:
         data = self._load_git_pushed_refs(repo_dir, cfg=cfg)
         return str(data.get(f"{remote_name}:{branch}") or "").strip()
 
+    def _git_branch_has_upstream_config(self, repo_dir, branch, remote_name="origin", cfg=None):
+        if not repo_dir or not branch or not self._has_git_marker(repo_dir):
+            return False
+        if self._run_git(["rev-parse", "--verify", f"refs/heads/{branch}"], cwd=repo_dir, cfg=cfg).returncode != 0:
+            return False
+        r_proc = self._run_git(["config", "--get", f"branch.{branch}.remote"], cwd=repo_dir, cfg=cfg)
+        if r_proc.returncode != 0 or r_proc.stdout.strip() != remote_name:
+            return False
+        m_proc = self._run_git(["config", "--get", f"branch.{branch}.merge"], cwd=repo_dir, cfg=cfg)
+        if m_proc.returncode != 0:
+            return False
+        return m_proc.stdout.strip() in (f"refs/heads/{branch}", branch)
+
+    def _was_git_branch_synced(self, repo_dir, branch, remote_name="origin", cfg=None):
+        return bool(self._get_git_synced_branch_oid(repo_dir, branch, remote_name=remote_name, cfg=cfg)) or (
+            self._git_branch_has_upstream_config(repo_dir, branch, remote_name=remote_name, cfg=cfg)
+        )
+
     def _test_git(self):
         if not shutil.which("git"):
             return False, self._tr("当前环境未安装 git 命令", "Git is not installed")
@@ -3607,7 +3625,7 @@ class SyncPlugin:
                 heads = res
                 if not heads:
                     repo_dir = self._resolve_local_git_dir(self.config)
-                    if self._get_git_synced_branch_oid(repo_dir, branch, remote_name="origin", cfg=self.config):
+                    if self._was_git_branch_synced(repo_dir, branch, remote_name="origin", cfg=self.config):
                         return False, self._tr(
                             f"远端分支 {branch} 已不存在（疑似被删除或重置），请先确认远端状态",
                             f"Remote branch {branch} no longer exists (it may have been deleted or reset); verify remote state first",
@@ -3639,7 +3657,7 @@ class SyncPlugin:
                 remote_name = "origin" if "origin" in remotes else remotes[0]
                 ok, res = self._git_remote_heads(remote_name, cfg=self.config, cwd=repo_dir, timeout=10, retries=1, total_budget=20.0)
                 if ok:
-                    if not res and self._get_git_synced_branch_oid(repo_dir, branch, remote_name=remote_name, cfg=self.config):
+                    if not res and self._was_git_branch_synced(repo_dir, branch, remote_name=remote_name, cfg=self.config):
                         return False, self._tr(
                             f"远端 {remote_name} 的分支 {branch} 已不存在（疑似被删除或重置），请先确认远端状态",
                             f"Remote {remote_name} branch {branch} no longer exists (it may have been deleted or reset); verify remote state first",
@@ -3696,10 +3714,10 @@ class SyncPlugin:
                     elif url_proc.stdout.strip() != target:
                         self._run_git(["remote", "set-url", "origin", target], cwd=repo_dir, cfg=cfg)
                     if self._is_managed_git_dir(repo_dir):
-                        # If we previously synced with origin/<branch> (tracking ref or persisted ledger exists)
+                        # If we previously synced with origin/<branch> (tracking ref, upstream config, or ledger exists)
                         # and the remote now has no branches, the remote branch was deleted or reset — abort
                         # loudly instead of silently pushing local history back to origin or wiping the cache.
-                        if self._get_git_synced_branch_oid(repo_dir, branch, remote_name="origin", cfg=cfg):
+                        if self._was_git_branch_synced(repo_dir, branch, remote_name="origin", cfg=cfg):
                             return False, self._tr(
                                 f"远端分支 {branch} 已不存在（疑似被删除或重置），为避免未经确认重建远端历史已中止同步",
                                 f"Remote branch {branch} no longer exists (it may have been deleted or reset); sync aborted to avoid silently recreating remote history",
@@ -3911,7 +3929,7 @@ class SyncPlugin:
                                 f"远端 {remote_name} 不存在分支 {branch}（已有分支：{avail}）",
                                 f"Remote {remote_name} does not have branch {branch} (available: {avail})",
                             )
-                        if not heads_or_err and self._get_git_synced_branch_oid(repo_dir, branch, remote_name=remote_name, cfg=cfg):
+                        if not heads_or_err and self._was_git_branch_synced(repo_dir, branch, remote_name=remote_name, cfg=cfg):
                             return False, self._tr(
                                 f"远端 {remote_name} 的分支 {branch} 已不存在（疑似被删除或重置），为避免未经确认重建远端历史已中止同步",
                                 f"Remote {remote_name} branch {branch} no longer exists (it may have been deleted or reset); sync aborted to avoid silently recreating remote history",
@@ -5198,6 +5216,11 @@ class SyncPlugin:
                                 f"Local Git branch {branch} diverged from last synced remote commit; push aborted",
                             ))
                         lease_arg = f"--force-with-lease=refs/heads/{branch}:{expected_remote_oid}"
+                    elif old_head and self._git_branch_has_upstream_config(repo_root, branch, remote_name=remote_name, cfg=cfg):
+                        raise RuntimeError(self._tr(
+                            f"远端 {remote_name} 的分支 {branch} 已不存在（疑似被删除或重置），为避免未经确认重建远端历史已中止同步",
+                            f"Remote {remote_name} branch {branch} no longer exists (it may have been deleted or reset); sync aborted to avoid silently recreating remote history",
+                        ))
                     else:
                         lease_arg = f"--force-with-lease=refs/heads/{branch}:"
                     push_proc = self._run_git_network(
