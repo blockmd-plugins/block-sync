@@ -7944,7 +7944,7 @@ class SyncPlugin:
                             f"{self._protocol_label(protocol)} sync",
                         ), "失败", tone="danger", tooltip=msg)
                         self._record_result("失败", msg, protocol=protocol)
-                        self._save_runtime(bridge)
+                        self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root)
                         self.last_status = msg
                         raise self._sync_failure(msg) from exc
 
@@ -7955,7 +7955,7 @@ class SyncPlugin:
                             f"{self._protocol_label(batch['protocol'])} sync",
                         ), "失败", tone="danger", tooltip=msg)
                         self._record_result("失败", msg, protocol=batch["protocol"], target=batch["target_display"])
-                        self._save_runtime(bridge)
+                        self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root)
                         self.last_status = msg
                         raise self._sync_failure(msg)
 
