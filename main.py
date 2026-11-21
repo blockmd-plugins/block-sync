@@ -850,6 +850,7 @@ class SyncPlugin:
         self.supports_add_folder = False
         self.supports_form_layout = False
         self.supports_multi_notebook = False
+        self.supports_log_timeline = False
         self.supports_system = False
         self._stored_global = None
         self._credential_cleanup = set()
@@ -1536,6 +1537,12 @@ class SyncPlugin:
         if key == "test_conn":
             return self._tr(f"测试连接 ({proto})", f"Test connection ({proto})"), ""
         if key == "sync_noop":
+            count = max(1, int(a.get("count") or 1))
+            if count > 1:
+                first_hm = format_hm(a.get("first_time") or "")
+                last_hm = format_hm(a.get("last_time") or "")
+                span_tip = f"{first_hm} → {last_hm}" if first_hm and last_hm and first_hm != last_hm else self._tr("已是最新", "Up to date")
+                return self._tr(f"{proto}同步（{count} 次无改动）", f"{proto} sync ({count} checks)"), span_tip
             return self._tr(f"{proto}同步", f"{proto} sync"), self._tr("已是最新", "Up to date")
         if key == "sync_canceled":
             return self._tr("危险变更同步", "Sync with risky changes"), self._tr("用户已取消本次同步", "The user canceled this sync")
@@ -2055,6 +2062,287 @@ class SyncPlugin:
         branch = self._git_branch(c)
         repo_dir = self._resolve_local_git_dir(c)
         return f"{target} ({branch})" if target else f"{repo_dir} ({branch})"
+
+    def _parse_hms_seconds(self, time_str):
+        m = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$", str(time_str or "").strip())
+        if not m:
+            return None
+        return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3) or 0)
+
+    def _format_quiet_duration(self, seconds):
+        secs = max(0, int(seconds or 0))
+        if secs < 60:
+            return ""
+        if secs < 3600:
+            mins = max(1, int(round(secs / 60.0)))
+            return self._tr(f"{mins} 分钟", f"{mins} min")
+        hrs = secs // 3600
+        mins = (secs % 3600) // 60
+        if mins > 0:
+            return self._tr(f"{hrs} 小时 {mins} 分钟", f"{hrs}h {mins}m")
+        return self._tr(f"{hrs} 小时", f"{hrs} hr")
+
+    def _record_noop_log(self, protocol, summary):
+        now_str = now_hms()
+        now_ts = int(time.time())
+        if self.logs:
+            top = self.logs[0]
+            if isinstance(top, dict) and top.get("log_key") == "sync_noop":
+                args = dict(top.get("log_args") or {})
+                if not args.get("protocol") or args.get("protocol") == protocol:
+                    count = max(1, int(args.get("count") or 1)) + 1
+                    first_time = str(args.get("first_time") or top.get("time") or now_str).strip() or now_str
+                    first_ts = int(args.get("first_ts") or 0)
+                    if first_ts <= 0:
+                        f_sec = self._parse_hms_seconds(first_time)
+                        n_sec = self._parse_hms_seconds(now_str)
+                        if f_sec is not None and n_sec is not None and n_sec >= f_sec:
+                            first_ts = now_ts - (n_sec - f_sec)
+                        else:
+                            first_ts = now_ts
+                    checks = [str(x) for x in (args.get("checks") or []) if str(x or "").strip()]
+                    if not checks and top.get("time"):
+                        checks = [str(top.get("time"))]
+                    checks.insert(0, now_str)
+                    args["protocol"] = protocol
+                    args["count"] = count
+                    args["first_time"] = first_time
+                    args["last_time"] = now_str
+                    args["first_ts"] = first_ts
+                    args["last_ts"] = now_ts
+                    args["checks"] = checks[:24]
+                    top["time"] = now_str
+                    top["tooltip"] = summary
+                    top["log_args"] = args
+                    return
+        self._append_log(
+            self._tr(f"{self._protocol_label(protocol)}同步", f"{self._protocol_label(protocol)} sync"),
+            "无变更",
+            tone="info",
+            tooltip=summary,
+            log_key="sync_noop",
+            log_args={
+                "protocol": protocol,
+                "count": 1,
+                "first_time": now_str,
+                "last_time": now_str,
+                "first_ts": now_ts,
+                "last_ts": now_ts,
+                "checks": [now_str],
+            },
+        )
+
+    def _is_noop_entry(self, entry):
+        if not isinstance(entry, dict):
+            return False
+        if entry.get("log_key") == "sync_noop":
+            return True
+        norm = self._normalize_log(entry)
+        return norm.get("status") == "无变更"
+
+    def _is_batchable_change(self, entry):
+        if not isinstance(entry, dict):
+            return False
+        key = entry.get("log_key")
+        return key in (
+            "push_new", "push_update", "push_overwrite",
+            "pull_new", "pull_update", "pull_overwrite",
+            "assets_synced",
+        )
+
+    def _timeline_entries(self, limit=8):
+        raw_logs = [e for e in self.logs if isinstance(e, dict)]
+        out = []
+        i = 0
+        n = len(raw_logs)
+        while i < n and len(out) < limit:
+            entry = raw_logs[i]
+
+            # 1. Collapse consecutive no-change checks into a single quiet span.
+            if self._is_noop_entry(entry):
+                total_count = 0
+                first_time = ""
+                last_time = ""
+                first_ts = 0
+                last_ts = 0
+                checks = []
+                while i < n and self._is_noop_entry(raw_logs[i]):
+                    cur = raw_logs[i]
+                    args = cur.get("log_args") if isinstance(cur.get("log_args"), dict) else {}
+                    c_count = max(1, int(args.get("count") or 1))
+                    total_count += c_count
+                    c_last = str(args.get("last_time") or cur.get("time") or "").strip()
+                    c_first = str(args.get("first_time") or cur.get("time") or "").strip()
+                    if not last_time and c_last:
+                        last_time = c_last
+                    if c_first:
+                        first_time = c_first
+                    c_lts = int(args.get("last_ts") or 0)
+                    c_fts = int(args.get("first_ts") or 0)
+                    if c_lts > last_ts:
+                        last_ts = c_lts
+                    if c_fts > 0 and (first_ts == 0 or c_fts < first_ts):
+                        first_ts = c_fts
+                    c_checks = args.get("checks")
+                    if isinstance(c_checks, list) and c_checks:
+                        for ck in c_checks:
+                            s_ck = str(ck or "").strip()
+                            if s_ck and len(checks) < 24:
+                                checks.append(s_ck)
+                    elif c_last and len(checks) < 24:
+                        checks.append(c_last)
+                    i += 1
+
+                if not first_time:
+                    first_time = last_time
+                dur_secs = 0
+                if first_ts > 0 and last_ts >= first_ts:
+                    dur_secs = last_ts - first_ts
+                else:
+                    fs = self._parse_hms_seconds(first_time)
+                    ls = self._parse_hms_seconds(last_time)
+                    if fs is not None and ls is not None and ls >= fs:
+                        dur_secs = ls - fs
+
+                dur_text = self._format_quiet_duration(dur_secs)
+                badge = (
+                    self._tr(f"静默 {dur_text}", f"Quiet {dur_text}")
+                    if dur_text
+                    else self._tr("无改动", "No changes")
+                )
+                title = (
+                    self._tr("1 次检查，无改动", "1 check, no changes")
+                    if total_count == 1
+                    else self._tr(f"{total_count} 次检查，无改动", f"{total_count} checks, no changes")
+                )
+                first_hm = format_hm(first_time)
+                last_hm = format_hm(last_time)
+                if total_count > 1 and first_hm and last_hm and first_hm != last_hm:
+                    span_str = f"{first_hm} → {last_hm}"
+                else:
+                    span_str = last_time or last_hm
+                span_item = {
+                    "kind": "span",
+                    "time": last_hm or last_time,
+                    "badge": badge,
+                    "title": title,
+                    "span": span_str,
+                    "tone": "info",
+                }
+                if len(checks) > 1:
+                    span_item["details"] = checks[:24]
+                out.append(span_item)
+                continue
+
+            # 2. Group file & attachment changes from the same sync second into one timeline event.
+            if self._is_batchable_change(entry):
+                batch_time = str(entry.get("time") or "").strip()
+                pushed_notes = 0
+                pulled_notes = 0
+                attachments = 0
+                tags = []
+                asset_prefixes = []
+                while i < n and self._is_batchable_change(raw_logs[i]) and str(raw_logs[i].get("time") or "").strip() == batch_time:
+                    cur = raw_logs[i]
+                    k = cur.get("log_key")
+                    args = cur.get("log_args") if isinstance(cur.get("log_args"), dict) else {}
+                    if k in ("push_new", "push_update", "push_overwrite"):
+                        pushed_notes += 1
+                        p = str(args.get("path") or "").strip()
+                        if p and p not in tags:
+                            tags.append(p)
+                    elif k in ("pull_new", "pull_update", "pull_overwrite"):
+                        pulled_notes += 1
+                        p = str(args.get("path") or "").strip()
+                        if p and p not in tags:
+                            tags.append(p)
+                    elif k == "assets_synced":
+                        cnt = max(1, int(args.get("count") or 1))
+                        attachments += cnt
+                        pfx = str(args.get("prefix") or "").strip().rstrip("/· ").strip()
+                        if pfx and pfx not in asset_prefixes:
+                            asset_prefixes.append(pfx)
+                    i += 1
+
+                if attachments > 0:
+                    if pushed_notes == 0 and pulled_notes == 0 and asset_prefixes:
+                        for pfx in asset_prefixes:
+                            if pfx not in tags:
+                                tags.append(pfx)
+                    else:
+                        att_tag = self._tr(
+                            f"{attachments} 个附件",
+                            "1 attachment" if attachments == 1 else f"{attachments} attachments",
+                        )
+                        tags.append(att_tag)
+
+                note_parts = []
+                if pushed_notes > 0 and pulled_notes == 0:
+                    note_parts.append(self._tr(
+                        f"推送 {pushed_notes} 篇笔记",
+                        "Pushed 1 note" if pushed_notes == 1 else f"Pushed {pushed_notes} notes",
+                    ))
+                elif pulled_notes > 0 and pushed_notes == 0:
+                    note_parts.append(self._tr(
+                        f"拉取 {pulled_notes} 篇笔记",
+                        "Pulled 1 note" if pulled_notes == 1 else f"Pulled {pulled_notes} notes",
+                    ))
+                elif pushed_notes > 0 and pulled_notes > 0:
+                    total_n = pushed_notes + pulled_notes
+                    note_parts.append(self._tr(f"同步 {total_n} 篇笔记", f"Synced {total_n} notes"))
+
+                if attachments > 0:
+                    if note_parts:
+                        note_parts.append(self._tr(
+                            f"{attachments} 个附件",
+                            "1 attachment" if attachments == 1 else f"{attachments} attachments",
+                        ))
+                    else:
+                        note_parts.append(self._tr(
+                            f"同步 {attachments} 个附件",
+                            "Synced 1 attachment" if attachments == 1 else f"Synced {attachments} attachments",
+                        ))
+
+                ev = {
+                    "kind": "event",
+                    "time": format_hm(batch_time) or batch_time,
+                    "title": " · ".join(note_parts) if note_parts else self._tr("同步完成", "Sync complete"),
+                    "tone": "success",
+                }
+                if tags:
+                    ev["tags"] = tags[:12]
+                if batch_time:
+                    ev["tooltip"] = batch_time
+                out.append(ev)
+                continue
+
+            # 3. Single event (failure, conflict, confirmation, test connection, or legacy entry).
+            item = self._log_for_page(entry)
+            tone = item.get("tone", "info")
+            title = item.get("title", "")
+            status = item.get("status", "")
+            sub_text = item.get("tooltip", "")
+            ev_time = format_hm(item.get("time", "")) or item.get("time", "")
+            ev = {
+                "kind": "event",
+                "time": ev_time,
+                "title": title,
+                "tone": tone,
+            }
+            if tone == "danger":
+                if self._is_en():
+                    if "fail" not in title.lower():
+                        ev["title"] = f"{title} failed"
+                else:
+                    if "失败" not in title and "未连通" not in title:
+                        ev["title"] = f"{title}失败"
+            elif status and tone != "success":
+                ev["status"] = status
+            if sub_text:
+                ev["sub_text"] = sub_text
+            out.append(ev)
+            i += 1
+        return out
 
     def _append_log(self, title, status, tone="", tooltip="", log_key=None, log_args=None):
         raw = {
@@ -7209,15 +7497,8 @@ class SyncPlugin:
                 self._record_result("成功", summary, protocol=protocol, target=batch["target_display"])
                 return summary
             summary = self._tr("已是最新", "Up to date")
-            if only_path is None and not self._scheduled_run:
-                self._append_log(
-                    self._tr(f"{self._protocol_label(protocol)}同步", f"{self._protocol_label(protocol)} sync"),
-                    "无变更",
-                    tone="info",
-                    tooltip=summary,
-                    log_key="sync_noop",
-                    log_args={"protocol": protocol},
-                )
+            if only_path is None:
+                self._record_noop_log(protocol, summary)
             self._record_result("无变更", summary, protocol=protocol, target=batch["target_display"])
             return summary
 
@@ -7897,23 +8178,31 @@ class SyncPlugin:
             if isinstance(last_ok, dict) and last_ok.get("time")
             else ""
         )
-        history_entries = [
-            self._log_for_page(entry)
-            for entry in self.logs[:6]
-            if isinstance(entry, dict)
-        ]
+        if self.supports_log_timeline:
+            history_item = {
+                "kind": "log_list",
+                "id": "sync_logs",
+                "variant": "timeline",
+                "empty_text": self._tr("暂无同步记录", "No sync activity yet"),
+                "entries": self._timeline_entries(limit=8),
+            }
+        else:
+            history_entries = [
+                self._log_for_page(entry)
+                for entry in self.logs[:6]
+                if isinstance(entry, dict)
+            ]
+            history_item = {
+                "kind": "log_list",
+                "id": "sync_logs",
+                "empty_text": self._tr("暂无同步记录", "No sync activity yet"),
+                "entries": history_entries,
+            }
         cards.append({
             "id": "history-card",
             "title": self._tr("最近同步记录", "Recent Sync Activity"),
             "meta": history_meta,
-            "items": [
-                {
-                    "kind": "log_list",
-                    "id": "sync_logs",
-                    "empty_text": self._tr("暂无同步记录", "No sync activity yet"),
-                    "entries": history_entries,
-                }
-            ],
+            "items": [history_item],
         })
 
         status = self.last_status
@@ -7964,6 +8253,7 @@ class SyncPlugin:
             self.supports_add_folder = "checklist_add_folder" in caps
             self.supports_form_layout = "form_layout" in caps
             self.supports_multi_notebook = "multi_notebook" in caps
+            self.supports_log_timeline = "log_timeline" in caps
             self.supports_action_progress = "action_progress" in caps
             self.supports_system = "system_integration" in caps
             raw_nbs = params.get("notebooks")
