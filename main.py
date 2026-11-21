@@ -1536,7 +1536,7 @@ class SyncPlugin:
         if key == "test_conn":
             return self._tr(f"测试连接 ({proto})", f"Test connection ({proto})"), ""
         if key == "sync_noop":
-            return self._tr(f"{proto}同步", f"{proto} sync"), self._tr(f"{proto}已是最新状态", f"{proto} is up to date")
+            return self._tr(f"{proto}同步", f"{proto} sync"), self._tr("已是最新", "Up to date")
         if key == "sync_canceled":
             return self._tr("危险变更同步", "Sync with risky changes"), self._tr("用户已取消本次同步", "The user canceled this sync")
         if key == "plan_changed":
@@ -7199,19 +7199,16 @@ class SyncPlugin:
         self.stats["total_synced"] += total_notes
         self.stats["last_sync"] = now_hms()
 
-        nb_count = len(batch["plans"])
-        nb_prefix = self._tr(f"{nb_count} 个笔记本 · ", f"Notebooks: {nb_count} · ") if nb_count > 1 else ""
-
         if total_notes == 0 and total_assets == 0:
             if did_push:
-                summary = self._tr("已将本地 Git 待推送提交同步到远端", "Pushed pending Git commits to the remote")
+                summary = self._tr("已推送本地提交", "Pushed local commits")
                 self._append_log(self._tr(
                     f"推送 {self._protocol_label(protocol)} 提交",
                     f"Push commits to {self._protocol_label(protocol)}",
                 ), "成功", tone="success", tooltip=summary)
                 self._record_result("成功", summary, protocol=protocol, target=batch["target_display"])
                 return summary
-            summary = self._tr(f"{nb_prefix}{self._protocol_label(protocol)}已是最新状态", f"{nb_prefix}{self._protocol_label(protocol)} is up to date")
+            summary = self._tr("已是最新", "Up to date")
             if only_path is None and not self._scheduled_run:
                 self._append_log(
                     self._tr(f"{self._protocol_label(protocol)}同步", f"{self._protocol_label(protocol)} sync"),
@@ -7225,8 +7222,8 @@ class SyncPlugin:
             return summary
 
         summary = self._tr(
-            f"{nb_prefix}推送 {total_pushed} 篇 · 拉取 {total_pulled} 篇 · 冲突 {reported_conflicts} 处",
-            f"{nb_prefix}Pushed: {total_pushed} · Pulled: {total_pulled} · Conflicts: {reported_conflicts}",
+            f"推送 {total_pushed} 篇 · 拉取 {total_pulled} 篇 · 冲突 {reported_conflicts} 处",
+            f"Pushed: {total_pushed} · Pulled: {total_pulled} · Conflicts: {reported_conflicts}",
         )
         if total_assets > 0:
             summary += self._tr(f" · 附件 {total_assets} 个", f" · Attachments: {total_assets}")
@@ -7240,7 +7237,7 @@ class SyncPlugin:
             conflicts=reported_conflicts,
             assets=total_assets,
         )
-        return self._tr(f"已完成{self._protocol_label(protocol)}同步：{summary}", f"{self._protocol_label(protocol)} sync complete: {summary}")
+        return self._tr(f"同步完成：{summary}", f"Synced: {summary}")
 
     # ---------- Dispatch & UI ----------
 
@@ -7735,10 +7732,8 @@ class SyncPlugin:
                 nb_options.append(opt)
 
             if self.supports_add_folder:
-                nb_meta = self._tr(f"已添加 {len(selected)} 个", f"{len(selected)} added") if selected else ""
                 nb_empty = self._tr("点击右上角 + 添加要同步的文件夹", "Click + to add a folder to sync")
             else:
-                nb_meta = self._tr(f"已选 {len(selected)} / {len(nb_options)}", f"Selected: {len(selected)} / {len(nb_options)}") if nb_options else ""
                 nb_empty = self._tr("暂无已打开的笔记本", "No open notebooks")
             checklist_item = {
                 "kind": "checklist",
@@ -7752,7 +7747,6 @@ class SyncPlugin:
             notebooks_card = {
                 "id": "notebooks-card",
                 "title": self._tr("同步笔记本", "Notebooks to Sync"),
-                "meta": nb_meta,
                 "items": [checklist_item],
             }
 
@@ -7899,7 +7893,7 @@ class SyncPlugin:
         last_result = self._get_last_result() or {}
         last_ok = last_result.get("last_success")
         history_meta = (
-            self._tr(f"上次成功 {last_ok['time']}", f"Last successful sync: {last_ok['time']}")
+            self._tr(f"上次成功 {last_ok['time']}", f"Last synced: {last_ok['time']}")
             if isinstance(last_ok, dict) and last_ok.get("time")
             else ""
         )
@@ -7926,13 +7920,13 @@ class SyncPlugin:
         if not status and configured and c == self.config:
             latest_state = str(last_result.get("status") or "").strip()
             if has_pending_confirm:
-                status = self._tr("检测到危险变更，请确认后同步", "Risky changes detected. Confirm to sync.")
+                status = self._tr("待确认同步变更", "Confirmation required")
             elif latest_state in ("失败", "未连通"):
-                status = self._tr("上次同步未完成，请查看记录或重试", "Last sync failed; check recent activity or retry")
+                status = self._tr("上次同步失败", "Last sync failed")
             elif latest_state == "已取消":
-                status = self._tr("上次同步已取消", "Last sync canceled")
+                status = self._tr("已取消同步", "Sync canceled")
             elif latest_state == "待确认":
-                status = self._tr("存在待确认的同步变更，请点击立即同步", "Pending sync changes require confirmation; click Sync Now")
+                status = self._tr("有待确认的变更", "Pending confirmation")
             elif isinstance(last_ok, dict) and last_ok.get("time"):
                 sync_hm = format_hm(last_ok["time"])
                 status = self._tr(f"上次同步 {sync_hm}", f"Last sync {sync_hm}")
