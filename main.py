@@ -7544,7 +7544,6 @@ class SyncPlugin:
 
         preview = {
             "variant": "plan",
-            "palette": "warm",
             "title": self._protocol_label(pending["protocol"]),
             "badge": self._tr(f"需确认 · {n_reasons} 项风险", f"Confirmation required · Risks: {n_reasons}"),
             "body": "\n".join(lines),
