@@ -847,6 +847,7 @@ class SyncPlugin:
         self._remote_preview_cache = {}
         self.kv_tooltip = False
         self.supports_checklist = False
+        self.supports_add_folder = False
         self.supports_form_layout = False
         self.supports_multi_notebook = False
         self.supports_system = False
@@ -7714,7 +7715,15 @@ class SyncPlugin:
         if self.supports_checklist and self.supports_form_layout:
             selected = self._selected_notebooks(c)
             nb_options = []
-            for entry in self.known_notebooks:
+            if self.supports_add_folder:
+                known_by_path = {e["path"]: e for e in self.known_notebooks}
+                listed = [
+                    known_by_path.get(p) or {"path": p, "name": os.path.basename(p) or p}
+                    for p in selected
+                ]
+            else:
+                listed = self.known_notebooks
+            for entry in listed:
                 path = entry["path"]
                 opt = {
                     "value": path,
@@ -7726,20 +7735,26 @@ class SyncPlugin:
                     opt["badge"] = self._tr("当前", "Current")
                 nb_options.append(opt)
 
-            nb_meta = self._tr(f"已选 {len(selected)} / {len(nb_options)}", f"Selected: {len(selected)} / {len(nb_options)}") if nb_options else ""
+            if self.supports_add_folder:
+                nb_meta = self._tr(f"已添加 {len(selected)} 个", f"{len(selected)} added") if selected else ""
+                nb_empty = self._tr("点击右上角 + 添加要同步的文件夹", "Click + to add a folder to sync")
+            else:
+                nb_meta = self._tr(f"已选 {len(selected)} / {len(nb_options)}", f"Selected: {len(selected)} / {len(nb_options)}") if nb_options else ""
+                nb_empty = self._tr("暂无已打开的笔记本", "No open notebooks")
+            checklist_item = {
+                "kind": "checklist",
+                "id": "selected_notebooks",
+                "value": selected,
+                "options": nb_options,
+                "empty_text": nb_empty,
+            }
+            if self.supports_add_folder:
+                checklist_item["add_folder"] = True
             notebooks_card = {
                 "id": "notebooks-card",
                 "title": self._tr("同步笔记本", "Notebooks to Sync"),
                 "meta": nb_meta,
-                "items": [
-                    {
-                        "kind": "checklist",
-                        "id": "selected_notebooks",
-                        "value": selected,
-                        "options": nb_options,
-                        "empty_text": self._tr("暂无已打开的笔记本", "No open notebooks"),
-                    }
-                ],
+                "items": [checklist_item],
             }
 
             target_items = [
@@ -7953,6 +7968,7 @@ class SyncPlugin:
             caps = set(params.get("ui_capabilities") or [])
             self.kv_tooltip = "kv_tooltip" in caps
             self.supports_checklist = "checklist" in caps
+            self.supports_add_folder = "checklist_add_folder" in caps
             self.supports_form_layout = "form_layout" in caps
             self.supports_multi_notebook = "multi_notebook" in caps
             self.supports_action_progress = "action_progress" in caps
