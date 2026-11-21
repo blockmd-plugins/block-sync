@@ -35,6 +35,8 @@ import xml.etree.ElementTree as ET
 VALID_PROTOCOLS = ("local_mirror", "webdav", "git")
 VALID_CONFLICT_POLICIES = ("keep_both", "remote_first", "local_first")
 VALID_GIT_AUTHS = ("ssh", "token")
+VALID_SYNC_INTERVALS = ("5", "30", "60")
+SYNC_INTERVAL_EVENT = "plugin.sync_interval"
 DELETE_GUARD_THRESHOLD = 5
 MAX_LOG_ENTRIES = 20
 CHINESE_TEXT = re.compile(r"[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]")
@@ -72,6 +74,7 @@ DEFAULT_CONFIG = {
     "git_auth": "ssh",
     "git_token": "",
     "auto_sync": True,
+    "sync_interval": "5",
     "system_notifications": True,
     "sync_assets": True,
     "conflict_policy": "keep_both",
@@ -859,6 +862,9 @@ class SyncPlugin:
         self._background_notice_deadline = 0.0
         self._git_background_deadline = 0.0
         self._next_system_notebook = ""
+        self._interval_synced_at = {}
+        self._scheduled_run = False
+        self._repeat_failure = False
         self.last_status = ""
         self._last_synced_notebooks = []
 
@@ -1706,6 +1712,9 @@ class SyncPlugin:
         if git_auth in VALID_GIT_AUTHS:
             merged["git_auth"] = git_auth
 
+        interval = str(raw.get("sync_interval", merged["sync_interval"]) or "").strip()
+        merged["sync_interval"] = interval if interval in VALID_SYNC_INTERVALS else DEFAULT_CONFIG["sync_interval"]
+
         for bool_key in ("auto_sync", "sync_assets", "delete_guard", "system_notifications"):
             if bool_key in raw:
                 merged[bool_key] = bool(raw[bool_key])
@@ -1840,8 +1849,9 @@ class SyncPlugin:
             self._saved_pending_confirms = dict(self.pending_confirms)
         except (RuntimeError, OSError) as exc:
             self._restore_pending_confirms()
-            if self._result_notice:
+            if self._result_notice or self._repeat_failure:
                 self._result_notice = ("状态未保存", 0)
+                self._repeat_failure = False
             self.last_status = self._tr("同步状态未保存，请检查后重试", "Sync state could not be saved. Check settings and retry.")
             self._send_result_notice(bridge)
             raise SyncStateError(self.last_status, self._result_notified) from exc
@@ -1904,11 +1914,12 @@ class SyncPlugin:
         if last_success is not None:
             entry["last_success"] = last_success
         self.notebook_results[nb_key] = entry
-        self._result_notice = (status_str, int(conflicts or 0), notice_key or (uuid.uuid4().hex if conflicts or status_str == "失败" else ""))
+        self._repeat_failure = self._scheduled_run and status_str == "失败" and isinstance(prev, dict) and prev.get("status") == "失败"
+        self._result_notice = None if self._repeat_failure else (status_str, int(conflicts or 0), notice_key or (uuid.uuid4().hex if conflicts or status_str == "失败" else ""))
 
     def _send_result_notice(self, bridge):
         notice, self._result_notice = self._result_notice, None
-        self._result_notified = False
+        self._result_notified, self._repeat_failure = self._repeat_failure, False
         if not notice or not self.supports_system or not self.config["system_notifications"]:
             return
         params = self._result_notice_params(*notice)
@@ -7200,7 +7211,7 @@ class SyncPlugin:
                 self._record_result("成功", summary, protocol=protocol, target=batch["target_display"])
                 return summary
             summary = self._tr(f"{nb_prefix}{self._protocol_label(protocol)}已是最新状态", f"{nb_prefix}{self._protocol_label(protocol)} is up to date")
-            if only_path is None:
+            if only_path is None and not self._scheduled_run:
                 self._append_log(
                     self._tr(f"{self._protocol_label(protocol)}同步", f"{self._protocol_label(protocol)} sync"),
                     "无变更",
@@ -7645,12 +7656,8 @@ class SyncPlugin:
             })
         target_items.extend([
             self._conflict_policy_item(c),
-            {
-                "kind": "switch",
-                "id": "auto_sync",
-                "label": self._tr("保存笔记后自动同步", "Sync Automatically on Save"),
-                "value": c["auto_sync"],
-            },
+            self._auto_sync_switch(c),
+            self._sync_interval_item(c),
             {
                 "kind": "actions",
                 "visible_when": {"control_id": "protocol", "in": ["webdav", "git"]},
@@ -7676,6 +7683,28 @@ class SyncPlugin:
             "kind": "switch", "id": "system_notifications",
             "label": self._tr("同步失败或冲突时通知", "Notify on Sync Errors or Conflicts"),
             "value": config["system_notifications"],
+        }
+
+    def _auto_sync_switch(self, config):
+        return {
+            "kind": "switch",
+            "id": "auto_sync",
+            "label": self._tr("自动同步", "Sync Automatically"),
+            "value": config["auto_sync"],
+        }
+
+    def _sync_interval_item(self, config):
+        return {
+            "kind": "segmented",
+            "id": "sync_interval",
+            "label": self._tr("定时同步间隔", "Scheduled Sync Interval"),
+            "value": config["sync_interval"],
+            "options": [
+                {"value": "5", "label": self._tr("5 分钟", "5 min")},
+                {"value": "30", "label": self._tr("30 分钟", "30 min")},
+                {"value": "60", "label": self._tr("1 小时", "1 hour")},
+            ],
+            "visible_when": {"control_id": "auto_sync", "equals": True},
         }
 
     def build_page(self, cfg=None):
@@ -7834,12 +7863,8 @@ class SyncPlugin:
                 "title": self._tr("同步选项", "Sync Options"),
                 "items": [
                     self._conflict_policy_item(c),
-                    {
-                        "kind": "switch",
-                        "id": "auto_sync",
-                        "label": self._tr("保存笔记后自动同步", "Sync Automatically on Save"),
-                        "value": c["auto_sync"],
-                    },
+                    self._auto_sync_switch(c),
+                    self._sync_interval_item(c),
                 ],
             }
             if self.supports_system:
@@ -7953,6 +7978,7 @@ class SyncPlugin:
                     clear_pending = True
                     next_status = ""
                 next_config["auto_sync"] = cfg["auto_sync"]
+                next_config["sync_interval"] = cfg["sync_interval"]
                 next_config["system_notifications"] = cfg["system_notifications"]
                 if cfg["conflict_policy"] != self.config["conflict_policy"]:
                     next_config["conflict_policy"] = cfg["conflict_policy"]
@@ -7973,7 +7999,7 @@ class SyncPlugin:
                     self.last_status = next_status
                 accepted = {
                     key: self.config[key]
-                    for key in ("selected_notebooks", "auto_sync", "system_notifications", "conflict_policy", "protocol", "mirror_dir")
+                    for key in ("selected_notebooks", "auto_sync", "sync_interval", "system_notifications", "conflict_policy", "protocol", "mirror_dir")
                     if key in values and cfg[key] == self.config[key]
                 }
             else:
@@ -8226,7 +8252,7 @@ class SyncPlugin:
                 self._retry_result_notices(bridge)
             if event_name in ("app.focus", "plugin.notifications_retry"):
                 return {"handled": True, "outcome": "skipped"}
-            if event_name in ("system.wake", "network.changed"):
+            if event_name in ("system.wake", "network.changed", SYNC_INTERVAL_EVENT):
                 return self._sync_after_system_event(bridge, event_name, params)
             if event_name != "note.saved":
                 return {"handled": False}
@@ -8317,10 +8343,17 @@ class SyncPlugin:
         ))
         if event_name == "network.changed" and (params.get("online") is not True or not needs_network):
             return skipped
-        if event_name == "system.wake" and params.get("online") is False and needs_network:
+        if event_name in ("system.wake", SYNC_INTERVAL_EVENT) and params.get("online") is False and needs_network:
             return skipped
         if self._target_error(self.config) or not self._selected_notebooks(self.config):
             return skipped
+        interval_key = self._result_key()
+        if event_name == SYNC_INTERVAL_EVENT:
+            last = self._interval_synced_at.get(interval_key)
+            if last is not None and time.monotonic() - last < int(self.config["sync_interval"]) * 60 - 5:
+                return skipped
+        self._interval_synced_at[interval_key] = time.monotonic()
+        self._scheduled_run = event_name == SYNC_INTERVAL_EVENT
         try:
             self._run_background_sync(bridge, deadline=deadline)
         except SyncStateError as exc:
@@ -8329,6 +8362,8 @@ class SyncPlugin:
             return {"handled": True, "outcome": "failed", "notified": True}
         except RuntimeError:
             return {"handled": True, "outcome": "failed"}
+        finally:
+            self._scheduled_run = False
         return {"handled": True, "outcome": self._last_sync_outcome, "synced_notebooks": self._last_synced_notebooks}
 
     def _run_background_sync(self, bridge, only_path=None, only_nb_root=None, deadline=None):
