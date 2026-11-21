@@ -6,6 +6,7 @@
 
 - **Three backends**: Sync multiple notebooks over Local Mirror, WebDAV, or Git.
 - **Auto on save**: Incremental sync runs automatically on save, plus one-click Sync Now.
+- **Scheduled sync** — With automatic sync enabled, sync runs every 5 minutes, 30 minutes, or 1 hour (default: 5 minutes). Runs with no changes add no log entry. Repeated failures alert only once.
 - **Conflict-safe**: Choose conflict copy, local-first, or remote-first with destructive guardrails. With deletion protection enabled, confirm before uploading a note that was deleted remotely.
 - **Sync alerts** — Get an alert when sync fails, encounters a conflict, or needs approval. Block uses an in-app alert in the foreground and a system notification in the background. If delivery fails, Sync retries on a later system event. You can turn alerts off in sync settings.
 - **Resume sync** — With automatic sync enabled, sync runs after the computer wakes or reconnects, using the existing safety checks.
