@@ -123,8 +123,10 @@ class HostBridge:
         sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
         sys.stdout.flush()
 
-    def notify_progress(self, done=None, total=None, progress=None, label=None):
+    def notify_progress(self, done=None, total=None, progress=None, label=None, channel=None, tone=None, running=None):
         params = {}
+        if channel:
+            params["channel"] = str(channel)
         if done is not None:
             params["done"] = int(done)
         if total is not None:
@@ -133,6 +135,10 @@ class HostBridge:
             params["progress"] = float(progress)
         if label:
             params["label"] = str(label)
+        if tone:
+            params["tone"] = str(tone)
+        if running is not None:
+            params["running"] = bool(running)
         if not params:
             return
         try:
@@ -851,6 +857,9 @@ class SyncPlugin:
         self.supports_form_layout = False
         self.supports_multi_notebook = False
         self.supports_log_timeline = False
+        self.supports_action_progress = False
+        self.supports_progress_bar = False
+        self.supports_segmented_status = False
         self.supports_system = False
         self._stored_global = None
         self._credential_cleanup = set()
@@ -876,10 +885,14 @@ class SyncPlugin:
     def _tr(self, zh, en):
         return en if self._is_en() else zh
 
-    def _emit_progress(self, bridge, done=None, total=None, progress=None, label=None):
+    def _emit_progress(self, bridge, done=None, total=None, progress=None, label=None, channel=None, tone=None, running=None):
         if not getattr(self, "supports_action_progress", False):
             return
+        if channel is not None and not getattr(self, "supports_progress_bar", False):
+            return
         params = {}
+        if channel:
+            params["channel"] = str(channel)
         if done is not None:
             params["done"] = int(done)
         if total is not None:
@@ -887,7 +900,11 @@ class SyncPlugin:
         if progress is not None:
             params["progress"] = float(progress)
         if label:
-            params["label"] = str(label)
+            params["label"] = str(label)[:32]
+        if tone and getattr(self, "supports_progress_bar", False):
+            params["tone"] = str(tone)
+        if running is not None and getattr(self, "supports_progress_bar", False):
+            params["running"] = bool(running)
         if not params:
             return
         try:
@@ -897,6 +914,51 @@ class SyncPlugin:
                 bridge.send({"jsonrpc": "2.0", "method": "host.action.progress", "params": params})
         except Exception:
             pass
+
+    @staticmethod
+    def _cfg_for_protocol(cfg, protocol):
+        c = dict(cfg)
+        c["protocol"] = protocol
+        return c
+
+    def _protocol_error(self, cfg, protocol, require_notebooks=False):
+        return self._target_error(self._cfg_for_protocol(cfg, protocol), require_notebooks=require_notebooks)
+
+    def _protocol_has_input(self, cfg, protocol):
+        if protocol == "local_mirror":
+            return bool(self._resolve_mirror_dir(cfg))
+        if protocol == "webdav":
+            return bool(str(cfg.get("webdav_url") or "").strip())
+        if protocol == "git":
+            return bool(str(cfg.get("git_remote") or "").strip())
+        return False
+
+    def _configured_protocols(self, cfg=None):
+        c = cfg or self.config
+        return [p for p in VALID_PROTOCOLS if not self._protocol_error(c, p, require_notebooks=False)]
+
+    @staticmethod
+    def _config_matches_saved(a, b):
+        if a is None or b is None:
+            return a == b
+        keys = (set(a.keys()) | set(b.keys())) - {"protocol"}
+        return all(a.get(k) == b.get(k) for k in keys)
+
+    @staticmethod
+    def _changed_protocols(old_cfg, new_cfg):
+        shared_keys = ("selected_notebooks", "conflict_policy", "sync_scope", "sync_assets", "delete_guard")
+        if any(old_cfg.get(k) != new_cfg.get(k) for k in shared_keys):
+            return set(VALID_PROTOCOLS)
+        changed = set()
+        if old_cfg.get("mirror_dir") != new_cfg.get("mirror_dir"):
+            changed.add("local_mirror")
+        old_refs = old_cfg.get("credential_refs") or {}
+        new_refs = new_cfg.get("credential_refs") or {}
+        if any(old_cfg.get(k) != new_cfg.get(k) for k in ("webdav_url", "webdav_dir", "webdav_user", "webdav_pass")) or old_refs.get("webdav_pass") != new_refs.get("webdav_pass"):
+            changed.add("webdav")
+        if any(old_cfg.get(k) != new_cfg.get(k) for k in ("git_remote", "git_branch", "git_auth", "git_token")) or old_refs.get("git_token") != new_refs.get("git_token"):
+            changed.add("git")
+        return changed
 
     def _localize_error(self, detail):
         if self._is_en() and CHINESE_TEXT.search(detail):
@@ -1208,7 +1270,7 @@ class SyncPlugin:
             legacy_pc = self._normalize_pending_confirm(pc_res.get("value"))
             if legacy_pc and legacy_pc["scope_key"] not in self.pending_confirms:
                 self.pending_confirms[legacy_pc["scope_key"]] = legacy_pc
-        self.pending_confirm = self.pending_confirms.get(self._result_key())
+        self.pending_confirm = self._get_pending_confirm()
         self._saved_pending_confirms = dict(self.pending_confirms)
         self._remote_preview_cache = {}
         self.last_status = ""
@@ -1377,7 +1439,15 @@ class SyncPlugin:
         if clear_pending:
             pending = dict(self.pending_confirms)
             scope = self._result_key()
-            pending.pop(scope, None)
+            clear_protocols = set(VALID_PROTOCOLS) if clear_pending is True else set(clear_pending)
+            if clear_protocols >= set(VALID_PROTOCOLS):
+                pending.pop(scope, None)
+            else:
+                legacy = pending.get(scope)
+                if isinstance(legacy, dict) and legacy.get("protocol") in clear_protocols:
+                    pending.pop(scope, None)
+            for proto in clear_protocols:
+                pending.pop(f"{scope}:{proto}", None)
             cleared_scopes = {scope}
             if shared is current:
                 cleared_scopes.update(self._notebook_key(root) for root in current.get("selected_notebooks", ()))
@@ -1387,7 +1457,8 @@ class SyncPlugin:
                 if isinstance(notice, dict) and (notice.get("status") == "失败" or self._is_pause_notice(notice)):
                     notice_scope = notice.get("scope", key)
                     if isinstance(notice_scope, str) and notice_scope in cleared_scopes:
-                        queued.pop(key)
+                        if clear_protocols >= set(VALID_PROTOCOLS) or not notice.get("protocol") or notice.get("protocol") in clear_protocols:
+                            queued.pop(key)
             updates.update(pending_confirms=pending, pending_confirm=None, pending_notices=queued)
         bridge.call_host("host.storage.set_many", {"values": updates})
         self.notebook_configs = actual_notebooks
@@ -1397,7 +1468,7 @@ class SyncPlugin:
         if clear_pending:
             self.pending_confirms = pending
             self._saved_pending_confirms = dict(pending)
-            self.pending_confirm = None
+            self.pending_confirm = self._get_pending_confirm()
             self._pending_notices = queued
             self._remote_preview_cache.clear()
 
@@ -1451,22 +1522,67 @@ class SyncPlugin:
             pending.update(only_path=only_path, only_nb_root=self._norm_nb_path(only_nb_root))
         return pending
 
+    def _pending_key(self, protocol):
+        return f"{self._result_key()}:{protocol}"
+
+    def _get_pending_confirm(self, protocol=None):
+        scope = self._result_key()
+        if protocol:
+            pc = self.pending_confirms.get(f"{scope}:{protocol}")
+            if isinstance(pc, dict) and pc.get("scope_key") == scope:
+                return pc
+            legacy = self.pending_confirms.get(scope)
+            if isinstance(legacy, dict) and legacy.get("scope_key") == scope and legacy.get("protocol") == protocol:
+                return legacy
+            return None
+        cur_proto = self.config.get("protocol")
+        if cur_proto:
+            cur_pc = self._get_pending_confirm(cur_proto)
+            if cur_pc is not None:
+                return cur_pc
+        for proto in VALID_PROTOCOLS:
+            pc = self._get_pending_confirm(proto)
+            if pc is not None:
+                return pc
+        legacy = self.pending_confirms.get(scope)
+        if isinstance(legacy, dict) and legacy.get("scope_key") == scope:
+            return legacy
+        return None
+
     def _set_pending_confirm(self, pending, bridge=None):
         norm = self._normalize_pending_confirm(pending) if pending else None
-        key = self._result_key()
-        self.pending_confirm = norm
+        scope = self._result_key()
         if norm is None:
-            self.pending_confirms.pop(key, None)
-        else:
-            self.pending_confirms[key] = norm
+            self._clear_pending_confirm(bridge=bridge)
+            return
+        proto = norm.get("protocol") or self.config.get("protocol", "local_mirror")
+        self.pending_confirms[f"{scope}:{proto}"] = norm
+        legacy = self.pending_confirms.get(scope)
+        if isinstance(legacy, dict) and legacy.get("protocol") == proto:
+            self.pending_confirms.pop(scope, None)
+        self.pending_confirm = self._get_pending_confirm()
         if bridge is not None:
             self._persist_pending_confirms(bridge)
 
-    def _clear_pending_confirm(self, bridge=None):
-        key = self._result_key()
-        had = self.pending_confirm is not None or key in self.pending_confirms
-        self.pending_confirm = None
-        self.pending_confirms.pop(key, None)
+    def _clear_pending_confirm(self, bridge=None, protocol=None):
+        scope = self._result_key()
+        had = False
+        if protocol:
+            if self.pending_confirms.pop(f"{scope}:{protocol}", None) is not None:
+                had = True
+            legacy = self.pending_confirms.get(scope)
+            if isinstance(legacy, dict) and legacy.get("protocol") == protocol:
+                self.pending_confirms.pop(scope, None)
+                had = True
+        else:
+            if self.pending_confirms.pop(scope, None) is not None:
+                had = True
+            for proto in VALID_PROTOCOLS:
+                if self.pending_confirms.pop(f"{scope}:{proto}", None) is not None:
+                    had = True
+            if self.pending_confirm is not None:
+                had = True
+        self.pending_confirm = self._get_pending_confirm()
         if had and bridge is not None:
             self._persist_pending_confirms(bridge)
 
@@ -1487,7 +1603,7 @@ class SyncPlugin:
 
     def _restore_pending_confirms(self):
         self.pending_confirms = dict(self._saved_pending_confirms)
-        self.pending_confirm = self.pending_confirms.get(self._result_key())
+        self.pending_confirm = self._get_pending_confirm()
 
     def _normalize_log(self, entry):
         title = str(entry.get("title") or "同步事件").strip() or "同步事件"
@@ -1793,17 +1909,19 @@ class SyncPlugin:
             bridge.call_host("host.storage.set", {"key": "config", "value": self.config})
             self._stored_global = dict(self.config)
         if clear_pending:
-            self._clear_pending_confirm(bridge)
+            if clear_pending is True:
+                self._clear_pending_confirm(bridge)
+            else:
+                for proto in clear_pending:
+                    self._clear_pending_confirm(bridge, protocol=proto)
             self._remote_preview_cache.clear()
 
-    def _save_runtime(self, bridge, only_path=None, notebook_root=None, clear_pending=False):
+    def _save_runtime(self, bridge, only_path=None, notebook_root=None, clear_pending=False, protocol=None):
         key = self._result_key()
         if clear_pending:
-            self.pending_confirm = None
-        if self.pending_confirm is None:
-            self.pending_confirms.pop(key, None)
+            self._clear_pending_confirm(protocol=protocol)
         else:
-            self.pending_confirms[key] = self.pending_confirm
+            self.pending_confirm = self._get_pending_confirm()
         values = {
             "stats": self.stats, "logs": self.logs[:MAX_LOG_ENTRIES], "sync_meta": self.sync_meta,
             "notebook_results": self.notebook_results, "pending_confirms": self.pending_confirms,
@@ -1818,6 +1936,8 @@ class SyncPlugin:
             for entry_key, previous in self._pending_notices.items():
                 if not isinstance(previous, dict) or previous.get("scope", entry_key) != key:
                     continue
+                if protocol and previous.get("protocol") and previous.get("protocol") != protocol:
+                    continue
                 if previous.get("status") != "失败" and not self._is_pause_notice(previous):
                     continue
                 legacy_pause = "order" not in previous and not previous.get("path") and not previous.get("fingerprint")
@@ -1828,17 +1948,19 @@ class SyncPlugin:
             scoped_file = notice[0] in ("待确认", "失败") and only_path is not None
             if scoped_file:
                 prefix = "note:" if notice[0] == "待确认" else "failure:"
-                notice_key = prefix + sha256_text(json.dumps([key, notebook_root, only_path], ensure_ascii=False))
+                notice_key = prefix + sha256_text(json.dumps([key, protocol or "", notebook_root, only_path], ensure_ascii=False))
             elif notice[0] == "失败":
-                notice_key = "failure:" + sha256_text(key)
+                notice_key = "failure:" + sha256_text(f"{key}:{protocol or ''}")
             elif notice[1] > 0:
                 notice_key = "conflict:" + notice[2]
             queued.pop(notice_key, None)
+            pc_for_notice = self._get_pending_confirm(protocol) if protocol else self.pending_confirm
             queued[notice_key] = {
                 "params": self._result_notice_params(*notice),
-                "fingerprint": self.pending_confirm.get("fingerprint", "") if notice[0] == "待确认" and self.pending_confirm else "",
+                "fingerprint": pc_for_notice.get("fingerprint", "") if notice[0] == "待确认" and pc_for_notice else "",
                 "status": notice[0],
                 "scope": key,
+                "protocol": protocol or "",
                 "order": max((self._notice_order(item) for item in queued.values()), default=0) + 1,
             }
             if scoped_file:
@@ -1871,7 +1993,8 @@ class SyncPlugin:
 
     def _result_key(self):
         if self.supports_multi_notebook and (
-            "selected_notebooks" in (self._stored_global or {}) or "__multi__" in self.pending_confirms
+            "selected_notebooks" in (self._stored_global or {})
+            or any(k == "__multi__" or k.startswith("__multi__:") for k in self.pending_confirms)
         ):
             return "__multi__"
         return self._notebook_key()
@@ -1880,21 +2003,36 @@ class SyncPlugin:
         nb_key = self._result_key()
         proto = protocol or self.config.get("protocol", "local_mirror")
         proto_label = self._protocol_label(proto)
-        target_str = str(target or self._target_display(self.config))
+        target_str = str(target or self._target_display(self._cfg_for_protocol(self.config, proto)))
         now_str = now_hms()
         status_str = str(status or "完成")
         summary_str = str(summary or "完成")
 
         prev = self.notebook_results.get(nb_key)
+        prev_protocols = (
+            dict(prev.get("protocols"))
+            if isinstance(prev, dict) and isinstance(prev.get("protocols"), dict)
+            else {}
+        )
+        prev_proto = prev_protocols.get(proto) if isinstance(prev_protocols.get(proto), dict) else None
+        if prev_proto is None and isinstance(prev, dict) and self._entry_matches_protocol(prev, proto):
+            prev_proto = prev
+
         prev_success = (
             dict(prev.get("last_success"))
             if isinstance(prev, dict) and isinstance(prev.get("last_success"), dict)
             else None
         )
+        prev_proto_success = (
+            dict(prev_proto.get("last_success"))
+            if isinstance(prev_proto, dict) and isinstance(prev_proto.get("last_success"), dict)
+            else None
+        )
         if status_str in ("成功", "无变更"):
-            last_success = {
+            success_snap = {
                 "status": status_str,
                 "protocol": proto_label,
+                "protocol_id": proto,
                 "target": target_str,
                 "time": now_str,
                 "pushed": int(pushed or 0),
@@ -1903,12 +2041,16 @@ class SyncPlugin:
                 "assets": int(assets or 0),
                 "summary": summary_str,
             }
+            last_success = dict(success_snap)
+            proto_last_success = dict(success_snap)
         else:
             last_success = prev_success
+            proto_last_success = prev_proto_success
 
-        entry = {
+        proto_entry = {
             "status": status_str,
             "protocol": proto_label,
+            "protocol_id": proto,
             "target": target_str,
             "time": now_str,
             "pushed": int(pushed or 0),
@@ -1918,11 +2060,19 @@ class SyncPlugin:
             "summary": summary_str,
         }
         if self._is_en():
-            entry["locale"] = "en"
+            proto_entry["locale"] = "en"
+        if proto_last_success is not None:
+            proto_entry["last_success"] = proto_last_success
+        prev_protocols[proto] = proto_entry
+
+        entry = dict(proto_entry)
         if last_success is not None:
             entry["last_success"] = last_success
+        else:
+            entry.pop("last_success", None)
+        entry["protocols"] = prev_protocols
         self.notebook_results[nb_key] = entry
-        self._repeat_failure = self._scheduled_run and status_str == "失败" and isinstance(prev, dict) and prev.get("status") == "失败"
+        self._repeat_failure = self._scheduled_run and status_str == "失败" and isinstance(prev_proto, dict) and prev_proto.get("status") == "失败"
         self._result_notice = None if self._repeat_failure else (status_str, int(conflicts or 0), notice_key or (uuid.uuid4().hex if conflicts or status_str == "失败" else ""))
 
     def _send_result_notice(self, bridge):
@@ -2050,6 +2200,151 @@ class SyncPlugin:
 
     def _get_last_result(self):
         return self.notebook_results.get(self._result_key()) or self.notebook_results.get(self._notebook_key())
+
+    @staticmethod
+    def _entry_matches_protocol(entry, protocol):
+        if not isinstance(entry, dict):
+            return False
+        pid = str(entry.get("protocol_id") or "").strip()
+        if pid:
+            return pid == protocol
+        label = str(entry.get("protocol") or "").strip()
+        aliases = {
+            "local_mirror": ("目录镜像", "Local mirror", "本地目录镜像"),
+            "webdav": ("WebDAV",),
+            "git": ("Git 仓库", "Git repository"),
+        }.get(protocol, ())
+        return label in aliases
+
+    def _get_protocol_result(self, protocol):
+        last = self._get_last_result()
+        if not isinstance(last, dict):
+            return {}
+        protos = last.get("protocols")
+        if isinstance(protos, dict) and isinstance(protos.get(protocol), dict):
+            return protos[protocol]
+        if self._entry_matches_protocol(last, protocol):
+            return last
+        return {}
+
+    def _format_short_sync_metric(self, rec):
+        if not isinstance(rec, dict):
+            return self._tr("已是最新", "Up to date")
+        pushed = int(rec.get("pushed") or 0)
+        pulled = int(rec.get("pulled") or 0)
+        conflicts = int(rec.get("conflicts") or 0)
+        assets = int(rec.get("assets") or 0)
+        parts = []
+        if pushed > 0:
+            parts.append(self._tr(f"推 {pushed}", f"{pushed} pushed"))
+        if pulled > 0:
+            parts.append(self._tr(f"拉 {pulled}", f"{pulled} pulled"))
+        if conflicts > 0:
+            parts.append(self._tr(f"冲突 {conflicts}", f"{conflicts} conflicts"))
+        if assets > 0:
+            parts.append(self._tr(f"附件 {assets}", f"{assets} assets"))
+        if parts:
+            return " / ".join(parts)
+        return self._tr("已是最新", "Up to date")
+
+    def _localize_result_summary(self, rec, fallback_zh, fallback_en):
+        summary = str((rec or {}).get("summary") or "").strip()
+        if summary and not (self._is_en() and (rec or {}).get("locale") != "en" and CHINESE_TEXT.search(summary)):
+            return summary
+        return self._tr(fallback_zh, fallback_en)
+
+    def _protocol_segment_status(self, protocol, cfg):
+        proto_err = self._protocol_error(cfg, protocol, require_notebooks=False)
+        if proto_err:
+            if self._protocol_has_input(cfg, protocol):
+                return "warning", proto_err
+            return "", self._tr("未配置", "Not configured")
+        pc = self._get_pending_confirm(protocol) if self._config_matches_saved(cfg, self.config) else None
+        if pc is not None:
+            return "warning", self._tr("已启用 · 待确认变更", "Enabled · Confirmation required")
+        res = self._get_protocol_result(protocol)
+        st = str(res.get("status") or "").strip()
+        if st in ("失败", "未连通"):
+            hm = format_hm(res.get("time") or "")
+            tip = self._tr(f"已启用 · {hm} 同步失败", f"Enabled · {hm} sync failed") if hm else self._tr("已启用 · 上次同步失败", "Enabled · Last sync failed")
+            return "danger", tip
+        if st == "已取消":
+            return "warning", self._tr("已启用 · 上次同步已取消", "Enabled · Last sync canceled")
+        ok_rec = res if st in ("成功", "无变更") else (res.get("last_success") if isinstance(res.get("last_success"), dict) else None)
+        if isinstance(ok_rec, dict) and ok_rec.get("time"):
+            hm = format_hm(ok_rec.get("time") or "")
+            metric = self._format_short_sync_metric(ok_rec)
+            return "success", self._tr(f"已启用 · {hm} {metric}", f"Enabled · {hm} {metric}")
+        return "success", self._tr("已启用 · 等待同步", "Enabled · Ready to sync")
+
+    def _build_progress_item(self, protocol, cfg):
+        label = {
+            "local_mirror": self._tr("目录镜像同步进度", "Local Mirror Progress"),
+            "webdav": self._tr("WebDAV 同步进度", "WebDAV Sync Progress"),
+            "git": self._tr("Git 仓库同步进度", "Git Sync Progress"),
+        }.get(protocol, self._tr("同步进度", "Sync Progress"))
+        proto_err = self._protocol_error(cfg, protocol, require_notebooks=False)
+        target_tip = self._target_display(self._cfg_for_protocol(cfg, protocol))
+        status = self._tr("未启用", "Not enabled")
+        progress = 0.0
+        tone = ""
+        tooltip = self._tr("配置完成后自动启用此同步目标", "Configure above to enable this sync target")
+
+        if proto_err:
+            if self._protocol_has_input(cfg, protocol):
+                status = self._tr("配置待修正", "Needs attention")
+                tone = "warning"
+                tooltip = proto_err
+        else:
+            pc = self._get_pending_confirm(protocol) if self._config_matches_saved(cfg, self.config) else None
+            res = self._get_protocol_result(protocol)
+            st = str(res.get("status") or "").strip()
+            ok_rec = res if st in ("成功", "无变更") else (res.get("last_success") if isinstance(res.get("last_success"), dict) else None)
+            if pc is not None:
+                status = self._tr("待确认同步变更", "Confirmation required")
+                progress = 0.5
+                tone = "warning"
+                reason_items = pc.get("reason_items") or []
+                tooltip = self._format_reason_item(reason_items[0]) if reason_items else self._tr("检测到危险变更，请先确认", "Risky changes require confirmation")
+            elif st in ("失败", "未连通"):
+                hm = format_hm(res.get("time") or "")
+                status = self._tr(f"{hm} · 同步失败", f"{hm} · Sync failed") if hm else self._tr("上次同步失败", "Last sync failed")
+                progress = 1.0
+                tone = "danger"
+                tooltip = self._localize_result_summary(res, "同步失败，请查看同步记录", "Sync failed. Check recent sync activity.")
+            elif st == "已取消":
+                hm = format_hm(res.get("time") or "")
+                status = self._tr(f"{hm} · 已取消", f"{hm} · Canceled") if hm else self._tr("已取消同步", "Sync canceled")
+                progress = 0.0
+                tone = "warning"
+                tooltip = self._tr("上次危险变更同步已取消", "Last risky sync was canceled")
+            elif isinstance(ok_rec, dict) and ok_rec.get("time"):
+                hm = format_hm(ok_rec.get("time") or "")
+                metric = self._format_short_sync_metric(ok_rec)
+                status = f"{hm} · {metric}" if hm else metric
+                progress = 1.0
+                tone = "success"
+                tooltip = target_tip
+            else:
+                status = self._tr("已启用 · 等待同步", "Enabled · Ready to sync")
+                progress = 0.0
+                tone = "accent"
+                tooltip = target_tip
+
+        item = {
+            "kind": "progress",
+            "id": f"progress_{protocol}",
+            "channel": protocol,
+            "label": label,
+            "status": status,
+            "progress": progress,
+            "visible_when": {"control_id": "protocol", "equals": protocol},
+        }
+        if tone:
+            item["tone"] = tone
+        if tooltip:
+            item["tooltip"] = tooltip
+        return item
 
     def _target_display(self, cfg=None):
         c = cfg or self.config
@@ -6952,7 +7247,26 @@ class SyncPlugin:
         def step_progress():
             if progress_state is not None and progress_state.get("total", 0) > 0:
                 progress_state["done"] += 1
-                self._emit_progress(bridge, done=progress_state["done"], total=progress_state["total"])
+                done = progress_state["done"]
+                total = progress_state["total"]
+                ch = progress_state.get("channel")
+                if ch:
+                    self._emit_progress(
+                        bridge,
+                        channel=ch,
+                        done=done,
+                        total=total,
+                        label=self._tr("同步中", "Syncing"),
+                        tone="accent",
+                        running=True,
+                    )
+                batch_count = int(progress_state.get("batch_count") or 1)
+                if batch_count > 1:
+                    idx = int(progress_state.get("batch_index") or 0)
+                    overall = (idx + min(1.0, done / float(total))) / float(batch_count)
+                    self._emit_progress(bridge, progress=overall, label=progress_state.get("overall_label"))
+                else:
+                    self._emit_progress(bridge, done=done, total=total)
 
         lock_dir = batch_base_root if protocol == "local_mirror" else (plan.get("repo_root") if protocol == "git" else "")
         try:
@@ -7339,7 +7653,7 @@ class SyncPlugin:
             "fingerprint": fp,
         }
 
-    def _execute_batch_plan(self, bridge, batch, only_path=None, report_progress=False):
+    def _execute_batch_plan(self, bridge, batch, only_path=None, report_progress=False, progress_meta=None):
         if batch["protocol"] == "git" and self._git_background_deadline and time.monotonic() >= self._git_background_deadline:
             raise RuntimeError(self._tr("Git 同步已到达后台执行时限，请重试", "Git sync reached the background deadline. Retry to continue."))
         protocol = batch["protocol"]
@@ -7385,9 +7699,33 @@ class SyncPlugin:
             + len(p.get("asset_conflicts") or ())
             for p in batch["plans"]
         )
-        progress_state = {"done": 0, "total": total_items} if (report_progress and total_items > 0) else None
-        if progress_state is not None:
-            self._emit_progress(bridge, done=0, total=total_items)
+        pm = progress_meta or {}
+        batch_count = int(pm.get("batch_count") or 1)
+        batch_index = int(pm.get("batch_index") or 0)
+        overall_label = pm.get("overall_label") or ""
+        progress_state = None
+        if report_progress and total_items > 0:
+            progress_state = {
+                "done": 0,
+                "total": total_items,
+                "channel": protocol,
+                "batch_index": batch_index,
+                "batch_count": batch_count,
+                "overall_label": overall_label,
+            }
+            self._emit_progress(
+                bridge,
+                channel=protocol,
+                done=0,
+                total=total_items,
+                label=self._tr("同步中", "Syncing"),
+                tone="accent",
+                running=True,
+            )
+            if batch_count > 1:
+                self._emit_progress(bridge, progress=batch_index / float(batch_count), label=overall_label)
+            else:
+                self._emit_progress(bridge, done=0, total=total_items)
 
         pending_base_maps = []
         staged_git_paths = []
@@ -7460,10 +7798,26 @@ class SyncPlugin:
             if report_progress:
                 self._emit_progress(
                     bridge,
+                    channel=protocol,
                     done=total_items if total_items > 0 else None,
                     total=total_items if total_items > 0 else None,
                     label=self._tr("推送 Git…", "Pushing Git…"),
+                    tone="accent",
+                    running=True,
                 )
+                if batch_count > 1:
+                    self._emit_progress(
+                        bridge,
+                        progress=(batch_index + 0.9) / float(batch_count),
+                        label=overall_label or self._tr("推送 Git…", "Pushing Git…"),
+                    )
+                else:
+                    self._emit_progress(
+                        bridge,
+                        done=total_items if total_items > 0 else None,
+                        total=total_items if total_items > 0 else None,
+                        label=self._tr("推送 Git…", "Pushing Git…"),
+                    )
             with self._target_lock(batch["repo_root"]):
                 did_push = self._commit_and_push_git(
                     batch["repo_root"],
@@ -7634,21 +7988,37 @@ class SyncPlugin:
 
         return reason_items
 
-    def _run_sync(self, bridge, only_path=None, only_nb_root=None, confirmed=False, approved_batch=None, report_progress=False):
+    def _run_sync(self, bridge, only_path=None, only_nb_root=None, confirmed=False, approved_batch=None, report_progress=False, protocol=None, progress_meta=None):
         self._last_sync_outcome = "skipped"
         self._last_synced_notebooks = []
         self._refresh_known_notebooks(bridge)
-        protocol = self.config.get("protocol", "local_mirror")
-        target_error = self._target_error(self.config)
+        proto = protocol or (approved_batch.get("protocol") if approved_batch is not None else None) or self.config.get("protocol", "local_mirror")
+        proto_cfg = self._cfg_for_protocol(self.config, proto)
+        target_error = self._target_error(proto_cfg)
         if target_error:
             self.last_status = target_error
             return target_error
 
+        pm = progress_meta or {}
+        batch_count = int(pm.get("batch_count") or 1)
+        batch_index = int(pm.get("batch_index") or 0)
+        overall_label = pm.get("overall_label") or ""
+        if report_progress:
+            self._emit_progress(
+                bridge,
+                channel=proto,
+                label=self._tr("比对变更…", "Checking changes…"),
+                tone="accent",
+                running=True,
+            )
+            if batch_count > 1:
+                self._emit_progress(bridge, progress=batch_index / float(batch_count), label=overall_label)
+
         if approved_batch is not None:
             batch = approved_batch
-            protocol = batch.get("protocol", protocol)
+            proto = batch.get("protocol", proto)
         else:
-            notebooks = self._selected_notebooks(self.config)
+            notebooks = self._selected_notebooks(proto_cfg)
             if only_nb_root:
                 norm_only = self._norm_nb_path(only_nb_root)
                 if norm_only not in notebooks:
@@ -7661,7 +8031,7 @@ class SyncPlugin:
             try:
                 batch = self._compute_batch_plan(
                     bridge,
-                    self.config,
+                    proto_cfg,
                     notebooks,
                     only_path=only_path,
                     inspect_remote=True,
@@ -7669,34 +8039,40 @@ class SyncPlugin:
                 )
             except Exception as exc:
                 msg = self._tr(
-                    f"{self._protocol_label(protocol)}同步未完成: {self._error_detail(exc)}",
-                    f"{self._protocol_label(protocol)} sync failed: {self._error_detail(exc)}",
+                    f"{self._protocol_label(proto)}同步未完成: {self._error_detail(exc)}",
+                    f"{self._protocol_label(proto)} sync failed: {self._error_detail(exc)}",
                 )
+                if report_progress:
+                    self._emit_progress(bridge, channel=proto, progress=1.0, label=self._tr("同步失败", "Sync failed"), tone="danger", running=False)
                 self._append_log(self._tr(
-                    f"{self._protocol_label(protocol)}同步",
-                    f"{self._protocol_label(protocol)} sync",
+                    f"{self._protocol_label(proto)}同步",
+                    f"{self._protocol_label(proto)} sync",
                 ), "失败", tone="danger", tooltip=msg)
-                self._record_result("失败", msg, protocol=protocol)
-                self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root)
+                self._record_result("失败", msg, protocol=proto)
+                self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root, protocol=proto)
                 self.last_status = msg
                 raise self._sync_failure(msg) from exc
 
         if batch.get("remote_error"):
             msg = batch["remote_error"]
-            self._append_log(self._tr(f"{self._protocol_label(protocol)}同步", f"{self._protocol_label(protocol)} sync"), "失败", tone="danger", tooltip=msg)
-            self._record_result("失败", msg, protocol=protocol, target=batch["target_display"])
-            self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root)
+            if report_progress:
+                self._emit_progress(bridge, channel=proto, progress=1.0, label=self._tr("同步失败", "Sync failed"), tone="danger", running=False)
+            self._append_log(self._tr(f"{self._protocol_label(proto)}同步", f"{self._protocol_label(proto)} sync"), "失败", tone="danger", tooltip=msg)
+            self._record_result("失败", msg, protocol=proto, target=batch["target_display"])
+            self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root, protocol=proto)
             self.last_status = msg
             raise self._sync_failure(msg)
 
         if not confirmed:
-            reason_items = self._assess_batch_dangerous_changes(batch, self.config)
+            reason_items = self._assess_batch_dangerous_changes(batch, proto_cfg)
             if reason_items:
                 self._last_sync_outcome = "pending_confirm"
                 first_reason = self._format_reason_item(reason_items[0])
                 self._set_pending_confirm(self._build_pending_confirm(
                     batch, reason_items, only_path=only_path, only_nb_root=only_nb_root or self.notebook_root,
                 ))
+                if report_progress:
+                    self._emit_progress(bridge, channel=proto, progress=0.5, label=self._tr("待确认", "Needs confirm"), tone="warning", running=False)
                 if only_path is not None:
                     cta = self._tr("请前往同步页确认", "Open Sync settings to review and confirm")
                     msg = self._tr(f"自动同步暂停（{first_reason}），{cta}", f"Auto-sync paused ({first_reason}). {cta}.")
@@ -7708,8 +8084,8 @@ class SyncPlugin:
                         log_key="auto_paused",
                         log_args={"path": only_path},
                     )
-                    self._record_result("待确认", msg, protocol=protocol, target=batch["target_display"], notice_key=batch["fingerprint"])
-                    self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root)
+                    self._record_result("待确认", msg, protocol=proto, target=batch["target_display"], notice_key=batch["fingerprint"])
+                    self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root, protocol=proto)
                     self.last_status = msg
                     return msg
                 msg = self._tr("检测到危险变更，请先确认后执行", "Risky changes detected. Confirm to continue.")
@@ -7721,28 +8097,123 @@ class SyncPlugin:
                     log_key="confirm_required",
                     log_args={"reason_item": reason_items[0]},
                 )
-                self._record_result("待确认", first_reason, protocol=protocol, target=batch["target_display"])
-                self._save_runtime(bridge)
+                self._record_result("待确认", first_reason, protocol=proto, target=batch["target_display"])
+                self._save_runtime(bridge, protocol=proto)
                 self.last_status = msg
                 return msg
 
         try:
-            msg = self._execute_batch_plan(bridge, batch, only_path=only_path, report_progress=report_progress)
+            msg = self._execute_batch_plan(bridge, batch, only_path=only_path, report_progress=report_progress, progress_meta=progress_meta)
         except Exception as exc:
             msg = self._error_detail(exc)
-            if not msg.startswith(self._protocol_label(protocol)) and "Git" not in msg:
-                msg = self._tr(f"{self._protocol_label(protocol)}同步未完成: {msg}", f"{self._protocol_label(protocol)} sync failed: {msg}")
-            self._append_log(self._tr(f"{self._protocol_label(protocol)}同步", f"{self._protocol_label(protocol)} sync"), "失败", tone="danger", tooltip=msg)
-            self._record_result("失败", msg, protocol=protocol, target=batch["target_display"])
-            self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root)
+            if not msg.startswith(self._protocol_label(proto)) and "Git" not in msg:
+                msg = self._tr(f"{self._protocol_label(proto)}同步未完成: {msg}", f"{self._protocol_label(proto)} sync failed: {msg}")
+            if report_progress:
+                self._emit_progress(bridge, channel=proto, progress=1.0, label=self._tr("同步失败", "Sync failed"), tone="danger", running=False)
+            self._append_log(self._tr(f"{self._protocol_label(proto)}同步", f"{self._protocol_label(proto)} sync"), "失败", tone="danger", tooltip=msg)
+            self._record_result("失败", msg, protocol=proto, target=batch["target_display"])
+            self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root, protocol=proto)
             self.last_status = msg
             raise self._sync_failure(msg) from exc
 
         self._last_sync_outcome = "synced"
         self._last_synced_notebooks = [p["nb_root"] for p in batch.get("plans") or () if p.get("nb_root")]
-        self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root, clear_pending=confirmed)
+        self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root, clear_pending=confirmed, protocol=proto)
+        if report_progress:
+            proto_res = self._get_protocol_result(proto)
+            done_lbl = self._format_short_sync_metric(proto_res)
+            self._emit_progress(bridge, channel=proto, progress=1.0, label=done_lbl, tone="success", running=False)
+            if batch_count > 1:
+                self._emit_progress(bridge, progress=(batch_index + 1) / float(batch_count), label=overall_label)
         self.last_status = msg
         return msg
+
+    def _run_multi_protocol_sync(self, bridge, protocols, report_progress=False):
+        total_targets = len(protocols)
+        if report_progress and total_targets > 1:
+            for proto in protocols:
+                if self._get_pending_confirm(proto):
+                    self._emit_progress(bridge, channel=proto, progress=0.5, label=self._tr("待确认", "Needs confirm"), tone="warning", running=False)
+                else:
+                    self._emit_progress(bridge, channel=proto, progress=0.0, label=self._tr("等待同步", "Queued"), running=False)
+
+        succeeded = []
+        pending = []
+        failed = []
+        synced_notebooks = []
+        seen_nbs = set()
+        last_err = ""
+
+        for idx, proto in enumerate(protocols):
+            proto_label = self._protocol_label(proto)
+            overall_label = self._tr(
+                f"{proto_label} ({idx + 1}/{total_targets})",
+                f"{proto_label} ({idx + 1}/{total_targets})",
+            )
+            if self._get_pending_confirm(proto):
+                pending.append(proto)
+                if report_progress:
+                    self._emit_progress(bridge, channel=proto, progress=0.5, label=self._tr("待确认", "Needs confirm"), tone="warning", running=False)
+                continue
+            try:
+                self._run_sync(
+                    bridge,
+                    report_progress=report_progress,
+                    protocol=proto,
+                    progress_meta={
+                        "batch_index": idx,
+                        "batch_count": total_targets,
+                        "overall_label": overall_label,
+                    },
+                )
+            except Exception as exc:
+                failed.append(proto)
+                last_err = self._error_detail(exc)
+                continue
+            if self._last_sync_outcome == "pending_confirm":
+                pending.append(proto)
+            else:
+                succeeded.append(proto)
+                for nb in self._last_synced_notebooks:
+                    if nb not in seen_nbs:
+                        seen_nbs.add(nb)
+                        synced_notebooks.append(nb)
+
+        self._last_synced_notebooks = synced_notebooks
+        sep = self._tr("、", ", ")
+        if failed and not succeeded and not pending:
+            msg = last_err or self._tr("全部同步目标均未完成", "All sync targets failed")
+            self.last_status = msg
+            return False, "danger", msg
+        if failed:
+            fail_names = sep.join(self._protocol_label(p) for p in failed)
+            msg = self._tr(
+                f"已完成 {len(succeeded)}/{total_targets} 个目标，{fail_names} 失败",
+                f"{len(succeeded)}/{total_targets} targets synced; {fail_names} failed",
+            )
+            self.last_status = msg
+            return False, "danger", msg
+        if pending:
+            pend_names = sep.join(self._protocol_label(p) for p in pending)
+            if succeeded:
+                msg = self._tr(
+                    f"已完成 {len(succeeded)}/{total_targets} 个目标，{pend_names} 待确认",
+                    f"{len(succeeded)}/{total_targets} targets synced; {pend_names} needs confirmation",
+                )
+            else:
+                msg = self._tr(
+                    f"{pend_names} 检测到危险变更，请先确认",
+                    f"{pend_names} detected risky changes; confirmation required",
+                )
+            self.last_status = msg
+            return True, "warning", msg
+        names = sep.join(self._protocol_label(p) for p in succeeded)
+        msg = self._tr(
+            f"已同步 {len(succeeded)} 个目标（{names}）",
+            f"Synced {len(succeeded)} targets ({names})",
+        )
+        self.last_status = msg
+        return True, "success", msg
 
     def _sync_failure(self, message):
         return SyncReportedError(message) if self._result_notified else RuntimeError(message)
@@ -7782,8 +8253,8 @@ class SyncPlugin:
         self.last_status = msg
         return bool(ok), msg
 
-    def _confirmation_card(self):
-        pending = self.pending_confirm
+    def _confirmation_card(self, pending=None):
+        pending = pending or self.pending_confirm
         reason_items = pending.get("reason_items") or []
         if reason_items:
             reason_texts = [self._format_reason_item(r) for r in reason_items]
@@ -7946,13 +8417,17 @@ class SyncPlugin:
             target_items.append(self._notification_switch(c))
         return [{"id": "target-card", "title": self._tr("同步设置", "Sync Settings"), "items": target_items}]
 
-    def _config_buttons(self, protocol):
+    def _config_buttons(self, protocol, cfg=None):
+        c = cfg or self.config
         buttons = [
             {"id": "test_conn", "label": self._tr("测试连接", "Test Connection"), "variant": "secondary"},
             {"id": "save_config", "label": self._tr("保存", "Save"), "variant": "primary"},
         ]
+        if protocol in ("webdav", "git") and not self._protocol_error(c, protocol, require_notebooks=True):
+            sync_label = self._tr("同步 WebDAV", "Sync WebDAV") if protocol == "webdav" else self._tr("同步 Git", "Sync Git")
+            buttons.insert(0, {"id": f"sync_{protocol}", "label": sync_label, "variant": "secondary"})
         field = {"git": "git_token", "webdav": "webdav_pass"}.get(protocol)
-        if self.supports_system and protocol == self.config["protocol"] and field and (self.config.get(field) or self.config.get("credential_refs", {}).get(field)):
+        if self.supports_system and field and (self.config.get(field) or self.config.get("credential_refs", {}).get(field)):
             buttons.insert(0, {"id": "forget_credential", "label": self._tr("清除凭据", "Forget Credential"), "variant": "secondary"})
         return buttons
 
@@ -8031,17 +8506,25 @@ class SyncPlugin:
                 "items": [checklist_item],
             }
 
+            protocol_options = []
+            for p in VALID_PROTOCOLS:
+                opt = {"value": p, "label": self._protocol_label(p)}
+                if self.supports_segmented_status:
+                    opt["channel"] = p
+                    seg_tone, seg_tip = self._protocol_segment_status(p, c)
+                    if seg_tone:
+                        opt["tone"] = seg_tone
+                    if seg_tip:
+                        opt["tooltip"] = seg_tip
+                protocol_options.append(opt)
+
             target_items = [
                 {
                     "kind": "segmented",
                     "id": "protocol",
                     "layout": "full",
                     "value": protocol,
-                    "options": [
-                        {"value": "local_mirror", "label": self._tr("目录镜像", "Local mirror")},
-                        {"value": "webdav", "label": "WebDAV"},
-                        {"value": "git", "label": self._tr("Git 仓库", "Git repository")},
-                    ],
+                    "options": protocol_options,
                 },
                 {
                     "kind": "folder",
@@ -8135,18 +8618,42 @@ class SyncPlugin:
                         },
                     ],
                 },
-                {
-                    "kind": "actions",
-                    "visible_when": {"control_id": "protocol", "in": ["webdav", "git"]},
-                    "buttons": self._config_buttons(protocol),
-                },
             ]
+            if self.supports_progress_bar:
+                for p in VALID_PROTOCOLS:
+                    target_items.append(self._build_progress_item(p, c))
+            target_items.append({
+                "kind": "actions",
+                "visible_when": {"control_id": "protocol", "in": ["webdav", "git"]},
+                "buttons": self._config_buttons(protocol, c),
+            })
+            if not self._protocol_error(c, "local_mirror", require_notebooks=True):
+                target_items.append({
+                    "kind": "actions",
+                    "visible_when": {"control_id": "protocol", "equals": "local_mirror"},
+                    "buttons": [
+                        {"id": "sync_local_mirror", "label": self._tr("同步目录镜像", "Sync Mirror"), "variant": "secondary"},
+                    ],
+                })
+
+            enabled_protocols = self._configured_protocols(c)
+            if len(enabled_protocols) >= 2:
+                target_meta = self._tr(
+                    f"同时启用 {len(enabled_protocols)}/3",
+                    f"{len(enabled_protocols)}/3 active",
+                )
+            elif len(enabled_protocols) == 1:
+                target_meta = self._tr("已启用 1/3", "1/3 active")
+            else:
+                target_meta = ""
 
             target_card = {
                 "id": "target-card",
                 "title": self._tr("同步目标", "Sync Destination"),
                 "items": target_items,
             }
+            if target_meta:
+                target_card["meta"] = target_meta
             options_card = {
                 "id": "options-card",
                 "title": self._tr("同步选项", "Sync Options"),
@@ -8162,15 +8669,23 @@ class SyncPlugin:
         else:
             cards = self._build_legacy_page(c)
 
+        active_pc = self._get_pending_confirm(protocol) or self._get_pending_confirm()
         has_pending_confirm = bool(
-            self.pending_confirm
-            and self.pending_confirm.get("scope_key") == self._result_key()
-            and c == self.config
+            active_pc
+            and active_pc.get("scope_key") == self._result_key()
+            and self._config_matches_saved(c, self.config)
         )
         if has_pending_confirm:
-            cards.insert(0, self._confirmation_card())
+            cards.insert(0, self._confirmation_card(active_pc))
 
-        configured = not self._target_error(c)
+        enabled_protocols = self._configured_protocols(c)
+        selected_nbs = self._selected_notebooks(c)
+        nb_overlap = any(
+            paths_overlap(selected_nbs[i], selected_nbs[j])
+            for i in range(len(selected_nbs))
+            for j in range(i)
+        )
+        configured = bool(enabled_protocols) and ((not self.supports_multi_notebook) or bool(selected_nbs)) and not nb_overlap
         last_result = self._get_last_result() or {}
         last_ok = last_result.get("last_success")
         history_meta = (
@@ -8206,7 +8721,7 @@ class SyncPlugin:
         })
 
         status = self.last_status
-        if not status and configured and c == self.config:
+        if not status and configured and self._config_matches_saved(c, self.config):
             latest_state = str(last_result.get("status") or "").strip()
             if has_pending_confirm:
                 status = self._tr("待确认同步变更", "Confirmation required")
@@ -8229,8 +8744,13 @@ class SyncPlugin:
                 {"id": "confirm_sync", "label": self._tr("确认同步", "Confirm Sync"), "variant": "danger"},
             ]
         elif configured:
+            sync_all_label = (
+                self._tr(f"全部同步 ({len(enabled_protocols)})", f"Sync All ({len(enabled_protocols)})")
+                if len(enabled_protocols) >= 2
+                else self._tr("立即同步", "Sync Now")
+            )
             header_actions = [
-                {"id": "sync_now", "label": self._tr("立即同步", "Sync Now"), "variant": "primary"},
+                {"id": "sync_now", "label": sync_all_label, "variant": "primary"},
             ]
         return {
             "title": self._tr("同步", "Sync"),
@@ -8255,6 +8775,8 @@ class SyncPlugin:
             self.supports_multi_notebook = "multi_notebook" in caps
             self.supports_log_timeline = "log_timeline" in caps
             self.supports_action_progress = "action_progress" in caps
+            self.supports_progress_bar = "progress_bar" in caps
+            self.supports_segmented_status = "segmented_status" in caps
             self.supports_system = "system_integration" in caps
             raw_nbs = params.get("notebooks")
             if isinstance(raw_nbs, list):
@@ -8270,31 +8792,39 @@ class SyncPlugin:
             if isinstance(values, dict) and values:
                 cfg = self._normalize_config(values, base=self.config)
                 next_config = dict(self.config)
-                clear_pending = False
+                clear_protocols = set()
                 next_status = self.last_status
                 if "selected_notebooks" in values and cfg["selected_notebooks"] != self.config["selected_notebooks"]:
                     next_config["selected_notebooks"] = list(cfg["selected_notebooks"])
-                    clear_pending = True
+                    clear_protocols.update(VALID_PROTOCOLS)
                     next_status = ""
                 next_config["auto_sync"] = cfg["auto_sync"]
                 next_config["sync_interval"] = cfg["sync_interval"]
                 next_config["system_notifications"] = cfg["system_notifications"]
                 if cfg["conflict_policy"] != self.config["conflict_policy"]:
                     next_config["conflict_policy"] = cfg["conflict_policy"]
-                    clear_pending = True
+                    clear_protocols.update(VALID_PROTOCOLS)
                     next_status = ""
-                if cfg["protocol"] == "local_mirror":
-                    mirror_err = self._target_error(cfg, require_notebooks=False)
-                    if not mirror_err:
-                        if self.config["protocol"] != "local_mirror" or self.config["mirror_dir"] != cfg["mirror_dir"]:
-                            next_config["protocol"] = "local_mirror"
-                            next_config["mirror_dir"] = cfg["mirror_dir"]
-                            clear_pending = True
-                            next_status = self._tr("已启用本地镜像目录", "Local mirror folder enabled")
-                    elif cfg["mirror_dir"]:
-                        render_status = mirror_err
+                if "protocol" in values and cfg["protocol"] != self.config["protocol"]:
+                    next_config["protocol"] = cfg["protocol"]
+                    next_status = ""
+                if "mirror_dir" in values:
+                    if not cfg["mirror_dir"]:
+                        if self.config["mirror_dir"]:
+                            next_config["mirror_dir"] = ""
+                            clear_protocols.add("local_mirror")
+                            next_status = self._tr("已停用目录镜像", "Local mirror disabled")
+                    else:
+                        mirror_err = self._protocol_error(cfg, "local_mirror", require_notebooks=False)
+                        if not mirror_err:
+                            if self.config["mirror_dir"] != cfg["mirror_dir"]:
+                                next_config["mirror_dir"] = cfg["mirror_dir"]
+                                clear_protocols.add("local_mirror")
+                                next_status = self._tr("已启用本地镜像目录", "Local mirror folder enabled")
+                        else:
+                            render_status = mirror_err
                 if next_config != self.config:
-                    self._save_config(bridge, next_config, clear_pending=clear_pending)
+                    self._save_config(bridge, next_config, clear_pending=clear_protocols or False)
                     self.last_status = next_status
                 accepted = {
                     key: self.config[key]
@@ -8317,7 +8847,13 @@ class SyncPlugin:
             tone = "info"
             if action_id == "save_config":
                 next_cfg = self._normalize_config(values)
-                status = self._target_error(next_cfg, require_notebooks=False)
+                proto = next_cfg["protocol"]
+                clearing_configured = (
+                    (proto == "webdav" and not next_cfg["webdav_url"] and bool(self.config.get("webdav_url")))
+                    or (proto == "git" and not next_cfg["git_remote"] and bool(self.config.get("git_remote")))
+                    or (proto == "local_mirror" and not next_cfg["mirror_dir"] and bool(self.config.get("mirror_dir")))
+                )
+                status = "" if clearing_configured else self._protocol_error(next_cfg, proto, require_notebooks=False)
                 if status:
                     self.last_status = status
                     return {
@@ -8327,17 +8863,25 @@ class SyncPlugin:
                         "page": self.build_page(cfg=next_cfg),
                         "status": status,
                     }
-                self._save_config(bridge, next_cfg, clear_pending=next_cfg != self.config)
-                status = self._tr("已保存同步目标配置", "Sync destination saved")
+                changed = self._changed_protocols(self.config, next_cfg)
+                self._save_config(bridge, next_cfg, clear_pending=changed or False)
+                if clearing_configured:
+                    status = self._tr(
+                        f"已停用{self._protocol_label(proto)}同步",
+                        f"{self._protocol_label(proto)} sync disabled",
+                    )
+                else:
+                    status = self._tr("已保存同步目标配置", "Sync destination saved")
                 self.last_status = status
                 ok = True
                 tone = "success"
             elif action_id == "forget_credential" and self.supports_system:
-                field = {"git": "git_token", "webdav": "webdav_pass"}.get(self.config["protocol"])
                 draft = self._normalize_config(values)
-                if (field and draft["protocol"] == self.config["protocol"] and
+                proto = draft["protocol"]
+                field = {"git": "git_token", "webdav": "webdav_pass"}.get(proto)
+                if (field and (self.config.get(field) or self.config.get("credential_refs", {}).get(field)) and
                         self._credential_target(draft, field) == self._credential_target(self.config, field)):
-                    self._save_config(bridge, forget=field, clear_pending=True)
+                    self._save_config(bridge, forget=field, clear_pending={proto})
                     status = self._tr("已清除此目标的同步凭据", "Sync credential cleared for this destination")
                     if self._credential_cleanup:
                         status = self._tr("已取消使用此目标的凭据，系统凭据库中的删除将重试", "Sync will stop using this credential. Deletion from the system store will be retried.")
@@ -8357,10 +8901,12 @@ class SyncPlugin:
                     "page": self.build_page(cfg=next_cfg),
                     "status": status,
                 }
-            elif action_id == "sync_now":
+            elif action_id in ("sync_local_mirror", "sync_webdav", "sync_git"):
+                proto = action_id[len("sync_"):]
                 if isinstance(values, dict) and values:
                     next_cfg = self._normalize_config(values)
-                    err = self._target_error(next_cfg)
+                    next_cfg["protocol"] = proto
+                    err = self._protocol_error(next_cfg, proto, require_notebooks=True)
                     if err:
                         self.last_status = err
                         return {
@@ -8371,30 +8917,97 @@ class SyncPlugin:
                             "status": err,
                         }
                     if next_cfg != self.config:
-                        self._save_config(bridge, next_cfg, clear_pending=True)
-                err = self._target_error(self.config)
+                        changed = self._changed_protocols(self.config, next_cfg)
+                        self._save_config(bridge, next_cfg, clear_pending=changed or False)
+                err = self._protocol_error(self.config, proto, require_notebooks=True)
                 if err or not self._selected_notebooks(self.config):
                     status = err or self._tr("请至少选择一个笔记本", "Select at least one notebook")
                     self.last_status = status
                     ok = False
                     tone = "danger"
-                elif self.pending_confirm:
+                elif self._get_pending_confirm(proto):
                     status = self._tr("请先确认或取消已暂停的同步", "Confirm or cancel the paused sync first")
                     self.last_status = status
                     ok = False
                     tone = "warning"
                 else:
-                    status = self._run_sync(bridge, report_progress=True)
-                    if self.pending_confirm:
+                    status = self._run_sync(bridge, report_progress=True, protocol=proto)
+                    if self._get_pending_confirm(proto):
                         ok = True
                         tone = "warning"
                     else:
                         ok = True
                         tone = "success"
+            elif action_id == "sync_now":
+                if isinstance(values, dict) and values:
+                    next_cfg = self._normalize_config(values)
+                    for p in VALID_PROTOCOLS:
+                        if self._protocol_has_input(next_cfg, p):
+                            p_err = self._protocol_error(next_cfg, p, require_notebooks=False)
+                            if p_err:
+                                self.last_status = p_err
+                                return {
+                                    "ok": False,
+                                    "tone": "danger",
+                                    "values": self._config_values(next_cfg),
+                                    "page": self.build_page(cfg=next_cfg),
+                                    "status": p_err,
+                                }
+                    if not self._configured_protocols(next_cfg):
+                        err = self._target_error(next_cfg)
+                        self.last_status = err
+                        return {
+                            "ok": False,
+                            "tone": "danger",
+                            "values": self._config_values(next_cfg),
+                            "page": self.build_page(cfg=next_cfg),
+                            "status": err,
+                        }
+                    if next_cfg != self.config:
+                        changed = self._changed_protocols(self.config, next_cfg)
+                        self._save_config(bridge, next_cfg, clear_pending=changed or False)
+                active_protocols = self._configured_protocols(self.config)
+                selected_nbs = self._selected_notebooks(self.config)
+                if not active_protocols:
+                    status = self._target_error(self.config)
+                    self.last_status = status
+                    ok = False
+                    tone = "danger"
+                elif not selected_nbs:
+                    status = self._tr("请至少选择一个笔记本", "Select at least one notebook")
+                    self.last_status = status
+                    ok = False
+                    tone = "danger"
+                else:
+                    nb_err = self._protocol_error(self.config, active_protocols[0], require_notebooks=True)
+                    if nb_err:
+                        status = nb_err
+                        self.last_status = status
+                        ok = False
+                        tone = "danger"
+                    elif len(active_protocols) == 1:
+                        only_proto = active_protocols[0]
+                        if self._get_pending_confirm(only_proto):
+                            status = self._tr("请先确认或取消已暂停的同步", "Confirm or cancel the paused sync first")
+                            self.last_status = status
+                            ok = False
+                            tone = "warning"
+                        else:
+                            status = self._run_sync(bridge, report_progress=True, protocol=only_proto)
+                            if self._get_pending_confirm(only_proto):
+                                ok = True
+                                tone = "warning"
+                            else:
+                                ok = True
+                                tone = "success"
+                    else:
+                        ok, tone, status = self._run_multi_protocol_sync(bridge, active_protocols, report_progress=True)
             elif action_id in ("confirm_sync", "confirm_sync_card"):
+                draft_proto = self.config.get("protocol", "local_mirror")
                 if isinstance(values, dict) and values:
                     draft_cfg = self._normalize_config(values)
-                    if draft_cfg != self.config:
+                    draft_proto = draft_cfg.get("protocol", draft_proto)
+                    if not self._config_matches_saved(draft_cfg, self.config):
                         status = self._tr(
                             "同步配置有未保存修改，请先保存或点击「立即同步」重新预览",
                             "Sync settings have unsaved edits; save them or click Sync Now to review the new target",
@@ -8406,7 +9019,7 @@ class SyncPlugin:
                             "page": self.build_page(cfg=draft_cfg),
                             "status": status,
                         }
-                pc = self.pending_confirm
+                pc = self._get_pending_confirm(draft_proto) or self._get_pending_confirm()
                 if not pc or pc.get("scope_key") != self._result_key():
                     status = self._tr(
                         "待确认的同步计划已失效，请重新点击「立即同步」",
@@ -8416,18 +9029,19 @@ class SyncPlugin:
                     ok = False
                     tone = "warning"
                 else:
-                    protocol = self.config.get("protocol", "local_mirror")
-                    notebooks = self._selected_notebooks(self.config)
+                    protocol = pc.get("protocol") or self.config.get("protocol", "local_mirror")
+                    proto_cfg = self._cfg_for_protocol(self.config, protocol)
+                    notebooks = self._selected_notebooks(proto_cfg)
                     only_path = pc.get("only_path")
                     only_nb_root = pc.get("only_nb_root")
                     if only_nb_root:
                         if only_nb_root not in notebooks:
-                            self._clear_pending_confirm(bridge)
+                            self._clear_pending_confirm(bridge, protocol=protocol)
                             self.last_status = self._tr("待确认的笔记本已移除，请重新同步", "The pending notebook was removed. Start sync again.")
                             return {"ok": False, "tone": "warning", "page": self.build_page(), "status": self.last_status}
                         notebooks = [only_nb_root]
                     try:
-                        batch = self._compute_batch_plan(bridge, self.config, notebooks, only_path=only_path, inspect_remote=True, force_refresh=True)
+                        batch = self._compute_batch_plan(bridge, proto_cfg, notebooks, only_path=only_path, inspect_remote=True, force_refresh=True)
                     except Exception as exc:
                         msg = self._tr(
                             f"{self._protocol_label(protocol)}同步未完成: {self._error_detail(exc)}",
@@ -8438,7 +9052,7 @@ class SyncPlugin:
                             f"{self._protocol_label(protocol)} sync",
                         ), "失败", tone="danger", tooltip=msg)
                         self._record_result("失败", msg, protocol=protocol)
-                        self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root)
+                        self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root, protocol=protocol)
                         self.last_status = msg
                         raise self._sync_failure(msg) from exc
 
@@ -8449,12 +9063,12 @@ class SyncPlugin:
                             f"{self._protocol_label(batch['protocol'])} sync",
                         ), "失败", tone="danger", tooltip=msg)
                         self._record_result("失败", msg, protocol=batch["protocol"], target=batch["target_display"])
-                        self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root)
+                        self._save_runtime(bridge, only_path=only_path, notebook_root=only_nb_root, protocol=protocol)
                         self.last_status = msg
                         raise self._sync_failure(msg)
 
                     if batch["fingerprint"] != pc.get("fingerprint"):
-                        reason_items = self._assess_batch_dangerous_changes(batch, self.config)
+                        reason_items = self._assess_batch_dangerous_changes(batch, proto_cfg)
                         if reason_items:
                             self._set_pending_confirm(self._build_pending_confirm(batch, reason_items, only_path, only_nb_root))
                             self._append_log(
@@ -8472,13 +9086,13 @@ class SyncPlugin:
                                 "同步计划已变化，请重新确认",
                                 "The sync plan changed. Review and confirm it again.",
                             ), protocol=batch["protocol"], target=batch["target_display"])
-                            self._save_runtime(bridge)
+                            self._save_runtime(bridge, protocol=protocol)
                             status = self._tr("同步计划已变化，请重新确认", "The sync plan changed. Review and confirm it again.")
                             self.last_status = status
                             ok = False
                             tone = "warning"
                         else:
-                            self._clear_pending_confirm()
+                            self._clear_pending_confirm(protocol=protocol)
                             self._append_log(
                                 self._tr("同步计划已变化", "The sync plan changed"),
                                 "已更新",
@@ -8493,26 +9107,29 @@ class SyncPlugin:
                                 "同步计划已变化，请重新同步",
                                 "The sync plan changed. Start sync again.",
                             ), protocol=batch["protocol"], target=batch["target_display"])
-                            self._save_runtime(bridge)
+                            self._save_runtime(bridge, protocol=protocol)
                             status = self._tr("同步计划已变化，请重新同步", "The sync plan changed. Start sync again.")
                             self.last_status = status
                             ok = False
                             tone = "info"
                     else:
-                        err = self._target_error(self.config)
+                        err = self._protocol_error(self.config, protocol, require_notebooks=True)
                         if err or not self._selected_notebooks(self.config):
-                            self._clear_pending_confirm(bridge)
+                            self._clear_pending_confirm(bridge, protocol=protocol)
                             status = err or self._tr("请至少选择一个笔记本", "Select at least one notebook")
                             self.last_status = status
                             ok = False
                             tone = "danger"
                         else:
                             status = self._run_sync(bridge, only_path=only_path, only_nb_root=only_nb_root,
-                                                    confirmed=True, approved_batch=batch, report_progress=True)
+                                                    confirmed=True, approved_batch=batch, report_progress=True, protocol=protocol)
                             ok = True
                             tone = "success"
             elif action_id == "cancel_confirm":
-                self._clear_pending_confirm()
+                draft_proto = self._normalize_config(values).get("protocol") if isinstance(values, dict) and values else self.config.get("protocol")
+                pc = self._get_pending_confirm(draft_proto) or self._get_pending_confirm()
+                proto = (pc or {}).get("protocol") or self.config.get("protocol", "local_mirror")
+                self._clear_pending_confirm(protocol=proto)
                 self._append_log(
                     self._tr("危险变更同步", "Sync with risky changes"),
                     "已取消",
@@ -8520,8 +9137,8 @@ class SyncPlugin:
                     tooltip=self._tr("用户已取消本次同步", "The user canceled this sync"),
                     log_key="sync_canceled",
                 )
-                self._record_result("已取消", self._tr("用户已取消危险变更", "The user canceled the risky changes"))
-                self._save_runtime(bridge)
+                self._record_result("已取消", self._tr("用户已取消危险变更", "The user canceled the risky changes"), protocol=proto)
+                self._save_runtime(bridge, protocol=proto)
                 status = self._tr("已取消本次同步", "Sync canceled")
                 self.last_status = status
                 ok = True
@@ -8539,7 +9156,7 @@ class SyncPlugin:
                 "page": self.build_page(cfg=self.config),
                 "status": status,
             }
-            if action_id in ("sync_now", "confirm_sync", "confirm_sync_card") and ok and tone == "success":
+            if action_id in ("sync_now", "sync_local_mirror", "sync_webdav", "sync_git", "confirm_sync", "confirm_sync_card") and self._last_synced_notebooks:
                 res["synced_notebooks"] = list(self._last_synced_notebooks)
             return res
 
@@ -8561,13 +9178,29 @@ class SyncPlugin:
             event_scope_ci = self._dir_is_case_insensitive(event_nb or self.notebook_root)
             if event_name == "note.saved" and self.config["auto_sync"] and is_safe_rel_md(rel_path) and self._matches_scope(rel_path, case_insensitive=event_scope_ci):
                 self._refresh_known_notebooks(bridge)
-                if not self._target_error(self.config):
-                    selected = self._selected_notebooks(self.config)
-                    if not self.supports_multi_notebook or (event_nb and event_nb in selected):
-                        if self.pending_confirm:
-                            return {"handled": True, "outcome": "pending_confirm"}
-                        self._run_background_sync(bridge, only_path=rel_path, only_nb_root=event_nb or None)
-                        outcome = getattr(self, "_last_sync_outcome", "synced")
+                active_protocols = self._configured_protocols(self.config)
+                selected = self._selected_notebooks(self.config)
+                if active_protocols and (not self.supports_multi_notebook or (event_nb and event_nb in selected)):
+                    outcomes = set()
+                    last_exc = None
+                    for proto in active_protocols:
+                        if self._protocol_error(self.config, proto, require_notebooks=True):
+                            continue
+                        if self._get_pending_confirm(proto):
+                            outcomes.add("pending_confirm")
+                            continue
+                        try:
+                            self._run_background_sync(bridge, only_path=rel_path, only_nb_root=event_nb or None, protocol=proto)
+                            outcomes.add(getattr(self, "_last_sync_outcome", "synced"))
+                        except SyncStateError as exc:
+                            outcomes.add("state_error")
+                            last_exc = exc
+                        except Exception as exc:
+                            outcomes.add("failed")
+                            last_exc = exc
+                    outcome = next((v for v in ("state_error", "failed", "pending_confirm", "synced") if v in outcomes), "skipped")
+                    if outcome in ("state_error", "failed") and len(active_protocols) == 1 and last_exc is not None:
+                        raise last_exc
             return {"handled": True, "outcome": outcome}
 
         if method == "plugin.shutdown":
@@ -8580,7 +9213,7 @@ class SyncPlugin:
         if not self.supports_multi_notebook or "selected_notebooks" in (self._stored_global or {}):
             result = self._sync_system_target(bridge, event_name, params)
             return dict(result, notebook_outcomes={params.get("notebook_root") or self.notebook_root: result})
-        if "__multi__" in self.pending_confirms:
+        if any(k == "__multi__" or k.startswith("__multi__:") for k in self.pending_confirms):
             return {"handled": True, "outcome": "skipped"}
 
         active = self.notebook_root, self.config, self.pending_confirm, self.last_status
@@ -8603,26 +9236,26 @@ class SyncPlugin:
                     continue
                 self.notebook_root = root
                 self.config = dict(saved, selected_notebooks=[root])
-                self.pending_confirm = self.pending_confirms.get(self._result_key())
+                self.pending_confirm = self._get_pending_confirm()
                 result = self._sync_system_target(bridge, event_name, params, deadline)
                 results[root] = result
                 synced.extend(result.get("synced_notebooks") or ())
         finally:
             self.notebook_root, self.config, self.pending_confirm, self.last_status = active
-            self.pending_confirm = self.pending_confirms.get(self._result_key())
+            self.pending_confirm = self._get_pending_confirm()
         outcomes = {result["outcome"] for result in results.values()}
         outcome = next((value for value in ("state_error", "failed", "pending_confirm", "synced") if value in outcomes), "skipped")
         return {"handled": True, "outcome": outcome, "synced_notebooks": synced, "notebook_outcomes": results}
 
-    def _sync_system_target(self, bridge, event_name, params, deadline=None):
-        skipped = {"handled": True, "outcome": "skipped"}
-        if not self.config["auto_sync"] or self.pending_confirm:
-            return skipped
-        protocol = self.config["protocol"]
-        git_target = self.config["git_remote"]
+    def _protocol_needs_network(self, protocol, cfg):
+        if protocol == "webdav":
+            return True
+        if protocol != "git":
+            return False
+        git_target = cfg["git_remote"]
         git_urls = [git_target]
-        if protocol == "git" and not self._is_remote_git_url(git_target):
-            repo = self._resolve_local_git_dir(self.config)
+        if not self._is_remote_git_url(git_target):
+            repo = self._resolve_local_git_dir(cfg)
             if self._has_git_marker(repo):
                 try:
                     remotes = self._run_git(["remote"], cwd=repo, timeout=1).stdout.splitlines()
@@ -8634,46 +9267,82 @@ class SyncPlugin:
                                 git_urls.extend(urls.stdout.splitlines())
                 except (OSError, subprocess.TimeoutExpired):
                     pass
-        needs_network = protocol == "webdav" or (protocol == "git" and any(
+        return any(
             url.startswith("\\\\") or (
                 not url.lower().startswith("file://") and not re.match(r"^[A-Za-z]:", url)
                 and bool(re.match(r"^(?:[^/@:\\]+@)?[^/\\:]+:", url))
             ) for url in git_urls
-        ))
-        if event_name == "network.changed" and (params.get("online") is not True or not needs_network):
-            return skipped
-        if event_name in ("system.wake", SYNC_INTERVAL_EVENT) and params.get("online") is False and needs_network:
-            return skipped
-        if self._target_error(self.config) or not self._selected_notebooks(self.config):
-            return skipped
-        interval_key = self._result_key()
-        if event_name == SYNC_INTERVAL_EVENT:
-            last = self._interval_synced_at.get(interval_key)
-            if last is not None and time.monotonic() - last < int(self.config["sync_interval"]) * 60 - 5:
-                return skipped
-        self._interval_synced_at[interval_key] = time.monotonic()
-        self._scheduled_run = event_name == SYNC_INTERVAL_EVENT
-        try:
-            self._run_background_sync(bridge, deadline=deadline)
-        except SyncStateError as exc:
-            return {"handled": True, "outcome": "state_error", "notified": exc.notified}
-        except SyncReportedError:
-            return {"handled": True, "outcome": "failed", "notified": True}
-        except RuntimeError:
-            return {"handled": True, "outcome": "failed"}
-        finally:
-            self._scheduled_run = False
-        return {"handled": True, "outcome": self._last_sync_outcome, "synced_notebooks": self._last_synced_notebooks}
+        )
 
-    def _run_background_sync(self, bridge, only_path=None, only_nb_root=None, deadline=None):
+    def _sync_system_target(self, bridge, event_name, params, deadline=None):
+        skipped = {"handled": True, "outcome": "skipped"}
+        if not self.config["auto_sync"] or not self._selected_notebooks(self.config):
+            return skipped
+        active_protocols = self._configured_protocols(self.config)
+        if not active_protocols:
+            return skipped
+
+        outcomes = set()
+        synced = []
+        seen_nbs = set()
+        notified = False
+
+        for protocol in active_protocols:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            if self._get_pending_confirm(protocol):
+                continue
+            if self._protocol_error(self.config, protocol, require_notebooks=True):
+                continue
+            needs_network = self._protocol_needs_network(protocol, self.config)
+            if event_name == "network.changed" and (params.get("online") is not True or not needs_network):
+                continue
+            if event_name in ("system.wake", SYNC_INTERVAL_EVENT) and params.get("online") is False and needs_network:
+                continue
+            interval_key = f"{self._result_key()}:{protocol}"
+            if event_name == SYNC_INTERVAL_EVENT:
+                last = self._interval_synced_at.get(interval_key)
+                if last is not None and time.monotonic() - last < int(self.config["sync_interval"]) * 60 - 5:
+                    continue
+            self._interval_synced_at[interval_key] = time.monotonic()
+            self._scheduled_run = event_name == SYNC_INTERVAL_EVENT
+            try:
+                self._run_background_sync(bridge, deadline=deadline, protocol=protocol)
+            except SyncStateError as exc:
+                outcomes.add("state_error")
+                notified = notified or exc.notified
+            except SyncReportedError:
+                outcomes.add("failed")
+                notified = True
+            except RuntimeError:
+                outcomes.add("failed")
+            else:
+                outcomes.add(self._last_sync_outcome)
+                for nb in self._last_synced_notebooks:
+                    if nb not in seen_nbs:
+                        seen_nbs.add(nb)
+                        synced.append(nb)
+            finally:
+                self._scheduled_run = False
+
+        outcome = next((v for v in ("state_error", "failed", "pending_confirm", "synced") if v in outcomes), "skipped")
+        res = {"handled": True, "outcome": outcome}
+        if synced:
+            res["synced_notebooks"] = synced
+        if notified:
+            res["notified"] = True
+        return res
+
+    def _run_background_sync(self, bridge, only_path=None, only_nb_root=None, deadline=None, protocol=None):
+        proto = protocol or self.config["protocol"]
         deadline = deadline if deadline is not None else time.monotonic() + 95
         self._background_notice_deadline = deadline + 20
-        if self.config["protocol"] == "webdav":
+        if proto == "webdav":
             self._webdav_deadline = deadline
-        if self.config["protocol"] == "git":
+        if proto == "git":
             self._git_background_deadline = deadline - 8
         try:
-            self._run_sync(bridge, only_path=only_path, only_nb_root=only_nb_root)
+            self._run_sync(bridge, only_path=only_path, only_nb_root=only_nb_root, protocol=proto)
         finally:
             self._webdav_deadline = 0.0
             self._git_background_deadline = 0.0
