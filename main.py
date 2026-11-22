@@ -8848,7 +8848,11 @@ class SyncPlugin:
             if action_id == "save_config":
                 next_cfg = self._normalize_config(values)
                 proto = next_cfg["protocol"]
-                clearing_configured = (
+                has_other_configured = any(
+                    p != proto and not self._protocol_error(next_cfg, p, require_notebooks=False)
+                    for p in VALID_PROTOCOLS
+                )
+                clearing_configured = has_other_configured and (
                     (proto == "webdav" and not next_cfg["webdav_url"] and bool(self.config.get("webdav_url")))
                     or (proto == "git" and not next_cfg["git_remote"] and bool(self.config.get("git_remote")))
                     or (proto == "local_mirror" and not next_cfg["mirror_dir"] and bool(self.config.get("mirror_dir")))
