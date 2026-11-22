@@ -8722,7 +8722,7 @@ class SyncPlugin:
         last_result = self._get_last_result() or {}
         last_ok = last_result.get("last_success")
         history_items = []
-        for proto in VALID_PROTOCOLS:
+        for proto in enabled_protocols:
             proto_ok = self._get_protocol_result(proto).get("last_success")
             if self.supports_log_timeline:
                 item = {
@@ -8743,11 +8743,12 @@ class SyncPlugin:
                 item["label"] = self._tr(f"上次成功 {proto_ok['time']}", f"Last synced: {proto_ok['time']}")
             item["visible_when"] = {"control_id": "protocol", "equals": proto}
             history_items.append(item)
-        cards.append({
-            "id": "history-card",
-            "title": self._tr("最近同步记录", "Recent Sync Activity"),
-            "items": history_items,
-        })
+        if history_items:
+            cards.append({
+                "id": "history-card",
+                "title": self._tr("最近同步记录", "Recent Sync Activity"),
+                "items": history_items,
+            })
 
         status = self.last_status
         if not status and configured and self._config_matches_saved(c, self.config):
