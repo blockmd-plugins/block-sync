@@ -846,6 +846,7 @@ class SyncPlugin:
         self.notebook_results = {}
         self.stats = {"total_synced": 0, "last_sync": ""}
         self.logs = []
+        self._log_protocol = ""
         self.sync_meta = {}
         self.pending_confirm = None
         self.pending_confirms = {}
@@ -1625,7 +1626,34 @@ class SyncPlugin:
             item["log_key"] = entry["log_key"]
             if isinstance(entry.get("log_args"), dict):
                 item["log_args"] = dict(entry["log_args"])
+        proto = self._infer_log_protocol(entry)
+        if proto:
+            item["protocol_id"] = proto
         return item
+
+    def _infer_log_protocol(self, entry):
+        pid = str(entry.get("protocol_id") or "").strip()
+        if pid in VALID_PROTOCOLS:
+            return pid
+        args = entry.get("log_args") if isinstance(entry.get("log_args"), dict) else {}
+        pid = str(args.get("protocol") or "").strip()
+        if pid in VALID_PROTOCOLS:
+            return pid
+        title = str(entry.get("title") or "")
+        for proto, labels in (
+            ("local_mirror", ("目录镜像", "Local mirror")),
+            ("webdav", ("WebDAV",)),
+            ("git", ("Git 仓库", "Git repository")),
+        ):
+            if any(label in title for label in labels):
+                return proto
+        return ""
+
+    def _logs_for_protocol(self, protocol=None):
+        logs = [e for e in self.logs if isinstance(e, dict)]
+        if not protocol:
+            return logs
+        return [e for e in logs if e.get("protocol_id") in ("", None, protocol)]
 
     def _render_structured_log(self, key, args):
         a = args or {}
@@ -1674,6 +1702,7 @@ class SyncPlugin:
         item = self._normalize_log(entry)
         log_key = item.pop("log_key", None)
         log_args = item.pop("log_args", None)
+        item.pop("protocol_id", None)
         recorded_in_english = item.pop("locale", None) == "en"
         if log_key:
             loc_title, loc_tip = self._render_structured_log(log_key, log_args)
@@ -2445,8 +2474,8 @@ class SyncPlugin:
             "assets_synced",
         )
 
-    def _timeline_entries(self, limit=8):
-        raw_logs = [e for e in self.logs if isinstance(e, dict)]
+    def _timeline_entries(self, limit=8, protocol=None):
+        raw_logs = self._logs_for_protocol(protocol)
         out = []
         i = 0
         n = len(raw_logs)
@@ -2650,6 +2679,9 @@ class SyncPlugin:
         if log_key:
             raw["log_key"] = log_key
             raw["log_args"] = dict(log_args or {})
+        proto = str((log_args or {}).get("protocol") or self._log_protocol or "").strip()
+        if proto in VALID_PROTOCOLS:
+            raw["protocol_id"] = proto
         entry = self._normalize_log(raw)
         if self._is_en():
             entry["locale"] = "en"
@@ -7993,6 +8025,7 @@ class SyncPlugin:
         self._last_synced_notebooks = []
         self._refresh_known_notebooks(bridge)
         proto = protocol or (approved_batch.get("protocol") if approved_batch is not None else None) or self.config.get("protocol", "local_mirror")
+        self._log_protocol = proto
         proto_cfg = self._cfg_for_protocol(self.config, proto)
         target_error = self._target_error(proto_cfg)
         if target_error:
@@ -8688,36 +8721,32 @@ class SyncPlugin:
         configured = bool(enabled_protocols) and ((not self.supports_multi_notebook) or bool(selected_nbs)) and not nb_overlap
         last_result = self._get_last_result() or {}
         last_ok = last_result.get("last_success")
-        history_meta = (
-            self._tr(f"上次成功 {last_ok['time']}", f"Last synced: {last_ok['time']}")
-            if isinstance(last_ok, dict) and last_ok.get("time")
-            else ""
-        )
-        if self.supports_log_timeline:
-            history_item = {
-                "kind": "log_list",
-                "id": "sync_logs",
-                "variant": "timeline",
-                "empty_text": self._tr("暂无同步记录", "No sync activity yet"),
-                "entries": self._timeline_entries(limit=8),
-            }
-        else:
-            history_entries = [
-                self._log_for_page(entry)
-                for entry in self.logs[:6]
-                if isinstance(entry, dict)
-            ]
-            history_item = {
-                "kind": "log_list",
-                "id": "sync_logs",
-                "empty_text": self._tr("暂无同步记录", "No sync activity yet"),
-                "entries": history_entries,
-            }
+        history_items = []
+        for proto in VALID_PROTOCOLS:
+            proto_ok = self._get_protocol_result(proto).get("last_success")
+            if self.supports_log_timeline:
+                item = {
+                    "kind": "log_list",
+                    "id": f"sync_logs_{proto}",
+                    "variant": "timeline",
+                    "empty_text": self._tr("暂无同步记录", "No sync activity yet"),
+                    "entries": self._timeline_entries(limit=8, protocol=proto),
+                }
+            else:
+                item = {
+                    "kind": "log_list",
+                    "id": f"sync_logs_{proto}",
+                    "empty_text": self._tr("暂无同步记录", "No sync activity yet"),
+                    "entries": [self._log_for_page(e) for e in self._logs_for_protocol(proto)[:6]],
+                }
+            if isinstance(proto_ok, dict) and proto_ok.get("time"):
+                item["label"] = self._tr(f"上次成功 {proto_ok['time']}", f"Last synced: {proto_ok['time']}")
+            item["visible_when"] = {"control_id": "protocol", "equals": proto}
+            history_items.append(item)
         cards.append({
             "id": "history-card",
             "title": self._tr("最近同步记录", "Recent Sync Activity"),
-            "meta": history_meta,
-            "items": [history_item],
+            "items": history_items,
         })
 
         status = self.last_status
@@ -9034,6 +9063,7 @@ class SyncPlugin:
                     tone = "warning"
                 else:
                     protocol = pc.get("protocol") or self.config.get("protocol", "local_mirror")
+                    self._log_protocol = protocol
                     proto_cfg = self._cfg_for_protocol(self.config, protocol)
                     notebooks = self._selected_notebooks(proto_cfg)
                     only_path = pc.get("only_path")
@@ -9134,6 +9164,7 @@ class SyncPlugin:
                 pc = self._get_pending_confirm(draft_proto) or self._get_pending_confirm()
                 proto = (pc or {}).get("protocol") or self.config.get("protocol", "local_mirror")
                 self._clear_pending_confirm(protocol=proto)
+                self._log_protocol = proto
                 self._append_log(
                     self._tr("危险变更同步", "Sync with risky changes"),
                     "已取消",
