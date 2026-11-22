@@ -4,7 +4,7 @@
   <img alt="Sync" src="assets/card-en-light.png">
 </picture>
 
-- **Three backends**: Sync multiple notebooks over Local Mirror, WebDAV, or Git.
+- **Three backends**: Sync multiple notebooks over Local Mirror, WebDAV, and Git; configured targets run simultaneously with independent progress bars.
 - **Auto on save**: Incremental sync runs automatically on save, plus one-click Sync Now.
 - **Scheduled sync** — With automatic sync enabled, sync runs every 5 minutes, 30 minutes, or 1 hour (default: 5 minutes). Runs with no changes add no log entry. Repeated failures alert only once.
 - **Conflict-safe**: Choose conflict copy, local-first, or remote-first with destructive guardrails. With deletion protection enabled, confirm before uploading a note that was deleted remotely.
