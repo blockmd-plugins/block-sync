@@ -46,6 +46,7 @@ jobs:
           from collections import deque
           from concurrent.futures import ThreadPoolExecutor
           import datetime
+          import hashlib
           import json
           import os
           from pathlib import Path
@@ -258,9 +259,25 @@ jobs:
                   if method == "host.notes.list":
                       return {"notes": [{"path": path} for path in notes]}
                   if method == "host.notes.read":
-                      return {"content": notes[params["path"]]}
+                      content = notes[params["path"]]
+                      return {
+                          "content": content,
+                          "revision": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                      }
                   if method == "host.notes.write":
                       notes[params["path"]] = params["content"]
+                      return {"ok": True}
+                  if method == "host.notes.trash":
+                      path = params["path"]
+                      if path not in notes:
+                          return {"ok": True, "trashed": False}
+                      expected = params.get("expected_revision") or ""
+                      actual = hashlib.sha256(notes[path].encode("utf-8")).hexdigest()
+                      require(expected == actual, f"host.notes.trash: revision mismatch for {path}")
+                      del notes[path]
+                      return {"ok": True, "trashed": True}
+                  if method == "host.log":
+                      require(isinstance(params.get("entries"), list), "host.log: entries must be a list")
                       return {"ok": True}
                   raise ValueError(f"Unexpected host request: {method}")
 
