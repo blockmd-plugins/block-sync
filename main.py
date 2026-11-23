@@ -9331,7 +9331,11 @@ class SyncPlugin:
                 next_cfg = self._normalize_config(values)
                 proto = next_cfg["protocol"]
                 enabled_key = PROTOCOL_ENABLED_KEYS[proto]
-                clearing_configured = (
+                has_other_configured = any(
+                    p != proto and self._protocol_enabled(next_cfg, p) and not self._protocol_error(next_cfg, p, require_notebooks=False)
+                    for p in VALID_PROTOCOLS
+                )
+                clearing_configured = has_other_configured and (
                     (proto == "webdav" and not next_cfg["webdav_url"] and bool(self.config.get("webdav_url")))
                     or (proto == "git" and not next_cfg["git_remote"] and bool(self.config.get("git_remote")))
                     or (proto == "local_mirror" and not next_cfg["mirror_dir"] and bool(self.config.get("mirror_dir")))
@@ -9348,7 +9352,10 @@ class SyncPlugin:
                     }
                 if clearing_configured:
                     next_cfg[enabled_key] = False
-                elif not self._protocol_has_input(self.config, proto) and not self._protocol_enabled(self.config, proto):
+                elif (
+                    not self._protocol_enabled(next_cfg, proto)
+                    and (enabled_key not in values or not self._protocol_has_input(self.config, proto))
+                ):
                     next_cfg[enabled_key] = True
                 changed = self._changed_protocols(self.config, next_cfg)
                 self._save_config(bridge, next_cfg, clear_pending=changed or False)
