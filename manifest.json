@@ -2,6 +2,7 @@
   "app": "blockmd",
   "schema_version": 1,
   "id": "block-sync",
+  "category": "tools",
   "name": {
     "zh": "同步",
     "en": "Sync"
