@@ -44,6 +44,7 @@ VALID_SYNC_INTERVALS = ("5", "30", "60")
 SYNC_INTERVAL_EVENT = "plugin.sync_interval"
 DELETE_GUARD_THRESHOLD = 5
 MAX_LOG_ENTRIES = 100
+MAX_HOST_LOG_QUEUE = 500
 WEBDAV_TRASH_DIR = ".block-sync-trash"
 CHINESE_TEXT = re.compile(r"[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]")
 LOG_STATUS_EN = {
@@ -856,6 +857,9 @@ class SyncPlugin:
         self.stats = {"total_synced": 0, "last_sync": ""}
         self.logs = []
         self._log_protocol = ""
+        self._host_log_queue = []
+        self._host_log_unsupported = False
+        self._host_log_scope = ("", "")
         self.sync_meta = {}
         self.pending_confirm = None
         self.pending_confirms = {}
@@ -2736,6 +2740,45 @@ class SyncPlugin:
             entry["locale"] = "en"
         self.logs.insert(0, entry)
         self.logs = self.logs[:MAX_LOG_ENTRIES]
+        self._queue_host_log(raw, proto)
+
+    def _queue_host_log(self, raw, proto):
+        """Mirror a timeline entry into Block's block.log so user reports carry the sync history."""
+        if self._host_log_unsupported or len(self._host_log_queue) >= MAX_HOST_LOG_QUEUE:
+            return
+        args = raw.get("log_args") or {}
+        nb_root, prefix = self._host_log_scope
+        path = str(args.get("path") or "")
+        if prefix and path.startswith(prefix):
+            path = path[len(prefix):]
+        tone = str(raw.get("tone") or "")
+        level = "error" if tone == "danger" else ("warn" if tone == "warning" else "info")
+        detail = str(raw.get("status") or "")
+        extra = str(args.get("error") or raw.get("tooltip") or "")
+        if extra and not path:
+            detail = f"{detail} {extra}".strip()
+        elif args.get("error"):
+            detail = f"{detail} {args.get('error')}".strip()
+        self._host_log_queue.append({
+            "level": level,
+            "event": str(raw.get("log_key") or raw.get("title") or ""),
+            "notebook_root": nb_root if path else "",
+            "path": path,
+            "protocol": proto,
+            "detail": detail,
+        })
+
+    def _flush_host_log(self, bridge):
+        if not self._host_log_queue:
+            return
+        entries, self._host_log_queue = self._host_log_queue, []
+        if self._host_log_unsupported:
+            return
+        try:
+            bridge.call_host("host.log", {"entries": entries})
+        except Exception as exc:
+            if "unknown host method" in str(exc).lower():
+                self._host_log_unsupported = True
 
     def _protocol_label(self, protocol):
         return {
@@ -7522,6 +7565,7 @@ class SyncPlugin:
         conflict_count = 0
         asset_count = 0
         prefix = f"{plan.get('nb_label')}/" if subdir else ""
+        self._host_log_scope = (nb_root if self.supports_multi_notebook else "", prefix)
         asset_copy_map = {}
 
         def step_progress():
@@ -9166,6 +9210,13 @@ class SyncPlugin:
         }
 
     def handle(self, bridge, method, params):
+        try:
+            return self._handle(bridge, method, params)
+        finally:
+            self._host_log_scope = ("", "")
+            self._flush_host_log(bridge)
+
+    def _handle(self, bridge, method, params):
         if method == "plugin.initialize":
             self.plugin_id = str(params.get("plugin_id") or "block-sync")
             self.data_dir = str(params.get("data_dir") or "")
