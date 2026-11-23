@@ -33,12 +33,18 @@ import xml.etree.ElementTree as ET
 
 
 VALID_PROTOCOLS = ("local_mirror", "webdav", "git")
+PROTOCOL_ENABLED_KEYS = {
+    "local_mirror": "local_mirror_enabled",
+    "webdav": "webdav_enabled",
+    "git": "git_enabled",
+}
 VALID_CONFLICT_POLICIES = ("keep_both", "remote_first", "local_first")
 VALID_GIT_AUTHS = ("ssh", "token")
 VALID_SYNC_INTERVALS = ("5", "30", "60")
 SYNC_INTERVAL_EVENT = "plugin.sync_interval"
 DELETE_GUARD_THRESHOLD = 5
-MAX_LOG_ENTRIES = 20
+MAX_LOG_ENTRIES = 100
+WEBDAV_TRASH_DIR = ".block-sync-trash"
 CHINESE_TEXT = re.compile(r"[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]")
 LOG_STATUS_EN = {
     "完成": "Complete",
@@ -63,6 +69,9 @@ CREDENTIAL_REF = re.compile(r"^sync\.(git_token|webdav_pass)\.[0-9a-f]{32}$")
 DEFAULT_CONFIG = {
     "selected_notebooks": [],
     "protocol": "local_mirror",
+    "local_mirror_enabled": False,
+    "webdav_enabled": False,
+    "git_enabled": False,
     "mirror_dir": "",
     "sync_scope": "all",
     "webdav_url": "",
@@ -857,6 +866,7 @@ class SyncPlugin:
         self.supports_add_folder = False
         self.supports_form_layout = False
         self.supports_multi_notebook = False
+        self._host_trash_unsupported = False
         self.supports_log_timeline = False
         self.supports_action_progress = False
         self.supports_progress_bar = False
@@ -934,9 +944,16 @@ class SyncPlugin:
             return bool(str(cfg.get("git_remote") or "").strip())
         return False
 
+    def _protocol_enabled(self, cfg, protocol):
+        key = PROTOCOL_ENABLED_KEYS.get(protocol)
+        return bool(cfg.get(key)) if key else False
+
     def _configured_protocols(self, cfg=None):
         c = cfg or self.config
-        return [p for p in VALID_PROTOCOLS if not self._protocol_error(c, p, require_notebooks=False)]
+        return [
+            p for p in VALID_PROTOCOLS
+            if self._protocol_enabled(c, p) and not self._protocol_error(c, p, require_notebooks=False)
+        ]
 
     @staticmethod
     def _config_matches_saved(a, b):
@@ -951,13 +968,19 @@ class SyncPlugin:
         if any(old_cfg.get(k) != new_cfg.get(k) for k in shared_keys):
             return set(VALID_PROTOCOLS)
         changed = set()
-        if old_cfg.get("mirror_dir") != new_cfg.get("mirror_dir"):
+        if old_cfg.get("mirror_dir") != new_cfg.get("mirror_dir") or old_cfg.get("local_mirror_enabled") != new_cfg.get("local_mirror_enabled"):
             changed.add("local_mirror")
         old_refs = old_cfg.get("credential_refs") or {}
         new_refs = new_cfg.get("credential_refs") or {}
-        if any(old_cfg.get(k) != new_cfg.get(k) for k in ("webdav_url", "webdav_dir", "webdav_user", "webdav_pass")) or old_refs.get("webdav_pass") != new_refs.get("webdav_pass"):
+        if (
+            any(old_cfg.get(k) != new_cfg.get(k) for k in ("webdav_url", "webdav_dir", "webdav_user", "webdav_pass", "webdav_enabled"))
+            or old_refs.get("webdav_pass") != new_refs.get("webdav_pass")
+        ):
             changed.add("webdav")
-        if any(old_cfg.get(k) != new_cfg.get(k) for k in ("git_remote", "git_branch", "git_auth", "git_token")) or old_refs.get("git_token") != new_refs.get("git_token"):
+        if (
+            any(old_cfg.get(k) != new_cfg.get(k) for k in ("git_remote", "git_branch", "git_auth", "git_token", "git_enabled"))
+            or old_refs.get("git_token") != new_refs.get("git_token")
+        ):
             changed.add("git")
         return changed
 
@@ -1674,6 +1697,16 @@ class SyncPlugin:
         if key == "conflict_copy":
             copy_rel = str(a.get("copy") or "")
             return self._tr(f"冲突保留 {path}", f"Keep conflict copy: {path}"), self._tr(f"已保留副本 {copy_rel}", f"Saved a copy at {copy_rel}")
+        if key in ("delete_remote", "delete_local"):
+            where = proto if key == "delete_remote" else self._tr("本地", "local")
+            return self._tr(f"删除 {path}", f"Delete {path}"), self._tr(f"已在{where}删除（可找回）", f"Deleted from {where} (recoverable)")
+        if key == "delete_skipped":
+            where = proto if a.get("side") == "remote" else self._tr("本地", "local")
+            return self._tr(f"保留 {path}", f"Keep {path}"), self._tr(f"{where}内容已变化，未删除", f"Changed on {where}; not deleted")
+        if key == "delete_unsupported":
+            return self._tr("远端删除未同步到本地", "Remote deletions not applied locally"), self._tr("请升级 Block 后重试", "Update Block and sync again")
+        if key == "delete_failed":
+            return self._tr(f"删除失败 {path}", f"Delete failed: {path}"), str(a.get("error") or "")
         if key == "assets_synced":
             prefix = str(a.get("prefix") or "")
             count = int(a.get("count") or 0)
@@ -1868,7 +1901,7 @@ class SyncPlugin:
         interval = str(raw.get("sync_interval", merged["sync_interval"]) or "").strip()
         merged["sync_interval"] = interval if interval in VALID_SYNC_INTERVALS else DEFAULT_CONFIG["sync_interval"]
 
-        for bool_key in ("auto_sync", "sync_assets", "delete_guard", "system_notifications"):
+        for bool_key in ("auto_sync", "sync_assets", "delete_guard", "system_notifications", "local_mirror_enabled", "webdav_enabled", "git_enabled"):
             if bool_key in raw:
                 merged[bool_key] = bool(raw[bool_key])
 
@@ -1877,6 +1910,11 @@ class SyncPlugin:
             merged["conflict_policy"] = policy
 
         merged["mirror_dir"] = self._resolve_mirror_dir(merged)
+        # Backward compatibility: legacy configs without explicit *_enabled flags keep configured targets enabled.
+        if base is DEFAULT_CONFIG:
+            for proto, enabled_key in PROTOCOL_ENABLED_KEYS.items():
+                if enabled_key not in raw:
+                    merged[enabled_key] = self._protocol_has_input(merged, proto)
         if self.supports_system and base is not DEFAULT_CONFIG:
             refs = dict(merged.get("credential_refs", {}))
             for field in CREDENTIAL_FIELDS:
@@ -2283,6 +2321,10 @@ class SyncPlugin:
         return self._tr(fallback_zh, fallback_en)
 
     def _protocol_segment_status(self, protocol, cfg):
+        if not self._protocol_enabled(cfg, protocol):
+            if self._protocol_has_input(cfg, protocol):
+                return "", self._tr("已停用", "Disabled")
+            return "", self._tr("未配置", "Not configured")
         proto_err = self._protocol_error(cfg, protocol, require_notebooks=False)
         if proto_err:
             if self._protocol_has_input(cfg, protocol):
@@ -2319,7 +2361,14 @@ class SyncPlugin:
         tone = ""
         tooltip = self._tr("配置完成后自动启用此同步目标", "Configure above to enable this sync target")
 
-        if proto_err:
+        if not self._protocol_enabled(cfg, protocol):
+            if self._protocol_has_input(cfg, protocol):
+                status = self._tr("已停用", "Disabled")
+                tooltip = self._tr("打开上方开关以恢复此同步目标", "Turn on the switch above to re-enable this sync target")
+            else:
+                status = self._tr("未启用", "Not enabled")
+                tooltip = self._tr("完成配置并打开上方开关以启用此同步目标", "Configure and turn on the switch above to enable this sync target")
+        elif proto_err:
             if self._protocol_has_input(cfg, protocol):
                 status = self._tr("配置待修正", "Needs attention")
                 tone = "warning"
@@ -2828,6 +2877,134 @@ class SyncPlugin:
         if nb_root and self.supports_multi_notebook:
             params["notebook_root"] = nb_root
         bridge.call_host("host.notes.write", params)
+
+    def _cloud_placeholder(self, root_dir, rel_path):
+        """True when iCloud evicted the file, leaving only a .name.icloud stub that scans cannot see."""
+        if not root_dir or sys.platform != "darwin":
+            return False
+        head, name = posixpath.split(rel_path)
+        parts = [p for p in head.split("/") if p]
+        try:
+            return os.path.lexists(os.path.join(root_dir, *parts, f".{name}.icloud"))
+        except (OSError, ValueError):
+            return False
+
+    def _trash_local_file(self, bridge, rel_path, revision, nb_root=None):
+        """Move a local notebook file to the system Trash through the host; returns deleted/missing/changed/unsupported."""
+        params = {"path": rel_path, "expected_revision": revision}
+        if nb_root and self.supports_multi_notebook:
+            params["notebook_root"] = nb_root
+        try:
+            res = bridge.call_host("host.notes.trash", params)
+        except RuntimeError as exc:
+            low = str(exc).lower()
+            if "unknown host method" in low:
+                return "unsupported"
+            if "note changed" in low:
+                return "changed"
+            raise
+        return "deleted" if isinstance(res, dict) and res.get("trashed") else "missing"
+
+    def _delete_mirror_entry(self, target_dir, rel_path, matches, excluded_subdirs=(), root_dir_fd=None):
+        """Move a mirror/Git worktree file into the same-volume recovery stash once its bytes still match."""
+        parts = [p for p in rel_path.split("/") if p]
+        if not parts or any(p in (".", "..") or p.startswith(".") for p in parts) or in_sync_subdir(rel_path, excluded_subdirs):
+            raise ValueError(self._tr(f"拒绝删除不安全路径：{rel_path}", f"Refused to delete unsafe path: {rel_path}"))
+        if root_dir_fd is None:
+            full = self._safe_mirror_dest(target_dir, rel_path, excluded_subdirs=excluded_subdirs)
+            if os.path.islink(full) or not os.path.isfile(full):
+                return "missing"
+            with open(full, "rb") as fh:
+                if not matches(fh.read()):
+                    return "changed"
+            now_ms, tag, wt_root, git_dir, candidate_dirs = self._stash_candidates_for_root(target_dir, rel_path)
+            for stash_dir, needs_exclude, excl_pat in candidate_dirs:
+                try:
+                    os.makedirs(stash_dir, exist_ok=True)
+                    if needs_exclude and git_dir and excl_pat:
+                        self._ensure_git_info_exclude(wt_root, git_dir, excl_pat)
+                    dest = os.path.join(stash_dir, tag)
+                    if os.path.exists(dest):
+                        continue
+                    os.replace(full, dest)
+                    self._prune_stash_dir(stash_dir, tag, now_ms)
+                    return "deleted"
+                except OSError:
+                    continue
+            raise RuntimeError(self._tr(f"无法移入恢复区：{rel_path}", f"Could not move into the recovery folder: {rel_path}"))
+        try:
+            parent_fd, owned = self._walk_dir_fd(root_dir_fd, parts[:-1])
+        except (FileNotFoundError, NotADirectoryError):
+            return "missing"
+        try:
+            name = parts[-1]
+            try:
+                before = os.lstat(name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                return "missing"
+            if not stat.S_ISREG(before.st_mode):
+                return "changed"
+            if not matches(self._read_all_at(parent_fd, name)):
+                return "changed"
+            stashed = self._stash_replaced_inode_at(parent_fd, name, target_dir, rel_path)
+            if stashed == name:
+                raise RuntimeError(self._tr(f"无法移入恢复区：{rel_path}", f"Could not move into the recovery folder: {rel_path}"))
+            try:
+                moved = os.lstat(stashed) if os.path.isabs(stashed) else os.lstat(stashed, dir_fd=parent_fd)
+            except OSError:
+                moved = None
+            if moved is not None and (moved.st_dev, moved.st_ino) != (before.st_dev, before.st_ino):
+                # Someone swapped the file between the check and the move: put it back untouched.
+                try:
+                    if os.path.isabs(stashed):
+                        os.link(stashed, name, dst_dir_fd=parent_fd)
+                    else:
+                        os.link(stashed, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                except OSError:
+                    pass
+                return "changed"
+            return "deleted"
+        finally:
+            if owned:
+                os.close(parent_fd)
+
+    def _webdav_trash_file(self, base_url, rel_path, matches, cfg=None):
+        """Move a WebDAV file into the hidden .block-sync-trash collection (DELETE only if MOVE is unsupported)."""
+        file_url = base_url + "/".join(urllib.parse.quote(p, safe="") for p in rel_path.split("/"))
+        found, raw, etag = self._webdav_get_bytes_with_etag(file_url, cfg=cfg)
+        if not found:
+            return "missing"
+        if not matches(raw):
+            return "changed"
+        cond = {"If-Match": etag} if self._is_strong_etag(etag) else {}
+        trash_name = f"{conflict_stamp()}-{sha256_text(rel_path)[:8]}-" + rel_path.replace("/", "__")
+        try:
+            self._webdav_ensure_dir(base_url, WEBDAV_TRASH_DIR, cfg=cfg)
+            dest = base_url + urllib.parse.quote(WEBDAV_TRASH_DIR, safe="") + "/" + urllib.parse.quote(trash_name, safe="")
+            self._webdav_request_full(
+                "MOVE",
+                file_url,
+                extra_headers={"Destination": dest, "Overwrite": "F", **cond},
+                cfg=cfg,
+                retries=0,
+            )
+            return "deleted"
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return "missing"
+            if exc.code == 412:
+                return "changed"
+            if exc.code not in (403, 405, 409, 501, 502):
+                raise
+        try:
+            self._webdav_request_full("DELETE", file_url, extra_headers=cond, cfg=cfg, retries=0)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return "missing"
+            if exc.code == 412:
+                return "changed"
+            raise
+        return "deleted"
 
     def _excluded_real_dirs(self, root_dir, excluded_subdirs):
         if not excluded_subdirs or not root_dir:
@@ -5508,6 +5685,8 @@ class SyncPlugin:
             "assets_to_pull_overwrite": [],
             "asset_conflicts": [],
             "assets_synced": [],
+            "assets_to_delete_remote": [],
+            "assets_to_delete_local": [],
         }
         if not cfg.get("sync_assets", True) or not nb_root:
             return empty
@@ -5646,7 +5825,12 @@ class SyncPlugin:
         pull_ow = []
         conflicts = []
         synced = []
+        delete_remote = []
+        delete_local = []
         reserved_copies = set()
+        # Deletions only propagate on full syncs where both sides were really seen.
+        allow_delete = explicit_paths is None and bool(local_notes) and bool(remote_notes)
+        remote_dir_ok = protocol == "webdav" or bool(target_dir and os.path.isdir(target_dir))
 
         for rel in sorted(set(local_assets.keys()) | set(remote_assets.keys())):
             ldata = local_assets.get(rel)
@@ -5656,11 +5840,22 @@ class SyncPlugin:
             if ldata == rdata:
                 synced.append(rel)
                 continue
+            base_del = base_map.get(f"asset:{rel}") if allow_delete else None
             if ldata is None:
-                pull_new.append(rel)
+                if self._cloud_placeholder(nb_root, rel):
+                    continue
+                if base_del is not None and sha256_bytes(rdata) == base_del:
+                    delete_remote.append(rel)
+                else:
+                    pull_new.append(rel)
                 continue
             if rdata is None:
-                push_new.append(rel)
+                if protocol != "webdav" and target_dir and self._cloud_placeholder(target_dir, remote_asset_path_map.get(rel, rel)):
+                    continue
+                if base_del is not None and remote_dir_ok and sha256_bytes(ldata) == base_del:
+                    delete_local.append(rel)
+                else:
+                    push_new.append(rel)
                 continue
 
             base_key = f"asset:{rel}"
@@ -5713,6 +5908,8 @@ class SyncPlugin:
             "assets_to_pull_overwrite": pull_ow,
             "asset_conflicts": conflicts,
             "assets_synced": synced,
+            "assets_to_delete_remote": delete_remote,
+            "assets_to_delete_local": delete_local,
         }
 
     def _paths_case_collide_on_dir(self, base_dir, p1, p2):
@@ -6131,6 +6328,35 @@ class SyncPlugin:
                     else:
                         synced.append(rel_path)
 
+        # A note in the last-synced base that vanished on one side while the other side still
+        # matches the base was deleted on purpose: propagate it instead of copying it back.
+        to_delete_remote = []
+        to_delete_local = []
+        deletion_held = set()
+        if remote_inspected and not remote_error and only_path is None and not is_first_sync:
+            local_dir = nb_root or self.notebook_root
+            remote_dir_ok = protocol == "webdav" or bool(target_dir and os.path.isdir(target_dir))
+            for rel_path in list(to_pull_new):
+                base_hash = base_map.get(rel_path)
+                if base_hash is None:
+                    continue
+                if self._cloud_placeholder(local_dir, rel_path):
+                    to_pull_new.remove(rel_path)
+                    deletion_held.add(rel_path)
+                elif local_notes and sha256_text(remote_notes[rel_path]) == base_hash:
+                    to_pull_new.remove(rel_path)
+                    to_delete_remote.append(rel_path)
+            for rel_path in list(to_push_new):
+                base_hash = base_map.get(rel_path)
+                if base_hash is None:
+                    continue
+                if protocol != "webdav" and self._cloud_placeholder(target_dir, remote_path_map.get(rel_path, rel_path)):
+                    to_push_new.remove(rel_path)
+                    deletion_held.add(rel_path)
+                elif remote_notes and remote_dir_ok and sha256_text(local_notes[rel_path]) == base_hash:
+                    to_push_new.remove(rel_path)
+                    to_delete_local.append(rel_path)
+
         asset_plan = {
             "local_assets": {},
             "remote_assets": {},
@@ -6142,6 +6368,8 @@ class SyncPlugin:
             "assets_to_pull_overwrite": [],
             "asset_conflicts": [],
             "assets_synced": [],
+            "assets_to_delete_remote": [],
+            "assets_to_delete_local": [],
         }
         if remote_inspected and not remote_error:
             try:
@@ -6197,6 +6425,10 @@ class SyncPlugin:
             if is_safe_rel_md(p) and self._matches_scope(p, scope, case_insensitive=missing_scope_ci) and p in remote_notes and p not in local_notes
         ] if (remote_inspected and only_path is None) else []
 
+        if deletion_held:
+            remote_missing = [p for p in remote_missing if p not in deletion_held]
+            local_missing = [p for p in local_missing if p not in deletion_held]
+
         local_hashes = {p: sha256_text(local_notes[p]) for p in sorted(local_notes)}
         remote_hashes = {p: sha256_text(remote_notes[p]) for p in sorted(remote_notes)}
         local_asset_hashes = {p: sha256_bytes(d) for p, d in sorted(asset_plan["local_assets"].items())}
@@ -6227,6 +6459,10 @@ class SyncPlugin:
             "asset_conflicts": [[a[0], a[1]] for a in asset_plan["asset_conflicts"]],
             "remote_missing": remote_missing,
             "local_missing": local_missing,
+            "delete_remote": to_delete_remote,
+            "delete_local": to_delete_local,
+            "assets_delete_remote": asset_plan.get("assets_to_delete_remote") or [],
+            "assets_delete_local": asset_plan.get("assets_to_delete_local") or [],
             "local_hashes": local_hashes,
             "remote_hashes": remote_hashes,
             "local_asset_hashes": local_asset_hashes,
@@ -6268,6 +6504,8 @@ class SyncPlugin:
             **asset_plan,
             "remote_missing": remote_missing,
             "local_missing": local_missing,
+            "to_delete_remote": to_delete_remote,
+            "to_delete_local": to_delete_local,
             "policy": policy,
             "scope": scope,
             "fingerprint": sha256_text(fp_payload),
@@ -6352,8 +6590,8 @@ class SyncPlugin:
             + sum(1 for _, is_conf in (plan.get("assets_to_push_overwrite") or ()) if is_conf)
         )
         n_conf = len(plan["conflicts"]) + len(plan.get("asset_view_copies") or ()) + len(plan.get("asset_conflicts") or ())
-        n_rm_miss = len(plan["remote_missing"])
-        n_loc_miss = len(plan["local_missing"])
+        n_rm_miss = len(plan["remote_missing"]) + len(plan.get("assets_to_delete_local") or ())
+        n_loc_miss = len(plan["local_missing"]) + len(plan.get("assets_to_delete_remote") or ())
         return {
             "pull_new": n_pull_new,
             "pull_total": n_pull_total,
@@ -6389,7 +6627,10 @@ class SyncPlugin:
             if m["push_conflict"] > 0 and (policy != "local_first" or m["push_conflict"] > DELETE_GUARD_THRESHOLD):
                 items.append({"kind": "push_conflict", "nb_label": nb_label, "count": m["push_conflict"]})
             if cfg.get("delete_guard", True) and 0 < m["remote_missing"] <= DELETE_GUARD_THRESHOLD:
+                auto_deleted = set(plan.get("to_delete_local") or ())
                 for path in plan["remote_missing"]:
+                    if path in auto_deleted:
+                        continue
                     items.append({"kind": "remote_missing_single", "nb_label": nb_label, "path": path})
 
         if cfg.get("delete_guard", True) and (m["remote_missing"] > DELETE_GUARD_THRESHOLD or m["local_missing"] > DELETE_GUARD_THRESHOLD):
@@ -6725,7 +6966,7 @@ class SyncPlugin:
                 f"Files planned for sync are ignored by Git ignore rules: {sample}",
             ))
 
-    def _commit_and_push_git(self, repo_root, cfg, staged_rel_paths=None, tracked_plan_paths=None, planned_blobs=None, checkout=None):
+    def _commit_and_push_git(self, repo_root, cfg, staged_rel_paths=None, tracked_plan_paths=None, planned_blobs=None, checkout=None, deleted_rel_paths=None):
         if checkout is not None:
             self._git_checkout_state(repo_root, cfg, checkout)
         # Remove any stale untracked atomic-write temp files left behind by a prior SIGKILL cancellation
@@ -6741,9 +6982,10 @@ class SyncPlugin:
                 f"Git checkout is at {cur_label} instead of {branch}; push aborted",
             ))
 
-        written = {p.replace("\\", "/").lstrip("/") for p in (staged_rel_paths or []) if p}
-        candidate_tracked = {p.replace("\\", "/").lstrip("/") for p in (tracked_plan_paths or []) if p} - written
-        all_check_paths = sorted(written | candidate_tracked)
+        deleted = {p.replace("\\", "/").lstrip("/") for p in (deleted_rel_paths or []) if p}
+        written = {p.replace("\\", "/").lstrip("/") for p in (staged_rel_paths or []) if p} - deleted
+        candidate_tracked = {p.replace("\\", "/").lstrip("/") for p in (tracked_plan_paths or []) if p} - written - deleted
+        all_check_paths = sorted(written | candidate_tracked | deleted)
         blob_map = {k.replace("\\", "/").lstrip("/"): v for k, v in (planned_blobs or {}).items() if k}
 
         # Fail loudly if .gitignore / .git/info/exclude blocks any file in the sync plan.
@@ -6791,6 +7033,12 @@ class SyncPlugin:
         changed_entries = []  # list of (path, mode, blob_oid)
         git_env = self._git_env()
         for p in all_check_paths:
+            if p in deleted:
+                # Mode 0 in --index-info removes the path from the commit tree.
+                prev_oid = head_entries.get(p, ("", ""))[1]
+                if prev_oid:
+                    changed_entries.append((p, "0", "0" * len(prev_oid)))
+                continue
             if p in blob_map:
                 raw_data = blob_map[p]
             else:
@@ -7532,6 +7780,98 @@ class SyncPlugin:
                 for rel, ldata, rhash in deferred_asset_overwrites:
                     write_remote_asset(rel, ldata, expected_hash=rhash)
                     base_map[f"asset:{rel}"] = sha256_bytes(ldata)
+
+                # 4. Propagate deletions. The other side is only removed while it still matches the
+                # last-synced base, and always into a recoverable place (system Trash, recovery
+                # stash, WebDAV .block-sync-trash or Git history).
+                deleted_count = 0
+                deleted_git_paths = []
+                deletions = (
+                    [("remote", rel, False) for rel in plan.get("to_delete_remote") or ()]
+                    + [("remote", rel, True) for rel in plan.get("assets_to_delete_remote") or ()]
+                    + [("local", rel, False) for rel in plan.get("to_delete_local") or ()]
+                    + [("local", rel, True) for rel in plan.get("assets_to_delete_local") or ()]
+                )
+                for side, rel, is_asset in deletions:
+                    key = f"asset:{rel}" if is_asset else rel
+                    expect = base_map.get(key)
+                    err_text = ""
+                    try:
+                        if side == "remote":
+                            if is_asset:
+                                def matches(raw, e=expect):
+                                    return sha256_bytes(raw) == e
+                            else:
+                                def matches(raw, r=rel, e=expect):
+                                    return sha256_text(self._decode_note_bytes(raw, r)) == e
+                            target_rel = (remote_asset_path_map if is_asset else remote_path_map).get(rel, rel)
+                            if protocol == "webdav":
+                                outcome = self._webdav_trash_file(base_url, target_rel, matches, cfg=cfg)
+                            else:
+                                verify_target()
+                                outcome = self._delete_mirror_entry(
+                                    target_dir,
+                                    target_rel,
+                                    matches,
+                                    excluded_subdirs=excluded_subdirs,
+                                    root_dir_fd=active_target_fd[0],
+                                )
+                                if outcome == "deleted" and protocol == "git":
+                                    deleted_git_paths.append(f"{subdir.strip('/')}/{target_rel}" if subdir.strip("/") else target_rel)
+                        elif self._host_trash_unsupported:
+                            outcome = "unsupported"
+                        else:
+                            revision = sha256_bytes(local_assets[rel]) if is_asset else sha256_text(local_notes[rel])
+                            outcome = self._trash_local_file(bridge, rel, revision, nb_root=nb_root)
+                    except Exception as exc:
+                        outcome = "failed"
+                        err_text = self._error_detail(exc)
+                    shown = f"{prefix}{rel}"
+                    where = self._protocol_label(protocol) if side == "remote" else self._tr("本地", "local")
+                    if outcome in ("deleted", "missing"):
+                        base_map.pop(key, None)
+                    if outcome == "deleted":
+                        deleted_count += 1
+                        self._append_log(
+                            self._tr(f"删除 {shown}", f"Delete {shown}"),
+                            "成功",
+                            tone="success",
+                            tooltip=self._tr(f"已在{where}删除（可找回）", f"Deleted from {where} (recoverable)"),
+                            log_key="delete_" + side,
+                            log_args={"path": shown, "protocol": protocol},
+                        )
+                    elif outcome == "changed":
+                        self._append_log(
+                            self._tr(f"保留 {shown}", f"Keep {shown}"),
+                            "无变更",
+                            tone="warning",
+                            tooltip=self._tr(f"{where}内容已变化，未删除", f"Changed on {where}; not deleted"),
+                            log_key="delete_skipped",
+                            log_args={"path": shown, "protocol": protocol, "side": side},
+                        )
+                    elif outcome == "unsupported":
+                        if not self._host_trash_unsupported:
+                            self._host_trash_unsupported = True
+                            self._append_log(
+                                self._tr("远端删除未同步到本地", "Remote deletions not applied locally"),
+                                "待确认",
+                                tone="warning",
+                                tooltip=self._tr("请升级 Block 后重试", "Update Block and sync again"),
+                                log_key="delete_unsupported",
+                                log_args={"protocol": protocol},
+                            )
+                    elif outcome == "failed":
+                        self._append_log(
+                            self._tr(f"删除失败 {shown}", f"Delete failed: {shown}"),
+                            "失败",
+                            tone="danger",
+                            tooltip=err_text,
+                            log_key="delete_failed",
+                            log_args={"path": shown, "protocol": protocol, "error": err_text},
+                        )
+                    step_progress()
+                plan["_deleted_count"] = deleted_count
+                plan["_deleted_git_paths"] = deleted_git_paths
         except Exception:
             if protocol != "git":
                 self.sync_meta[plan["meta_key"]] = base_map
@@ -7729,6 +8069,10 @@ class SyncPlugin:
             + len(p.get("assets_to_pull_new") or ())
             + len(p.get("assets_to_pull_overwrite") or ())
             + len(p.get("asset_conflicts") or ())
+            + len(p.get("to_delete_remote") or ())
+            + len(p.get("to_delete_local") or ())
+            + len(p.get("assets_to_delete_remote") or ())
+            + len(p.get("assets_to_delete_local") or ())
             for p in batch["plans"]
         )
         pm = progress_meta or {}
@@ -7760,6 +8104,8 @@ class SyncPlugin:
                 self._emit_progress(bridge, done=0, total=total_items)
 
         pending_base_maps = []
+        total_deleted = 0
+        deleted_git_paths = []
         staged_git_paths = []
         tracked_git_paths = []
         planned_git_blobs = {}
@@ -7803,6 +8149,10 @@ class SyncPlugin:
                     all_planned_git_writes.append(f"{sub_prefix}{rpm.get(p, p)}")
                 for p in (plan.get("assets_synced") or ()):
                     all_planned_git_writes.append(f"{sub_prefix}{rapm.get(p, p)}")
+                for p in (plan.get("to_delete_remote") or ()):
+                    all_planned_git_writes.append(f"{sub_prefix}{rpm.get(p, p)}")
+                for p in (plan.get("assets_to_delete_remote") or ()):
+                    all_planned_git_writes.append(f"{sub_prefix}{rapm.get(p, p)}")
         checkout = batch.get("git_checkout")
         with self._guard_local_git_checkout(repo if checkout is not None else None, cfg, expected=checkout):
             if protocol == "git" and repo and all_planned_git_writes:
@@ -7820,6 +8170,8 @@ class SyncPlugin:
                 total_assets += assets
                 pending_base_maps.append((plan["meta_key"], updated_base))
                 staged_git_paths.extend(written_paths)
+                total_deleted += int(plan.get("_deleted_count") or 0)
+                deleted_git_paths.extend(plan.get("_deleted_git_paths") or ())
                 tracked_git_paths.extend(synced_paths)
                 planned_git_blobs.update(nb_blobs)
                 if protocol != "git":
@@ -7858,6 +8210,7 @@ class SyncPlugin:
                     tracked_plan_paths=tracked_git_paths,
                     planned_blobs=planned_git_blobs,
                     checkout=checkout,
+                    deleted_rel_paths=deleted_git_paths,
                 )
             for mk, updated_base in pending_base_maps:
                 self.sync_meta[mk] = updated_base
@@ -7873,7 +8226,7 @@ class SyncPlugin:
         self.stats["total_synced"] += total_notes
         self.stats["last_sync"] = now_hms()
 
-        if total_notes == 0 and total_assets == 0:
+        if total_notes == 0 and total_assets == 0 and total_deleted == 0:
             if did_push:
                 summary = self._tr("已推送本地提交", "Pushed local commits")
                 self._append_log(self._tr(
@@ -7894,6 +8247,8 @@ class SyncPlugin:
         )
         if total_assets > 0:
             summary += self._tr(f" · 附件 {total_assets} 个", f" · Attachments: {total_assets}")
+        if total_deleted > 0:
+            summary += self._tr(f" · 删除 {total_deleted} 项", f" · Deleted: {total_deleted}")
         self._record_result(
             "成功",
             summary,
@@ -8378,6 +8733,9 @@ class SyncPlugin:
                     {"value": "git", "label": self._tr("Git 仓库", "Git repository")},
                 ],
             },
+            self._protocol_enable_switch("local_mirror", c),
+            self._protocol_enable_switch("webdav", c),
+            self._protocol_enable_switch("git", c),
             {
                 "kind": "folder",
                 "id": "mirror_dir",
@@ -8450,13 +8808,28 @@ class SyncPlugin:
             target_items.append(self._notification_switch(c))
         return [{"id": "target-card", "title": self._tr("同步设置", "Sync Settings"), "items": target_items}]
 
+    def _protocol_enable_switch(self, protocol, config):
+        key = PROTOCOL_ENABLED_KEYS[protocol]
+        label = {
+            "local_mirror": self._tr("启用目录镜像", "Enable Local Mirror"),
+            "webdav": self._tr("启用 WebDAV", "Enable WebDAV"),
+            "git": self._tr("启用 Git 仓库", "Enable Git Repository"),
+        }[protocol]
+        return {
+            "kind": "switch",
+            "id": key,
+            "label": label,
+            "value": bool(config.get(key)),
+            "visible_when": {"control_id": "protocol", "equals": protocol},
+        }
+
     def _config_buttons(self, protocol, cfg=None):
         c = cfg or self.config
         buttons = [
             {"id": "test_conn", "label": self._tr("测试连接", "Test Connection"), "variant": "secondary"},
             {"id": "save_config", "label": self._tr("保存", "Save"), "variant": "primary"},
         ]
-        if protocol in ("webdav", "git") and not self._protocol_error(c, protocol, require_notebooks=True):
+        if protocol in ("webdav", "git") and self._protocol_enabled(c, protocol) and not self._protocol_error(c, protocol, require_notebooks=True):
             sync_label = self._tr("同步 WebDAV", "Sync WebDAV") if protocol == "webdav" else self._tr("同步 Git", "Sync Git")
             buttons.insert(0, {"id": f"sync_{protocol}", "label": sync_label, "variant": "secondary"})
         field = {"git": "git_token", "webdav": "webdav_pass"}.get(protocol)
@@ -8559,6 +8932,9 @@ class SyncPlugin:
                     "value": protocol,
                     "options": protocol_options,
                 },
+                self._protocol_enable_switch("local_mirror", c),
+                self._protocol_enable_switch("webdav", c),
+                self._protocol_enable_switch("git", c),
                 {
                     "kind": "folder",
                     "id": "mirror_dir",
@@ -8660,7 +9036,7 @@ class SyncPlugin:
                 "visible_when": {"control_id": "protocol", "in": ["webdav", "git"]},
                 "buttons": self._config_buttons(protocol, c),
             })
-            if not self._protocol_error(c, "local_mirror", require_notebooks=True):
+            if self._protocol_enabled(c, "local_mirror") and not self._protocol_error(c, "local_mirror", require_notebooks=True):
                 target_items.append({
                     "kind": "actions",
                     "visible_when": {"control_id": "protocol", "equals": "local_mirror"},
@@ -8838,10 +9214,27 @@ class SyncPlugin:
                 if "protocol" in values and cfg["protocol"] != self.config["protocol"]:
                     next_config["protocol"] = cfg["protocol"]
                     next_status = ""
+                for proto, enabled_key in PROTOCOL_ENABLED_KEYS.items():
+                    if enabled_key in values and cfg[enabled_key] != self.config[enabled_key]:
+                        next_config[enabled_key] = cfg[enabled_key]
+                        if not cfg[enabled_key]:
+                            clear_protocols.add(proto)
+                            next_status = self._tr(
+                                f"已停用{self._protocol_label(proto)}",
+                                f"{self._protocol_label(proto)} disabled",
+                            )
+                        elif not self._protocol_error(next_config, proto, require_notebooks=False):
+                            next_status = self._tr(
+                                f"已启用{self._protocol_label(proto)}",
+                                f"{self._protocol_label(proto)} enabled",
+                            )
+                        else:
+                            next_status = ""
                 if "mirror_dir" in values:
                     if not cfg["mirror_dir"]:
-                        if self.config["mirror_dir"]:
+                        if self.config["mirror_dir"] or self.config["local_mirror_enabled"]:
                             next_config["mirror_dir"] = ""
+                            next_config["local_mirror_enabled"] = False
                             clear_protocols.add("local_mirror")
                             next_status = self._tr("已停用目录镜像", "Local mirror disabled")
                     else:
@@ -8849,6 +9242,8 @@ class SyncPlugin:
                         if not mirror_err:
                             if self.config["mirror_dir"] != cfg["mirror_dir"]:
                                 next_config["mirror_dir"] = cfg["mirror_dir"]
+                                next_config["local_mirror_enabled"] = True
+                                cfg["local_mirror_enabled"] = True
                                 clear_protocols.add("local_mirror")
                                 next_status = self._tr("已启用本地镜像目录", "Local mirror folder enabled")
                         else:
@@ -8858,9 +9253,15 @@ class SyncPlugin:
                     self.last_status = next_status
                 accepted = {
                     key: self.config[key]
-                    for key in ("selected_notebooks", "auto_sync", "sync_interval", "system_notifications", "conflict_policy", "protocol", "mirror_dir")
+                    for key in (
+                        "selected_notebooks", "auto_sync", "sync_interval", "system_notifications",
+                        "conflict_policy", "protocol", "mirror_dir",
+                        "local_mirror_enabled", "webdav_enabled", "git_enabled",
+                    )
                     if key in values and cfg[key] == self.config[key]
                 }
+                if "mirror_dir" in values and self.config["local_mirror_enabled"] != values.get("local_mirror_enabled"):
+                    accepted["local_mirror_enabled"] = self.config["local_mirror_enabled"]
             else:
                 cfg = dict(self.config)
                 cfg["selected_notebooks"] = list(self.config.get("selected_notebooks") or [])
@@ -8878,11 +9279,8 @@ class SyncPlugin:
             if action_id == "save_config":
                 next_cfg = self._normalize_config(values)
                 proto = next_cfg["protocol"]
-                has_other_configured = any(
-                    p != proto and not self._protocol_error(next_cfg, p, require_notebooks=False)
-                    for p in VALID_PROTOCOLS
-                )
-                clearing_configured = has_other_configured and (
+                enabled_key = PROTOCOL_ENABLED_KEYS[proto]
+                clearing_configured = (
                     (proto == "webdav" and not next_cfg["webdav_url"] and bool(self.config.get("webdav_url")))
                     or (proto == "git" and not next_cfg["git_remote"] and bool(self.config.get("git_remote")))
                     or (proto == "local_mirror" and not next_cfg["mirror_dir"] and bool(self.config.get("mirror_dir")))
@@ -8897,6 +9295,10 @@ class SyncPlugin:
                         "page": self.build_page(cfg=next_cfg),
                         "status": status,
                     }
+                if clearing_configured:
+                    next_cfg[enabled_key] = False
+                elif not self._protocol_has_input(self.config, proto) and not self._protocol_enabled(self.config, proto):
+                    next_cfg[enabled_key] = True
                 changed = self._changed_protocols(self.config, next_cfg)
                 self._save_config(bridge, next_cfg, clear_pending=changed or False)
                 if clearing_configured:
@@ -8954,7 +9356,15 @@ class SyncPlugin:
                         changed = self._changed_protocols(self.config, next_cfg)
                         self._save_config(bridge, next_cfg, clear_pending=changed or False)
                 err = self._protocol_error(self.config, proto, require_notebooks=True)
-                if err or not self._selected_notebooks(self.config):
+                if not self._protocol_enabled(self.config, proto):
+                    status = self._tr(
+                        f"请先启用{self._protocol_label(proto)}",
+                        f"Enable {self._protocol_label(proto)} first",
+                    )
+                    self.last_status = status
+                    ok = False
+                    tone = "warning"
+                elif err or not self._selected_notebooks(self.config):
                     status = err or self._tr("请至少选择一个笔记本", "Select at least one notebook")
                     self.last_status = status
                     ok = False
@@ -8976,7 +9386,7 @@ class SyncPlugin:
                 if isinstance(values, dict) and values:
                     next_cfg = self._normalize_config(values)
                     for p in VALID_PROTOCOLS:
-                        if self._protocol_has_input(next_cfg, p):
+                        if self._protocol_enabled(next_cfg, p) and self._protocol_has_input(next_cfg, p):
                             p_err = self._protocol_error(next_cfg, p, require_notebooks=False)
                             if p_err:
                                 self.last_status = p_err
@@ -8988,7 +9398,11 @@ class SyncPlugin:
                                     "status": p_err,
                                 }
                     if not self._configured_protocols(next_cfg):
-                        err = self._target_error(next_cfg)
+                        err = (
+                            self._tr("请先启用至少一个同步目标", "Enable at least one sync destination first")
+                            if not any(self._protocol_enabled(next_cfg, p) for p in VALID_PROTOCOLS)
+                            else self._target_error(next_cfg)
+                        )
                         self.last_status = err
                         return {
                             "ok": False,
@@ -9003,7 +9417,11 @@ class SyncPlugin:
                 active_protocols = self._configured_protocols(self.config)
                 selected_nbs = self._selected_notebooks(self.config)
                 if not active_protocols:
-                    status = self._target_error(self.config)
+                    status = (
+                        self._tr("请先启用至少一个同步目标", "Enable at least one sync destination first")
+                        if not any(self._protocol_enabled(self.config, p) for p in VALID_PROTOCOLS)
+                        else self._target_error(self.config)
+                    )
                     self.last_status = status
                     ok = False
                     tone = "danger"
