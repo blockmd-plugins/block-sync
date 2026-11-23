@@ -8,6 +8,7 @@
 - **Auto on save**: Incremental sync runs automatically on save, plus one-click Sync Now.
 - **Scheduled sync** — With automatic sync enabled, sync runs every 5 minutes, 30 minutes, or 1 hour (default: 5 minutes). Runs with no changes add no log entry. Repeated failures alert only once.
 - **Conflict-safe**: Choose conflict copy, local-first, or remote-first with destructive guardrails. With deletion protection enabled, confirm before uploading a note that was deleted remotely.
+- **Deletions sync**: A note or attachment deleted on one side and unchanged on the other is deleted there on the next sync instead of coming back. Local files go to the system Trash, Git keeps them in history, WebDAV moves them to `.block-sync-trash`, and mirrors move them to the recovery folder. Large batches ask for confirmation first.
 - **Sync alerts** — Get an alert when sync fails, encounters a conflict, or needs approval. Block uses an in-app alert in the foreground and a system notification in the background. If delivery fails, Sync retries on a later system event. You can turn alerts off in sync settings.
 - **Resume sync** — With automatic sync enabled, sync runs after the computer wakes or reconnects, using the existing safety checks.
 - **Git pushes** — Sync pushes commits it can identify as its own. Review and handle any other unpushed commits in Git before retrying sync.

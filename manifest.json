@@ -40,8 +40,8 @@
       "en": "Read notes and attachments for incremental comparison and upload"
     },
     "notes:write": {
-      "zh": "将远端拉取的新增或更新笔记、冲突副本写入本地工作区",
-      "en": "Write remote note updates and conflict copies into the local workspace"
+      "zh": "将远端拉取的新增或更新笔记、冲突副本写入本地工作区，并把远端已删除的未改动文件移入回收站",
+      "en": "Write remote note updates and conflict copies locally, and move files deleted remotely and unchanged locally to the Trash"
     },
     "network": {
       "zh": "连接 WebDAV 服务器或远程 Git 仓库执行双向同步",
