@@ -22,20 +22,14 @@
     ]
   },
   "permissions": [
-    "storage",
     "notes:read",
     "notes:write",
     "network",
     "events:note_saved",
-    "system:notify",
     "system:secrets",
     "events:system"
   ],
   "permission_reasons": {
-    "storage": {
-      "zh": "保存各笔记本的同步配置、同步状态元信息与近期同步日志",
-      "en": "Save per-notebook sync settings, sync state metadata, and recent logs"
-    },
     "notes:read": {
       "zh": "读取待同步笔记与附件内容，用于增量比对与上传",
       "en": "Read notes and attachments for incremental comparison and upload"
@@ -51,10 +45,6 @@
     "events:note_saved": {
       "zh": "在笔记保存后自动触发增量同步",
       "en": "Automatically trigger incremental sync when a note is saved"
-    },
-    "system:notify": {
-      "zh": "同步失败、发生冲突或需要确认时发出通知",
-      "en": "Notify you when sync fails, encounters conflicts, or needs confirmation"
     },
     "system:secrets": {
       "zh": "将 Git 令牌和 WebDAV 密码保存在系统凭据库中",
