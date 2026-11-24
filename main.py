@@ -61,6 +61,8 @@ LOG_STATUS_EN = {
 }
 LAYOUTS_META_KEY = "notebook_layouts"
 INITIALIZED_META_KEY = "initialized_targets"
+TOMBSTONES_META_KEY = "__tombstones__"
+MAX_TOMBSTONES_PER_NB = 4000
 MAX_STORED_CONFIRM_SAMPLES = 30
 MAX_WEBDAV_DIRS = 2000
 CREDENTIAL_FIELDS = ("git_token", "webdav_pass")
@@ -1134,6 +1136,8 @@ class SyncPlugin:
         marker = f"|{protocol}:"
         legacy_keys = {f"{protocol}:{base}" for base in target_bases}
         for key, entry in self.sync_meta.items():
+            if key in (LAYOUTS_META_KEY, INITIALIZED_META_KEY, TOMBSTONES_META_KEY):
+                continue
             if not isinstance(entry, dict):
                 continue
             if key in legacy_keys:
@@ -1219,9 +1223,173 @@ class SyncPlugin:
 
     def _get_base_map(self, *keys):
         for key in keys:
+            if key in (LAYOUTS_META_KEY, INITIALIZED_META_KEY, TOMBSTONES_META_KEY):
+                continue
             if isinstance(self.sync_meta.get(key), dict):
                 return dict(self.sync_meta[key])
         return {}
+
+    def _split_item_key(self, item_key):
+        if isinstance(item_key, str) and item_key.startswith("asset:"):
+            return "asset:", item_key[6:]
+        return "", str(item_key or "")
+
+    def _record_tombstone(self, nb_key, item_key, item_hash, ts=None):
+        """Record a deleted note/asset hash in the per-notebook tombstone ledger."""
+        if not nb_key or not item_key or not item_hash:
+            return False
+        tombstones = self.sync_meta.get(TOMBSTONES_META_KEY)
+        tombstones = dict(tombstones) if isinstance(tombstones, dict) else {}
+        nb_map = tombstones.get(nb_key)
+        nb_map = dict(nb_map) if isinstance(nb_map, dict) else {}
+        now_ts = int(time.time()) if ts is None else int(ts)
+        nb_map[item_key] = {"hash": str(item_hash), "ts": now_ts}
+        if len(nb_map) > MAX_TOMBSTONES_PER_NB:
+            ordered = sorted(
+                nb_map.items(),
+                key=lambda kv: (kv[1].get("ts", 0) if isinstance(kv[1], dict) else 0, kv[0]),
+            )
+            nb_map = dict(ordered[-MAX_TOMBSTONES_PER_NB:])
+        tombstones[nb_key] = nb_map
+        self.sync_meta[TOMBSTONES_META_KEY] = tombstones
+        return True
+
+    def _clear_tombstone(self, nb_key, item_key, base_dir=None):
+        """Remove a live note/asset (and any collapsing folded alias) from tombstones."""
+        if not nb_key or not item_key:
+            return False
+        tombstones = self.sync_meta.get(TOMBSTONES_META_KEY)
+        if not isinstance(tombstones, dict):
+            return False
+        nb_map = tombstones.get(nb_key)
+        if not isinstance(nb_map, dict) or not nb_map:
+            return False
+        nb_map = dict(nb_map)
+        removed = nb_map.pop(item_key, None) is not None
+        if base_dir and os.path.isdir(base_dir):
+            prefix, rel = self._split_item_key(item_key)
+            target_fold = self._fold_identity(rel)
+            for cand_key in list(nb_map.keys()):
+                cand_prefix, cand_rel = self._split_item_key(cand_key)
+                if cand_prefix == prefix and self._fold_identity(cand_rel) == target_fold and self._paths_collapse(base_dir, rel, cand_rel):
+                    nb_map.pop(cand_key, None)
+                    removed = True
+        if not removed:
+            return False
+        tombstones = dict(tombstones)
+        if nb_map:
+            tombstones[nb_key] = nb_map
+        else:
+            tombstones.pop(nb_key, None)
+        self.sync_meta[TOMBSTONES_META_KEY] = tombstones
+        return True
+
+    def _lookup_tombstone_hash(self, nb_key, item_key, base_dir=None):
+        """Look up a tombstone hash by exact key or collapsing folded path."""
+        if not nb_key or not item_key:
+            return None
+        tombstones = self.sync_meta.get(TOMBSTONES_META_KEY)
+        if not isinstance(tombstones, dict):
+            return None
+        nb_map = tombstones.get(nb_key)
+        if not isinstance(nb_map, dict) or not nb_map:
+            return None
+        entry = nb_map.get(item_key)
+        if isinstance(entry, dict) and entry.get("hash"):
+            return entry["hash"]
+        if base_dir and os.path.isdir(base_dir):
+            prefix, rel = self._split_item_key(item_key)
+            target_fold = self._fold_identity(rel)
+            best_ts = -1
+            best_hash = None
+            for cand_key, cand_entry in nb_map.items():
+                if not isinstance(cand_entry, dict) or not cand_entry.get("hash"):
+                    continue
+                cand_prefix, cand_rel = self._split_item_key(cand_key)
+                if cand_prefix != prefix:
+                    continue
+                if self._fold_identity(cand_rel) == target_fold and self._paths_collapse(base_dir, rel, cand_rel):
+                    cand_ts = int(cand_entry.get("ts") or 0)
+                    if cand_ts >= best_ts:
+                        best_ts = cand_ts
+                        best_hash = cand_entry["hash"]
+            return best_hash
+        return None
+
+    def _lookup_other_protocol_hash(self, nb_key, item_key, target_hash, base_dir=None, exclude_meta_key=None):
+        """Check if another protocol's base_map for the same notebook recorded target_hash."""
+        if not nb_key or not item_key or not target_hash:
+            return None
+        prefix, rel = self._split_item_key(item_key)
+        target_fold = self._fold_identity(rel)
+        nb_prefix = f"nb:{nb_key}|"
+        dir_ok = bool(base_dir and os.path.isdir(base_dir))
+        for mk, entry in self.sync_meta.items():
+            if mk in (LAYOUTS_META_KEY, INITIALIZED_META_KEY, TOMBSTONES_META_KEY) or mk == exclude_meta_key:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            if not mk.startswith(nb_prefix):
+                continue
+            if entry.get(item_key) == target_hash:
+                return target_hash
+            if dir_ok:
+                for cand_key, cand_hash in entry.items():
+                    if cand_hash != target_hash:
+                        continue
+                    cand_prefix, cand_rel = self._split_item_key(cand_key)
+                    if cand_prefix == prefix and self._fold_identity(cand_rel) == target_fold and self._paths_collapse(base_dir, rel, cand_rel):
+                        return target_hash
+        return None
+
+    def _record_deleted_event_tombstones(self, nb_key, local_dir, rel_path, folder):
+        """Record tombstones from all base_maps of nb_key for a deleted note or folder."""
+        if not nb_key or (not folder and not rel_path):
+            return False
+        nb_prefix = f"nb:{nb_key}|"
+        default_nb = nb_key == self._notebook_key()
+        dir_ok = bool(local_dir and os.path.isdir(local_dir))
+        recorded = False
+        if folder:
+            folder_prefix = folder + "/"
+            folded_prefix = ""
+            if dir_ok:
+                case = self._dir_is_case_insensitive(local_dir, (folder,))
+                norm = self._dir_is_normalization_insensitive(local_dir)
+                if case or norm:
+                    folded_prefix = fold_sync_path(folder, case=case, normalize=norm) + "/"
+            for mk, entry in list(self.sync_meta.items()):
+                if mk in (LAYOUTS_META_KEY, INITIALIZED_META_KEY, TOMBSTONES_META_KEY) or not isinstance(entry, dict):
+                    continue
+                if not (mk.startswith(nb_prefix) or (not mk.startswith("nb:") and default_nb)):
+                    continue
+                for item_key, item_hash in entry.items():
+                    if not isinstance(item_hash, str) or not item_hash:
+                        continue
+                    _, item_rel = self._split_item_key(item_key)
+                    matched = item_rel.startswith(folder_prefix)
+                    if not matched and folded_prefix:
+                        matched = fold_sync_path(item_rel, case=case, normalize=norm).startswith(folded_prefix)
+                    if matched and self._record_tombstone(nb_key, item_key, item_hash):
+                        recorded = True
+            return recorded
+
+        target_fold = self._fold_identity(rel_path)
+        for mk, entry in list(self.sync_meta.items()):
+            if mk in (LAYOUTS_META_KEY, INITIALIZED_META_KEY, TOMBSTONES_META_KEY) or not isinstance(entry, dict):
+                continue
+            if not (mk.startswith(nb_prefix) or (not mk.startswith("nb:") and default_nb)):
+                continue
+            for item_key, item_hash in entry.items():
+                if not isinstance(item_hash, str) or not item_hash:
+                    continue
+                _, item_rel = self._split_item_key(item_key)
+                matched = item_rel == rel_path or (
+                    dir_ok and self._fold_identity(item_rel) == target_fold and self._paths_collapse(local_dir, rel_path, item_rel)
+                )
+                if matched and self._record_tombstone(nb_key, item_key, item_hash):
+                    recorded = True
+        return recorded
 
     def _load_state(self, bridge):
         self._refresh_known_notebooks(bridge)
@@ -5723,6 +5891,34 @@ class SyncPlugin:
                 tracked.add(rel)
         return tracked
 
+    def _pair_orphan_base_keys(self, side_paths, orphan_base_paths, base_map, prefix, local_dir, target_dir, protocol, aliases_out):
+        """Pair 1-to-1 single-side paths missing from base_map with orphan base_map keys that collapse on disk."""
+        if not side_paths or not orphan_base_paths:
+            return
+        side_folded = {}
+        for p in sorted(side_paths):
+            side_folded.setdefault(self._fold_identity(p), []).append(p)
+        orphan_folded = {}
+        for bp in sorted(orphan_base_paths):
+            orphan_folded.setdefault(self._fold_identity(bp), []).append(bp)
+        for fk, s_list in side_folded.items():
+            b_list = orphan_folded.get(fk)
+            if not b_list or len(s_list) != 1 or len(b_list) != 1:
+                continue
+            sp, bp = s_list[0], b_list[0]
+            s_key = f"{prefix}{sp}"
+            b_key = f"{prefix}{bp}"
+            if s_key in base_map or b_key not in base_map:
+                continue
+            collides = (bool(local_dir) and self._paths_collapse(local_dir, sp, bp)) or (
+                protocol in ("local_mirror", "git") and bool(target_dir) and self._paths_collapse(target_dir, sp, bp)
+            )
+            if collides:
+                base_map[s_key] = base_map[b_key]
+                aliases_out.setdefault(s_key, [])
+                if b_key not in aliases_out[s_key]:
+                    aliases_out[s_key].append(b_key)
+
     def _plan_notebook_assets(
         self,
         protocol,
@@ -5739,6 +5935,8 @@ class SyncPlugin:
         excluded_subdirs=(),
         tracked_remote_paths=None,
         git_tree_paths=None,
+        is_first_sync=False,
+        nb_key=None,
     ):
         empty = {
             "local_assets": {},
@@ -5753,6 +5951,8 @@ class SyncPlugin:
             "assets_synced": [],
             "assets_to_delete_remote": [],
             "assets_to_delete_local": [],
+            "delete_expected_hashes": {},
+            "asset_base_aliases": {},
         }
         if not cfg.get("sync_assets", True) or not nb_root:
             return empty
@@ -5885,6 +6085,16 @@ class SyncPlugin:
                 if f"asset:{lp}" not in base_map and f"asset:{rp}" in base_map:
                     base_map[f"asset:{lp}"] = base_map[f"asset:{rp}"]
 
+        asset_base_aliases = {}
+        orphan_base_assets = [
+            k[6:] for k in base_map
+            if isinstance(k, str) and k.startswith("asset:") and k[6:] not in local_assets and k[6:] not in remote_assets
+        ]
+        only_local_assets = [lp for lp in local_assets if lp not in remote_assets and f"asset:{lp}" not in base_map]
+        only_remote_assets = [rp for rp in remote_assets if rp not in local_assets and f"asset:{rp}" not in base_map]
+        self._pair_orphan_base_keys(only_local_assets, orphan_base_assets, base_map, "asset:", nb_root, target_dir, protocol, asset_base_aliases)
+        self._pair_orphan_base_keys(only_remote_assets, orphan_base_assets, base_map, "asset:", nb_root, target_dir, protocol, asset_base_aliases)
+
         push_new = []
         push_ow = []
         pull_new = []
@@ -5893,10 +6103,12 @@ class SyncPlugin:
         synced = []
         delete_remote = []
         delete_local = []
+        asset_delete_expected_hashes = {}
         reserved_copies = set()
-        # Deletions only propagate on full syncs where both sides were really seen.
-        allow_delete = explicit_paths is None and bool(local_notes) and bool(remote_notes)
+        nb_key = nb_key or self._notebook_key(nb_root)
         remote_dir_ok = protocol == "webdav" or bool(target_dir and os.path.isdir(target_dir))
+        allow_delete_remote = (not is_first_sync) and bool(nb_root and os.path.isdir(nb_root))
+        allow_delete_local = (not is_first_sync) and explicit_paths is None and bool(remote_notes or remote_assets) and remote_dir_ok
 
         for rel in sorted(set(local_assets.keys()) | set(remote_assets.keys())):
             ldata = local_assets.get(rel)
@@ -5906,20 +6118,36 @@ class SyncPlugin:
             if ldata == rdata:
                 synced.append(rel)
                 continue
-            base_del = base_map.get(f"asset:{rel}") if allow_delete else None
             if ldata is None:
                 if self._cloud_placeholder(nb_root, rel):
                     continue
-                if base_del is not None and sha256_bytes(rdata) == base_del:
+                rhash = sha256_bytes(rdata)
+                asset_key = f"asset:{rel}"
+                matched_del_hash = None
+                if allow_delete_remote:
+                    bhash = base_map.get(asset_key)
+                    if bhash is not None:
+                        if rhash == bhash:
+                            matched_del_hash = bhash
+                    else:
+                        thash = self._lookup_tombstone_hash(nb_key, asset_key, nb_root)
+                        if thash is not None and rhash == thash:
+                            matched_del_hash = thash
+                        else:
+                            matched_del_hash = self._lookup_other_protocol_hash(nb_key, asset_key, rhash, nb_root)
+                if matched_del_hash is not None:
                     delete_remote.append(rel)
+                    asset_delete_expected_hashes[asset_key] = matched_del_hash
                 else:
                     pull_new.append(rel)
                 continue
             if rdata is None:
                 if protocol != "webdav" and target_dir and self._cloud_placeholder(target_dir, remote_asset_path_map.get(rel, rel)):
                     continue
-                if base_del is not None and remote_dir_ok and sha256_bytes(ldata) == base_del:
+                base_del = base_map.get(f"asset:{rel}") if allow_delete_local else None
+                if base_del is not None and sha256_bytes(ldata) == base_del:
                     delete_local.append(rel)
+                    asset_delete_expected_hashes[f"asset:{rel}"] = base_del
                 else:
                     push_new.append(rel)
                 continue
@@ -5976,6 +6204,8 @@ class SyncPlugin:
             "assets_synced": synced,
             "assets_to_delete_remote": delete_remote,
             "assets_to_delete_local": delete_local,
+            "delete_expected_hashes": asset_delete_expected_hashes,
+            "asset_base_aliases": asset_base_aliases,
         }
 
     def _paths_case_collide_on_dir(self, base_dir, p1, p2):
@@ -6298,6 +6528,7 @@ class SyncPlugin:
         synced = []
         reserved_conflict_paths = set()
         remote_path_map = {}
+        base_key_aliases = {}
 
         if remote_inspected and not remote_error:
             local_base_dir = nb_root or self.notebook_root
@@ -6340,6 +6571,15 @@ class SyncPlugin:
                             remote_etags[lp] = remote_etags.pop(rp)
                         if lp not in base_map and rp in base_map:
                             base_map[lp] = base_map[rp]
+
+                orphan_base_notes = [
+                    bp for bp in base_map
+                    if is_safe_rel_md(bp) and bp not in local_notes and bp not in remote_notes
+                ]
+                only_local_notes = [lp for lp in local_notes if lp not in remote_notes and lp not in base_map]
+                only_remote_notes = [rp for rp in remote_notes if rp not in local_notes and rp not in base_map]
+                self._pair_orphan_base_keys(only_local_notes, orphan_base_notes, base_map, "", local_base_dir, target_dir, protocol, base_key_aliases)
+                self._pair_orphan_base_keys(only_remote_notes, orphan_base_notes, base_map, "", local_base_dir, target_dir, protocol, base_key_aliases)
 
         if remote_inspected and not remote_error:
             check_local_note = None
@@ -6398,20 +6638,36 @@ class SyncPlugin:
         # matches the base was deleted on purpose: propagate it instead of copying it back.
         to_delete_remote = []
         to_delete_local = []
+        delete_expected_hashes = {}
         deletion_held = set()
-        if remote_inspected and not remote_error and only_path is None and not is_first_sync:
+        if remote_inspected and not remote_error and not is_first_sync:
             local_dir = nb_root or self.notebook_root
+            local_dir_ok = bool(local_dir and os.path.isdir(local_dir))
             remote_dir_ok = protocol == "webdav" or bool(target_dir and os.path.isdir(target_dir))
             for rel_path in list(to_pull_new):
+                rhash = sha256_text(remote_notes[rel_path])
                 base_hash = base_map.get(rel_path)
-                if base_hash is None:
+                matched_deleted_hash = None
+                if base_hash is not None:
+                    if rhash == base_hash:
+                        matched_deleted_hash = base_hash
+                else:
+                    tomb_hash = self._lookup_tombstone_hash(nb_key, rel_path, local_dir)
+                    if tomb_hash is not None and rhash == tomb_hash:
+                        matched_deleted_hash = tomb_hash
+                    else:
+                        matched_deleted_hash = self._lookup_other_protocol_hash(
+                            nb_key, rel_path, rhash, local_dir, exclude_meta_key=meta_key
+                        )
+                if matched_deleted_hash is None:
                     continue
                 if self._cloud_placeholder(local_dir, rel_path):
                     to_pull_new.remove(rel_path)
                     deletion_held.add(rel_path)
-                elif local_notes and sha256_text(remote_notes[rel_path]) == base_hash:
+                elif local_dir_ok and matched_deleted_hash:
                     to_pull_new.remove(rel_path)
                     to_delete_remote.append(rel_path)
+                    delete_expected_hashes[rel_path] = matched_deleted_hash
             for rel_path in list(to_push_new):
                 base_hash = base_map.get(rel_path)
                 if base_hash is None:
@@ -6419,9 +6675,10 @@ class SyncPlugin:
                 if protocol != "webdav" and self._cloud_placeholder(target_dir, remote_path_map.get(rel_path, rel_path)):
                     to_push_new.remove(rel_path)
                     deletion_held.add(rel_path)
-                elif remote_notes and remote_dir_ok and sha256_text(local_notes[rel_path]) == base_hash:
+                elif only_path is None and remote_notes and remote_dir_ok and sha256_text(local_notes[rel_path]) == base_hash:
                     to_push_new.remove(rel_path)
                     to_delete_local.append(rel_path)
+                    delete_expected_hashes[rel_path] = base_hash
 
         asset_plan = {
             "local_assets": {},
@@ -6436,6 +6693,8 @@ class SyncPlugin:
             "assets_synced": [],
             "assets_to_delete_remote": [],
             "assets_to_delete_local": [],
+            "delete_expected_hashes": {},
+            "asset_base_aliases": {},
         }
         if remote_inspected and not remote_error:
             try:
@@ -6454,10 +6713,19 @@ class SyncPlugin:
                     excluded_subdirs=excluded_subdirs,
                     tracked_remote_paths=tracked_remote_paths if protocol == "git" else None,
                     git_tree_paths=git_tree_paths if protocol == "git" else None,
+                    is_first_sync=is_first_sync,
+                    nb_key=nb_key,
                 )
             except Exception as exc:
                 remote_inspected = False
                 remote_error = self._tr(f"附件扫描失败: {self._error_detail(exc)}", f"Attachment scan failed: {self._error_detail(exc)}")
+        if asset_plan.get("delete_expected_hashes"):
+            delete_expected_hashes.update(asset_plan["delete_expected_hashes"])
+        for ak, a_aliases in (asset_plan.get("asset_base_aliases") or {}).items():
+            base_key_aliases.setdefault(ak, [])
+            for a_old in a_aliases:
+                if a_old not in base_key_aliases[ak]:
+                    base_key_aliases[ak].append(a_old)
 
         asset_view_copies = []
         if remote_inspected and not remote_error and policy == "keep_both" and asset_plan.get("asset_conflicts"):
@@ -6489,11 +6757,19 @@ class SyncPlugin:
         local_missing = [
             p for p in base_map
             if is_safe_rel_md(p) and self._matches_scope(p, scope, case_insensitive=missing_scope_ci) and p in remote_notes and p not in local_notes
-        ] if (remote_inspected and only_path is None) else []
+        ] if (remote_inspected and only_path is None) else (
+            [only_path] if (remote_inspected and only_path is not None and only_path in base_map and only_path in remote_notes and only_path not in local_notes) else []
+        )
 
         if deletion_held:
             remote_missing = [p for p in remote_missing if p not in deletion_held]
             local_missing = [p for p in local_missing if p not in deletion_held]
+        if to_delete_remote:
+            seen_local_missing = set(local_missing)
+            for p in to_delete_remote:
+                if p not in deletion_held and p not in seen_local_missing:
+                    local_missing.append(p)
+                    seen_local_missing.add(p)
 
         local_hashes = {p: sha256_text(local_notes[p]) for p in sorted(local_notes)}
         remote_hashes = {p: sha256_text(remote_notes[p]) for p in sorted(remote_notes)}
@@ -6572,6 +6848,8 @@ class SyncPlugin:
             "local_missing": local_missing,
             "to_delete_remote": to_delete_remote,
             "to_delete_local": to_delete_local,
+            "delete_expected_hashes": delete_expected_hashes,
+            "base_key_aliases": base_key_aliases,
             "policy": policy,
             "scope": scope,
             "fingerprint": sha256_text(fp_payload),
@@ -6657,7 +6935,7 @@ class SyncPlugin:
         )
         n_conf = len(plan["conflicts"]) + len(plan.get("asset_view_copies") or ()) + len(plan.get("asset_conflicts") or ())
         n_rm_miss = len(plan["remote_missing"]) + len(plan.get("assets_to_delete_local") or ())
-        n_loc_miss = len(plan["local_missing"]) + len(plan.get("assets_to_delete_remote") or ())
+        n_loc_miss = len(set(plan["local_missing"]) | set(plan.get("to_delete_remote") or ())) + len(plan.get("assets_to_delete_remote") or ())
         return {
             "pull_new": n_pull_new,
             "pull_total": n_pull_total,
@@ -7650,15 +7928,19 @@ class SyncPlugin:
                         planned_git_writes.append(f"{sub_prefix}{cp}")
                     if planned_git_writes:
                         self._check_git_staged_conflicts(plan["repo_root"], planned_git_writes, cfg=cfg, recover=False)
+                nb_key = plan.get("nb_key") or self._notebook_key(nb_root)
+                local_dir = nb_root or self.notebook_root
                 # 1. Planned attachment sync (with conditional verification and conflict-copy mapping).
                 for rel in plan.get("assets_synced") or ():
                     if rel in local_assets:
                         base_map[f"asset:{rel}"] = sha256_bytes(local_assets[rel])
+                    self._clear_tombstone(nb_key, f"asset:{rel}", local_dir)
 
                 for rel in plan.get("assets_to_push_new") or ():
                     data = local_assets[rel]
                     write_remote_asset(rel, data, create_only=True)
                     base_map[f"asset:{rel}"] = sha256_bytes(data)
+                    self._clear_tombstone(nb_key, f"asset:{rel}", local_dir)
                     asset_count += 1
                     step_progress()
 
@@ -7667,13 +7949,19 @@ class SyncPlugin:
                     exp_hash = sha256_bytes(remote_assets[rel]) if rel in remote_assets else None
                     write_remote_asset(rel, data, expected_hash=exp_hash)
                     base_map[f"asset:{rel}"] = sha256_bytes(data)
+                    self._clear_tombstone(nb_key, f"asset:{rel}", local_dir)
                     asset_count += 1
                     step_progress()
 
                 for rel in plan.get("assets_to_pull_new") or ():
                     data = remote_assets[rel]
+                    rhash = sha256_bytes(data)
+                    if not plan.get("is_first_sync") and self._lookup_tombstone_hash(nb_key, f"asset:{rel}", local_dir) == rhash:
+                        step_progress()
+                        continue
                     self._write_mirror_bytes(nb_root, rel, data, create_only=True)
-                    base_map[f"asset:{rel}"] = sha256_bytes(data)
+                    base_map[f"asset:{rel}"] = rhash
+                    self._clear_tombstone(nb_key, f"asset:{rel}", local_dir)
                     asset_count += 1
                     step_progress()
 
@@ -7682,6 +7970,7 @@ class SyncPlugin:
                     exp_hash = sha256_bytes(local_assets[rel]) if rel in local_assets else None
                     self._write_mirror_bytes(nb_root, rel, data, expected_hash=exp_hash)
                     base_map[f"asset:{rel}"] = sha256_bytes(data)
+                    self._clear_tombstone(nb_key, f"asset:{rel}", local_dir)
                     asset_count += 1
                     step_progress()
 
@@ -7697,6 +7986,8 @@ class SyncPlugin:
                     self._write_mirror_bytes(nb_root, copy_rel, rdata, create_only=True)
                     write_remote_asset(copy_rel, rdata, create_only=True)
                     base_map[f"asset:{copy_rel}"] = rhash
+                    self._clear_tombstone(nb_key, f"asset:{rel}", local_dir)
+                    self._clear_tombstone(nb_key, f"asset:{copy_rel}", local_dir)
                     asset_copy_map[rel] = copy_rel
                     deferred_asset_overwrites.append((rel, ldata, rhash))
                     asset_count += 1
@@ -7714,11 +8005,13 @@ class SyncPlugin:
                 # 2. Planned markdown notes sync.
                 for rel_path in plan["synced"]:
                     base_map[rel_path] = sha256_text(local_notes[rel_path])
+                    self._clear_tombstone(nb_key, rel_path, local_dir)
 
                 for rel_path in plan["to_push_new"]:
                     text = local_notes[rel_path]
                     write_remote_note(rel_path, text, create_only=True)
                     base_map[rel_path] = sha256_text(text)
+                    self._clear_tombstone(nb_key, rel_path, local_dir)
                     pushed += 1
                     self._append_log(
                         self._tr(f"推送 {prefix}{rel_path}", f"Push {prefix}{rel_path}"),
@@ -7736,6 +8029,7 @@ class SyncPlugin:
                     is_conflict = exp_hash is not None and base_map.get(rel_path) != exp_hash
                     write_remote_note(rel_path, text, expected_hash=exp_hash)
                     base_map[rel_path] = sha256_text(text)
+                    self._clear_tombstone(nb_key, rel_path, local_dir)
                     pushed += 1
                     if is_conflict:
                         self._append_log(
@@ -7759,11 +8053,15 @@ class SyncPlugin:
 
                 for rel_path in plan["to_pull_new"]:
                     orig_text = remote_notes[rel_path]
+                    if not plan.get("is_first_sync") and self._lookup_tombstone_hash(nb_key, rel_path, local_dir) == sha256_text(orig_text):
+                        step_progress()
+                        continue
                     text = rewrite_note_asset_links(rel_path, orig_text, asset_copy_map)
                     self._write_local_note(bridge, rel_path, text, nb_root=nb_root)
                     if text != orig_text:
                         write_remote_note(rel_path, text, expected_hash=sha256_text(orig_text))
                     base_map[rel_path] = sha256_text(text)
+                    self._clear_tombstone(nb_key, rel_path, local_dir)
                     pulled += 1
                     self._append_log(
                         self._tr(f"拉取 {prefix}{rel_path}", f"Pull {prefix}{rel_path}"),
@@ -7786,6 +8084,7 @@ class SyncPlugin:
                     if text != orig_text:
                         write_remote_note(rel_path, text, expected_hash=sha256_text(orig_text))
                     base_map[rel_path] = sha256_text(text)
+                    self._clear_tombstone(nb_key, rel_path, local_dir)
                     pulled += 1
                     if is_conflict:
                         self._append_log(
@@ -7815,6 +8114,8 @@ class SyncPlugin:
                     write_remote_note(rel_path, local_text, expected_hash=sha256_text(remote_text))
                     base_map[rel_path] = sha256_text(local_text)
                     base_map[conflict_rel] = sha256_text(saved_conflict_text)
+                    self._clear_tombstone(nb_key, rel_path, local_dir)
+                    self._clear_tombstone(nb_key, conflict_rel, local_dir)
                     conflict_count += 1
                     self._append_log(
                         self._tr(f"冲突保留 {prefix}{rel_path}", f"Keep conflict copy: {prefix}{rel_path}"),
@@ -7831,6 +8132,7 @@ class SyncPlugin:
                     self._write_local_note(bridge, conflict_rel, saved_conflict_text, nb_root=nb_root)
                     write_remote_note(conflict_rel, saved_conflict_text, create_only=True)
                     base_map[conflict_rel] = sha256_text(saved_conflict_text)
+                    self._clear_tombstone(nb_key, conflict_rel, local_dir)
                     conflict_count += 1
                     self._append_log(
                         self._tr(f"冲突保留 {prefix}{rel_path}", f"Keep conflict copy: {prefix}{rel_path}"),
@@ -7859,9 +8161,15 @@ class SyncPlugin:
                     + [("local", rel, False) for rel in plan.get("to_delete_local") or ()]
                     + [("local", rel, True) for rel in plan.get("assets_to_delete_local") or ()]
                 )
+                delete_expected_hashes = plan.get("delete_expected_hashes") or {}
+                base_key_aliases = plan.get("base_key_aliases") or {}
                 for side, rel, is_asset in deletions:
                     key = f"asset:{rel}" if is_asset else rel
-                    expect = base_map.get(key)
+                    expect = (
+                        delete_expected_hashes.get(key)
+                        or base_map.get(key)
+                        or self._lookup_tombstone_hash(nb_key, key, local_dir)
+                    )
                     err_text = ""
                     try:
                         if side == "remote":
@@ -7897,6 +8205,10 @@ class SyncPlugin:
                     where = self._protocol_label(protocol) if side == "remote" else self._tr("本地", "local")
                     if outcome in ("deleted", "missing"):
                         base_map.pop(key, None)
+                        for alias_key in base_key_aliases.get(key) or ():
+                            base_map.pop(alias_key, None)
+                        if expect:
+                            self._record_tombstone(nb_key, key, expect)
                     if outcome == "deleted":
                         deleted_count += 1
                         self._append_log(
@@ -7957,6 +8269,11 @@ class SyncPlugin:
         for lp, rp in remote_asset_path_map.items():
             if rp != lp and f"asset:{lp}" in base_map and rp not in local_assets:
                 base_map.pop(f"asset:{rp}", None)
+        for key, aliases in (plan.get("base_key_aliases") or {}).items():
+            if key in base_map:
+                for alias_key in aliases:
+                    if alias_key != key:
+                        base_map.pop(alias_key, None)
 
         synced_repo_paths = []
         if protocol == "git":
@@ -9714,13 +10031,35 @@ class SyncPlugin:
                 return {"handled": True, "outcome": "skipped"}
             if event_name in ("system.wake", "network.changed", SYNC_INTERVAL_EVENT):
                 return self._sync_after_system_event(bridge, event_name, params)
-            if event_name != "note.saved":
+            if event_name not in ("note.saved", "note.deleted"):
                 return {"handled": False}
             rel_path = str(params.get("path") or "").replace("\\", "/")
+            folder = str(params.get("folder") or "").replace("\\", "/").strip("/")
             event_nb = self._norm_nb_path(params.get("notebook_root") or self.notebook_root)
+            local_dir = event_nb or self.notebook_root
+            nb_key = self._notebook_key(local_dir)
             outcome = "skipped"
-            event_scope_ci = self._dir_is_case_insensitive(event_nb or self.notebook_root)
-            if event_name == "note.saved" and self.config["auto_sync"] and is_safe_rel_md(rel_path) and self._matches_scope(rel_path, case_insensitive=event_scope_ci):
+            event_scope_ci = self._dir_is_case_insensitive(local_dir)
+
+            if event_name == "note.deleted":
+                clean_rel = rel_path.strip("/")
+                if self._record_deleted_event_tombstones(nb_key, local_dir, clean_rel, folder):
+                    self._save_runtime(
+                        bridge,
+                        only_path=clean_rel if (clean_rel and not folder) else None,
+                        notebook_root=event_nb or None,
+                    )
+                should_sync = bool(self.config["auto_sync"]) and (
+                    is_safe_rel_path(folder)
+                    if folder
+                    else (is_safe_rel_md(clean_rel) and self._matches_scope(clean_rel, case_insensitive=event_scope_ci))
+                )
+                sync_only_path = None if folder else clean_rel
+            else:
+                should_sync = bool(self.config["auto_sync"]) and is_safe_rel_md(rel_path) and self._matches_scope(rel_path, case_insensitive=event_scope_ci)
+                sync_only_path = rel_path
+
+            if should_sync:
                 self._refresh_known_notebooks(bridge)
                 active_protocols = self._configured_protocols(self.config)
                 selected = self._selected_notebooks(self.config)
@@ -9734,7 +10073,7 @@ class SyncPlugin:
                             outcomes.add("pending_confirm")
                             continue
                         try:
-                            self._run_background_sync(bridge, only_path=rel_path, only_nb_root=event_nb or None, protocol=proto)
+                            self._run_background_sync(bridge, only_path=sync_only_path, only_nb_root=event_nb or None, protocol=proto)
                             outcomes.add(getattr(self, "_last_sync_outcome", "synced"))
                         except SyncStateError as exc:
                             outcomes.add("state_error")
