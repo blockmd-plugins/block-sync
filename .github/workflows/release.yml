@@ -279,6 +279,10 @@ jobs:
                   if method == "host.log":
                       require(isinstance(params.get("entries"), list), "host.log: entries must be a list")
                       return {"ok": True}
+                  if method == "host.ui.toast":
+                      return {"ok": True, "shown": True}
+                  if method == "host.ui.open_settings":
+                      return {"ok": True}
                   raise ValueError(f"Unexpected host request: {method}")
 
               env = {k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT", "COMSPEC") if k in os.environ}

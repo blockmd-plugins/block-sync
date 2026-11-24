@@ -876,6 +876,8 @@ class SyncPlugin:
         self.supports_progress_bar = False
         self.supports_segmented_status = False
         self.supports_system = False
+        self.supports_toast_banner = False
+        self.supports_open_settings = False
         self._stored_global = None
         self._credential_cleanup = set()
         self._legacy_cleanup = False
@@ -2149,10 +2151,13 @@ class SyncPlugin:
     def _send_result_notice(self, bridge):
         notice, self._result_notice = self._result_notice, None
         self._result_notified, self._repeat_failure = self._repeat_failure, False
-        if not notice or not self.supports_system or not self.config["system_notifications"]:
+        if not notice:
             return
         params = self._result_notice_params(*notice)
         if params is None:
+            return
+        self._send_in_app_toast(bridge, params)
+        if not self.supports_system or not self.config["system_notifications"]:
             return
         if self._background_notice_deadline:
             remaining = self._background_notice_deadline - time.monotonic()
@@ -2160,6 +2165,24 @@ class SyncPlugin:
         delivered, queued = self._deliver_result_notice(bridge, params)
         self._result_notified = delivered or queued
         return delivered
+
+    def _send_in_app_toast(self, bridge, params):
+        if not self.supports_toast_banner:
+            return
+        toast_params = {
+            "message": params["title"],
+            "body": params.get("body") or "",
+            "tone": params.get("tone") or "info",
+        }
+        if self.supports_open_settings:
+            toast_params["action"] = {
+                "id": "open_sync_settings",
+                "label": self._tr("查看", "View"),
+            }
+        try:
+            bridge.call_host("host.ui.toast", toast_params)
+        except (AttributeError, RuntimeError, OSError):
+            pass
 
     def _result_notice_params(self, status, conflicts, notice_key=""):
         if status in ("失败", "状态未保存"):
@@ -9235,6 +9258,8 @@ class SyncPlugin:
             self.supports_progress_bar = "progress_bar" in caps
             self.supports_segmented_status = "segmented_status" in caps
             self.supports_system = "system_integration" in caps
+            self.supports_toast_banner = "toast_banner" in caps
+            self.supports_open_settings = "open_settings" in caps
             raw_nbs = params.get("notebooks")
             if isinstance(raw_nbs, list):
                 self.known_notebooks = [str(p) for p in raw_nbs if str(p or "").strip()]
@@ -9322,9 +9347,16 @@ class SyncPlugin:
             return {"page": page, "values": accepted}
 
         if method == "plugin.action":
+            action_id = str(params.get("action_id") or "")
+            if action_id == "open_sync_settings":
+                if self.supports_open_settings:
+                    try:
+                        bridge.call_host("host.ui.open_settings", {})
+                    except (AttributeError, RuntimeError, OSError):
+                        pass
+                return {"ok": True}
             self._refresh_known_notebooks(bridge)
             values = params.get("values") or {}
-            action_id = str(params.get("action_id") or "")
             ok = True
             tone = "info"
             if action_id == "save_config":
