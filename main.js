@@ -1665,7 +1665,13 @@ function createSyncController() {
       }
     } catch (exc) {
       const pLabel = protocolLabel(getLocale(), proto);
-      const det = errorDetail(getLocale(), exc);
+      let det = errorDetail(getLocale(), exc);
+      if (proto === 'local_mirror' && /outside authorized filesystem scope/i.test(det)) {
+        det = t(
+          '目标文件夹未授权，请在同步设置里重新选择一次目标文件夹',
+          'Destination folder is not authorized; re-select it in Sync settings'
+        );
+      }
       const msg =
         det.startsWith(pLabel) || det.includes('Git')
           ? det
@@ -1758,13 +1764,13 @@ function createSyncController() {
         logKey: 'sync_skipped',
         logArgs: { protocol: proto, count: skippedItems.length, items: skippedItems.slice(0, 8) },
       });
+      notifyOversizedSkips(skippedItems);
     }
 
     if (totalNotes === 0 && assets === 0 && deleted === 0) {
       if (res.did_push) {
         const pLabel = protocolLabel(getLocale(), proto);
         appendLog(t(`推送 ${pLabel} 提交`, `Push commits to ${pLabel}`), '成功', {
-      notifyOversizedSkips(skippedItems);
           tone: 'success',
           tooltip: summary,
         });
