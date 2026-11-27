@@ -268,6 +268,33 @@ export function configMatchesSaved(a, b) {
   return true;
 }
 
+export function connConfigSignature(cfg, protocol, downloadsDir = '', homeDir = '') {
+  const c = cfg || {};
+  const refs = c.credential_refs && typeof c.credential_refs === 'object' ? c.credential_refs : {};
+  if (protocol === 'local_mirror') {
+    return JSON.stringify(['local_mirror', resolveMirrorDir(c, downloadsDir, homeDir)]);
+  }
+  if (protocol === 'webdav') {
+    return JSON.stringify([
+      'webdav',
+      String(c.webdav_url || '').trim(),
+      resolveWebdavDir(c),
+      String(c.webdav_user || '').trim(),
+      Boolean(c.webdav_pass || refs.webdav_pass),
+    ]);
+  }
+  if (protocol === 'git') {
+    return JSON.stringify([
+      'git',
+      String(c.git_remote || '').trim(),
+      String(c.git_branch || 'main').trim() || 'main',
+      String(c.git_auth || 'ssh'),
+      Boolean(c.git_token || refs.git_token),
+    ]);
+  }
+  return JSON.stringify([protocol || '']);
+}
+
 export function changedProtocols(oldCfg, newCfg) {
   const oldC = oldCfg || {};
   const newC = newCfg || {};
@@ -855,6 +882,7 @@ export function createConfigStore({
     savedPendingConfirms: {},
     pendingConfirm: null,
     pendingNotices: {},
+    connStates: {},
     credentialCleanup: new Set(),
   };
 
@@ -1118,6 +1146,11 @@ export function createConfigStore({
     state.savedPendingConfirms = { ...state.pendingConfirms };
     state.savedConfig = { ...state.config };
 
+    const connRes = storageGet(rpc, 'conn_states');
+    state.connStates = connRes.found && connRes.value && typeof connRes.value === 'object' && !Array.isArray(connRes.value)
+      ? { ...connRes.value }
+      : {};
+
     if (state.supportsSystem) {
       const noticesRes = storageGet(rpc, 'pending_notices');
       state.pendingNotices = noticesRes.found && noticesRes.value && typeof noticesRes.value === 'object' && !Array.isArray(noticesRes.value)
@@ -1349,6 +1382,34 @@ export function createConfigStore({
     return state.credentialCleanup.size > 0 ? 'migration_retry' : 'skipped';
   };
 
+  const getConnState = (protocol) => {
+    if (!protocol) return null;
+    const key = `${resultKey()}:${protocol}`;
+    const entry = state.connStates[key];
+    return entry && typeof entry === 'object' ? entry : null;
+  };
+
+  const setConnState = (protocol, entry) => {
+    if (!protocol) return;
+    const key = `${resultKey()}:${protocol}`;
+    if (entry && typeof entry === 'object') {
+      state.connStates[key] = { ...entry };
+    } else {
+      delete state.connStates[key];
+    }
+  };
+
+  const clearConnState = (protocol = null) => {
+    const scope = resultKey();
+    if (protocol) {
+      delete state.connStates[`${scope}:${protocol}`];
+    } else {
+      for (const proto of VALID_PROTOCOLS) {
+        delete state.connStates[`${scope}:${proto}`];
+      }
+    }
+  };
+
   const saveRuntime = () => {
     const rpc = getRpc();
     const values = {
@@ -1358,6 +1419,7 @@ export function createConfigStore({
       notebook_results: state.notebookResults,
       pending_confirms: state.pendingConfirms,
       pending_confirm: null,
+      conn_states: state.connStates,
     };
     if (state.supportsSystem) {
       storageSetMany(rpc, values);
@@ -1463,6 +1525,9 @@ export function createConfigStore({
     getPendingConfirm,
     setPendingConfirm,
     clearPendingConfirm,
+    getConnState,
+    setConnState,
+    clearConnState,
     loadState,
     saveConfig,
     saveRuntime,
