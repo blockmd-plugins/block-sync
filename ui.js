@@ -10,6 +10,7 @@ import {
   hasChineseText,
   isEnglishLocale,
   protocolLabel,
+  localizeError,
   formatReasonItem,
   formatSampleItem,
   logForPage,
@@ -35,6 +36,7 @@ import {
   protocolHasInput,
   protocolEnabled,
   configMatchesSaved,
+  connConfigSignature,
   credentialPlaceholder,
   notebookLabel,
 } from './config.js';
@@ -619,20 +621,27 @@ export function buildConfirmationCard(pending, locale) {
   };
 }
 
-function protocolEnableSwitch(protocol, config, locale) {
+function withAutosave(item, enabled, actionId = 'save_config') {
+  return enabled ? { ...item, autosave: actionId } : item;
+}
+
+function protocolEnableSwitch(protocol, config, locale, supportsFormAutosave = false) {
   const key = PROTOCOL_ENABLED_KEYS[protocol];
   const label = {
     local_mirror: tr(locale, '启用目录镜像', 'Enable Local Mirror'),
     webdav: tr(locale, '启用 WebDAV', 'Enable WebDAV'),
     git: tr(locale, '启用 Git 仓库', 'Enable Git Repository'),
   }[protocol];
-  return {
-    kind: 'switch',
-    id: key,
-    label,
-    value: Boolean(config[key]),
-    visible_when: { control_id: 'protocol', equals: protocol },
-  };
+  return withAutosave(
+    {
+      kind: 'switch',
+      id: key,
+      label,
+      value: Boolean(config[key]),
+      visible_when: { control_id: 'protocol', equals: protocol },
+    },
+    supportsFormAutosave
+  );
 }
 
 // Drop a protocol's config fields, progress and actions while its enable switch is off.
@@ -688,23 +697,29 @@ function syncIntervalItem(cfg, locale) {
   };
 }
 
-function fileSyncOptions(cfg, locale) {
+function fileSyncOptions(cfg, locale, supportsFormAutosave = false) {
   return [
-    {
-      kind: 'input',
-      id: 'max_file_size_mb',
-      label: tr(locale, '单文件大小上限 (MB)', 'Per-file size limit (MB)'),
-      value: String(cfg.max_file_size_mb ?? '50'),
-      placeholder: '50 (1–64)',
-    },
-    {
-      kind: 'input',
-      id: 'ignore_patterns',
-      label: tr(locale, '忽略规则', 'Ignore rules'),
-      layout: 'stacked',
-      value: String(cfg.ignore_patterns ?? '').replace(/\n/g, '\\n'),
-      placeholder: tr(locale, '用 \\n 分隔，例如 *.mp4\\nassets/videos/*', 'Separate with \\n, e.g. *.mp4\\nassets/videos/*'),
-    },
+    withAutosave(
+      {
+        kind: 'input',
+        id: 'max_file_size_mb',
+        label: tr(locale, '单文件大小上限 (MB)', 'Per-file size limit (MB)'),
+        value: String(cfg.max_file_size_mb ?? '50'),
+        placeholder: '50 (1–64)',
+      },
+      supportsFormAutosave
+    ),
+    withAutosave(
+      {
+        kind: 'input',
+        id: 'ignore_patterns',
+        label: tr(locale, '忽略规则', 'Ignore rules'),
+        layout: 'stacked',
+        value: String(cfg.ignore_patterns ?? '').replace(/\n/g, '\\n'),
+        placeholder: tr(locale, '用 \\n 分隔，例如 *.mp4\\nassets/videos/*', 'Separate with \\n, e.g. *.mp4\\nassets/videos/*'),
+      },
+      supportsFormAutosave
+    ),
   ];
 }
 
@@ -726,9 +741,57 @@ function credPlaceholder(c, field, defaultText, supportsSystem, locale) {
   return credentialPlaceholder(c, field, defaultText, { supportsSystem, locale });
 }
 
-function configButtons(ctx, protocol, c) {
-  const { configStore, locale, supportsSystem } = ctx;
+function hasSavedCredential(ctx, protocol, c) {
+  const { configStore, supportsSystem } = ctx;
   const savedCfg = configStore ? configStore.state.config : c;
+  const field = protocol === 'git' ? 'git_token' : protocol === 'webdav' ? 'webdav_pass' : null;
+  return Boolean(
+    supportsSystem &&
+      field &&
+      (savedCfg[field] || (savedCfg.credential_refs && savedCfg.credential_refs[field]))
+  );
+}
+
+function forgetCredentialRow(ctx, protocol, c, visibleWhen) {
+  const { locale, supportsButtonLink } = ctx;
+  if (!hasSavedCredential(ctx, protocol, c)) return null;
+  return {
+    kind: 'actions',
+    visible_when: visibleWhen,
+    buttons: [
+      {
+        id: 'forget_credential',
+        label: tr(locale, '清除凭据', 'Forget Credential'),
+        variant: supportsButtonLink ? 'link' : 'secondary',
+      },
+    ],
+  };
+}
+
+function getValidConnState(ctx, protocol, cfg) {
+  const { configStore, downloadsDir, homeDir } = ctx;
+  if (!configStore || typeof configStore.getConnState !== 'function') return null;
+  const cs = configStore.getConnState(protocol);
+  if (!cs || typeof cs !== 'object') return null;
+  const sig = connConfigSignature(cfg, protocol, downloadsDir, homeDir);
+  return cs.target_sig === sig ? cs : null;
+}
+
+function localizeConnMessage(locale, connState) {
+  if (!connState || !connState.message) return '';
+  const msg = String(connState.message);
+  if (isEnglishLocale(locale) && connState.locale !== 'en' && hasChineseText(msg)) {
+    const fallback = localizeError(locale, msg);
+    if (fallback && !hasChineseText(fallback)) return fallback;
+    return connState.ok
+      ? tr(locale, '远端已连通', 'Connected')
+      : tr(locale, '连接检测失败，请重试', 'Connection check failed');
+  }
+  return msg;
+}
+
+function configButtons(ctx, protocol, c) {
+  const { locale } = ctx;
   const buttons = [
     {
       id: 'test_conn',
@@ -758,12 +821,7 @@ function configButtons(ctx, protocol, c) {
       ...syncButtonFeedback(locale),
     });
   }
-  const field = protocol === 'git' ? 'git_token' : protocol === 'webdav' ? 'webdav_pass' : null;
-  if (
-    supportsSystem &&
-    field &&
-    (savedCfg[field] || (savedCfg.credential_refs && savedCfg.credential_refs[field]))
-  ) {
+  if (hasSavedCredential(ctx, protocol, c)) {
     buttons.unshift({
       id: 'forget_credential',
       label: tr(locale, '清除凭据', 'Forget Credential'),
@@ -794,6 +852,10 @@ function protocolSegmentStatus(ctx, protocol, cfg) {
     : null;
   if (pc) {
     return ['warning', tr(locale, '已启用 · 待确认变更', 'Enabled · Confirmation required')];
+  }
+  const connState = getValidConnState(ctx, protocol, cfg);
+  if (connState && connState.ok === false) {
+    return ['danger', tr(locale, '已启用 · 无法连接远端', 'Enabled · Cannot reach remote')];
   }
   const res = getProtocolResult(configStore, protocol);
   const st = String(res.status || '').trim();
@@ -928,8 +990,208 @@ function buildProgressItem(ctx, protocol, cfg) {
   return item;
 }
 
+function buildStatusRowItem(ctx, protocol, cfg) {
+  const { configStore, locale, supportsProgressBar = false } = ctx;
+  const savedCfg = configStore ? configStore.state.config : cfg;
+  const protoErr = protocolError(cfg, protocol, { ...ctx, requireNotebooks: false });
+  const targetTip = targetDisplay(cfgForProtocol(cfg, protocol), ctx);
+
+  let headline = tr(locale, '未启用', 'Not enabled');
+  let detail = tr(locale, '配置完成后自动启用此同步目标', 'Configure above to enable this sync target');
+  let progress = 0.0;
+  let tone = '';
+  let tooltip = detail;
+
+  if (!protocolEnabled(cfg, protocol)) {
+    if (protocolHasInput(cfg, protocol, ctx.downloadsDir, ctx.homeDir)) {
+      headline = tr(locale, '已停用', 'Disabled');
+      detail = tr(locale, '打开上方开关以恢复同步', 'Turn on switch above to resume');
+      tooltip = detail;
+    } else {
+      headline = tr(locale, '未启用', 'Not enabled');
+      detail = tr(locale, '完成配置以启用此同步目标', 'Complete setup to enable');
+      tooltip = detail;
+    }
+  } else if (protoErr) {
+    if (protocolHasInput(cfg, protocol, ctx.downloadsDir, ctx.homeDir)) {
+      headline = tr(locale, '配置待修正', 'Needs attention');
+      detail = protoErr;
+      tone = 'warning';
+      tooltip = protoErr;
+    }
+  } else {
+    const pc = configStore && configMatchesSaved(cfg, savedCfg)
+      ? configStore.getPendingConfirm(protocol)
+      : null;
+    const res = getProtocolResult(configStore, protocol);
+    const st = String(res.status || '').trim();
+    const okRec =
+      st === '成功' || st === '无变更'
+        ? res
+        : res.last_success && typeof res.last_success === 'object'
+          ? res.last_success
+          : null;
+    const connState = getValidConnState(ctx, protocol, cfg);
+    const connFailed = Boolean(connState && connState.ok === false);
+    const connOk = Boolean(connState && connState.ok === true);
+    const connDetail =
+      protocol === 'git'
+        ? tr(
+            locale,
+            `远端已连通 · ${gitBranch(cfgForProtocol(cfg, protocol))}`,
+            `Connected · ${gitBranch(cfgForProtocol(cfg, protocol))}`
+          )
+        : protocol === 'webdav'
+          ? tr(locale, '远端已连通', 'Remote connected')
+          : tr(locale, '目录已连通', 'Folder ready');
+
+    if (pc) {
+      headline = tr(locale, '待确认同步变更', 'Confirmation required');
+      progress = 0.5;
+      tone = 'warning';
+      const reasonItems = pc.reason_items || [];
+      detail = reasonItems.length > 0
+        ? formatReasonItem(locale, reasonItems[0])
+        : tr(locale, '检测到危险变更，请先确认', 'Risky changes require confirmation');
+      tooltip = detail;
+    } else if (connFailed) {
+      headline =
+        protocol === 'local_mirror'
+          ? tr(locale, '同步目录不可用', 'Sync folder unavailable')
+          : tr(locale, '无法连接远端', 'Cannot reach remote');
+      detail =
+        localizeConnMessage(locale, connState) ||
+        tr(locale, '请检查配置后重新检测', 'Check settings and retry');
+      progress = 1.0;
+      tone = 'danger';
+      tooltip = detail;
+    } else if (st === '失败' || st === '未连通') {
+      const hm = formatHm(res.time || '');
+      const offline = st === '失败' && res.fail_class === 'network';
+      headline = offline
+        ? tr(locale, '等待网络，稍后自动重试', 'Offline, will retry')
+        : hm
+          ? tr(locale, `${hm} 同步失败`, `${hm} Sync failed`)
+          : tr(locale, '同步失败', 'Sync failed');
+      detail = localizeResultSummary(
+        locale,
+        res,
+        '请检查配置或网络连接',
+        'Check settings or connection'
+      );
+      progress = 1.0;
+      tone = offline ? 'warning' : 'danger';
+      tooltip = detail;
+    } else if (st === '已取消') {
+      const hm = formatHm(res.time || '');
+      headline = hm
+        ? tr(locale, `${hm} 已取消`, `${hm} Canceled`)
+        : tr(locale, '已取消同步', 'Sync canceled');
+      detail = connOk
+        ? connDetail
+        : tr(locale, '上次危险变更同步已取消', 'Last risky sync was canceled');
+      progress = 0.0;
+      tone = 'warning';
+      tooltip = detail;
+    } else if (okRec && okRec.time) {
+      const hm = formatHm(okRec.time || '');
+      const metric = formatShortSyncMetric(locale, okRec);
+      headline = hm
+        ? tr(locale, `${hm} 已同步`, `${hm} Synced`)
+        : tr(locale, '已同步', 'Synced');
+      detail = connOk
+        ? protocol === 'git'
+          ? connDetail
+          : `${connDetail} · ${metric}`
+        : metric;
+      progress = 1.0;
+      tone = 'success';
+      tooltip = formatSkippedDetails(okRec.skipped_items) || localizeConnMessage(locale, connState) || targetTip;
+    } else if (connOk) {
+      headline = tr(locale, '已连通 · 等待同步', 'Connected · Ready to sync');
+      detail = connDetail;
+      progress = 0.0;
+      tone = 'success';
+      tooltip = localizeConnMessage(locale, connState) || targetTip;
+    } else {
+      headline = tr(locale, '已启用 · 等待同步', 'Enabled · Ready to sync');
+      detail = targetTip;
+      progress = 0.0;
+      tone = 'accent';
+      tooltip = targetTip;
+    }
+  }
+
+  if (!supportsProgressBar) {
+    const row = { label: headline, value: detail || headline };
+    if (tooltip) row.tooltip = tooltip;
+    return {
+      kind: 'kv',
+      rows: [row],
+      visible_when: { control_id: 'protocol', equals: protocol },
+    };
+  }
+
+  const item = {
+    kind: 'progress',
+    id: `progress_${protocol}`,
+    channel: protocol,
+    label: headline,
+    status: detail,
+    progress,
+    visible_when: { control_id: 'protocol', equals: protocol },
+  };
+  if (tone) item.tone = tone;
+  if (tooltip) item.tooltip = tooltip;
+  return item;
+}
+
+function buildStatusActionRow(ctx, protocol, c) {
+  const { configStore, locale } = ctx;
+  if (!protocolEnabled(c, protocol)) return null;
+  const connState = getValidConnState(ctx, protocol, c);
+  const connFailed = Boolean(connState && connState.ok === false);
+
+  if (connFailed && !protocolError(c, protocol, { ...ctx, requireNotebooks: false })) {
+    return {
+      kind: 'actions',
+      visible_when: { control_id: 'protocol', equals: protocol },
+      buttons: [
+        {
+          id: 'test_conn',
+          label: tr(locale, '重新检测', 'Retry Check'),
+          variant: 'secondary',
+          ...testButtonFeedback(locale),
+          retry_label: tr(locale, '重新检测', 'Retry Check'),
+        },
+      ],
+    };
+  }
+
+  if (protocolError(c, protocol, { ...ctx, requireNotebooks: true })) {
+    return null;
+  }
+
+  const res = getProtocolResult(configStore, protocol);
+  const st = String(res.status || '').trim();
+  const isSyncFailed = st === '失败' || st === '未连通';
+  return {
+    kind: 'actions',
+    visible_when: { control_id: 'protocol', equals: protocol },
+    buttons: [
+      {
+        id: `sync_${protocol}`,
+        label: isSyncFailed ? tr(locale, '重试', 'Retry') : tr(locale, '立即同步', 'Sync Now'),
+        variant: 'secondary',
+        ...syncButtonFeedback(locale),
+        retry_label: tr(locale, '重试', 'Retry'),
+      },
+    ],
+  };
+}
+
 function buildLegacyCards(ctx, c) {
-  const { locale, supportsSystem, downloadsDir, homeDir } = ctx;
+  const { locale, supportsSystem, supportsFormAutosave = false, downloadsDir, homeDir } = ctx;
   const protocol = c.protocol;
   const targetItems = [
     {
@@ -943,16 +1205,19 @@ function buildLegacyCards(ctx, c) {
         { value: 'git', label: tr(locale, 'Git 仓库', 'Git repository') },
       ],
     },
-    protocolEnableSwitch('local_mirror', c, locale),
-    protocolEnableSwitch('webdav', c, locale),
-    protocolEnableSwitch('git', c, locale),
-    {
-      kind: 'folder',
-      id: 'mirror_dir',
-      label: tr(locale, '同步文件夹', 'Sync Folder'),
-      value: resolveMirrorDir(c, downloadsDir, homeDir),
-      visible_when: { control_id: 'protocol', equals: 'local_mirror' },
-    },
+    protocolEnableSwitch('local_mirror', c, locale, supportsFormAutosave),
+    protocolEnableSwitch('webdav', c, locale, supportsFormAutosave),
+    protocolEnableSwitch('git', c, locale, supportsFormAutosave),
+    withAutosave(
+      {
+        kind: 'folder',
+        id: 'mirror_dir',
+        label: tr(locale, '同步文件夹', 'Sync Folder'),
+        value: resolveMirrorDir(c, downloadsDir, homeDir),
+        visible_when: { control_id: 'protocol', equals: 'local_mirror' },
+      },
+      supportsFormAutosave
+    ),
   ];
 
   const webdavFields = [
@@ -962,70 +1227,104 @@ function buildLegacyCards(ctx, c) {
     ['secret', 'webdav_pass', tr(locale, '密码', 'Password'), ''],
   ];
   for (const [kind, key, label, placeholder] of webdavFields) {
-    targetItems.push({
-      kind,
-      id: key,
-      label,
-      value: kind === 'secret' ? credFieldValue(c, key, supportsSystem) : String(c[key] || ''),
-      placeholder: kind === 'secret'
-        ? credPlaceholder(c, key, placeholder, supportsSystem, locale)
-        : placeholder,
-      visible_when: { control_id: 'protocol', equals: 'webdav' },
-    });
+    targetItems.push(
+      withAutosave(
+        {
+          kind,
+          id: key,
+          label,
+          value: kind === 'secret' ? credFieldValue(c, key, supportsSystem) : String(c[key] || ''),
+          placeholder: kind === 'secret'
+            ? credPlaceholder(c, key, placeholder, supportsSystem, locale)
+            : placeholder,
+          visible_when: { control_id: 'protocol', equals: 'webdav' },
+        },
+        supportsFormAutosave
+      )
+    );
+  }
+  if (supportsFormAutosave && protocol === 'webdav') {
+    const forgetRow = forgetCredentialRow(ctx, 'webdav', c, { control_id: 'protocol', equals: 'webdav' });
+    if (forgetRow) targetItems.push(forgetRow);
   }
 
   targetItems.push(
-    {
-      kind: 'input',
-      id: 'git_remote',
-      label: tr(locale, '仓库地址', 'Repository Address'),
-      value: String(c.git_remote || ''),
-      placeholder: 'git@github.com:user/notes.git',
-      visible_when: { control_id: 'protocol', equals: 'git' },
-    },
-    {
-      kind: 'input',
-      id: 'git_branch',
-      label: tr(locale, '分支', 'Branch'),
-      value: String(c.git_branch || ''),
-      placeholder: 'main',
-      visible_when: { control_id: 'protocol', equals: 'git' },
-    },
-    {
-      kind: 'segmented',
-      id: 'git_auth',
-      label: tr(locale, '认证方式', 'Authentication'),
-      value: c.git_auth,
-      options: [
-        { value: 'ssh', label: 'SSH' },
-        { value: 'token', label: tr(locale, 'HTTPS 令牌', 'HTTPS Token') },
-      ],
-      visible_when: { control_id: 'protocol', equals: 'git' },
-    }
+    withAutosave(
+      {
+        kind: 'input',
+        id: 'git_remote',
+        label: tr(locale, '仓库地址', 'Repository Address'),
+        value: String(c.git_remote || ''),
+        placeholder: 'git@github.com:user/notes.git',
+        visible_when: { control_id: 'protocol', equals: 'git' },
+      },
+      supportsFormAutosave
+    ),
+    withAutosave(
+      {
+        kind: 'input',
+        id: 'git_branch',
+        label: tr(locale, '分支', 'Branch'),
+        value: String(c.git_branch || ''),
+        placeholder: 'main',
+        visible_when: { control_id: 'protocol', equals: 'git' },
+      },
+      supportsFormAutosave
+    ),
+    withAutosave(
+      {
+        kind: 'segmented',
+        id: 'git_auth',
+        label: tr(locale, '认证方式', 'Authentication'),
+        value: c.git_auth,
+        options: [
+          { value: 'ssh', label: 'SSH' },
+          { value: 'token', label: tr(locale, 'HTTPS 令牌', 'HTTPS Token') },
+        ],
+        visible_when: { control_id: 'protocol', equals: 'git' },
+      },
+      supportsFormAutosave
+    )
   );
 
   if (protocol === 'git') {
-    targetItems.push({
-      kind: 'secret',
-      id: 'git_token',
-      label: tr(locale, '访问令牌', 'Access Token'),
-      value: credFieldValue(c, 'git_token', supportsSystem),
-      placeholder: credPlaceholder(c, 'git_token', 'ghp_...', supportsSystem, locale),
-      visible_when: { control_id: 'git_auth', equals: 'token' },
-    });
+    targetItems.push(
+      withAutosave(
+        {
+          kind: 'secret',
+          id: 'git_token',
+          label: tr(locale, '访问令牌', 'Access Token'),
+          value: credFieldValue(c, 'git_token', supportsSystem),
+          placeholder: credPlaceholder(c, 'git_token', 'ghp_...', supportsSystem, locale),
+          visible_when: { control_id: 'git_auth', equals: 'token' },
+        },
+        supportsFormAutosave
+      )
+    );
+    if (supportsFormAutosave) {
+      const forgetRow = forgetCredentialRow(ctx, 'git', c, { control_id: 'protocol', equals: 'git' });
+      if (forgetRow) targetItems.push(forgetRow);
+    }
   }
 
   targetItems.push(
     conflictPolicyItem(c, locale),
     autoSyncSwitch(c, locale),
     syncIntervalItem(c, locale),
-    ...fileSyncOptions(c, locale),
-    {
+    ...fileSyncOptions(c, locale, supportsFormAutosave)
+  );
+
+  if (supportsFormAutosave) {
+    targetItems.push(buildStatusRowItem(ctx, protocol, c));
+    const actRow = buildStatusActionRow(ctx, protocol, c);
+    if (actRow) targetItems.push(actRow);
+  } else {
+    targetItems.push({
       kind: 'actions',
       visible_when: { control_id: 'protocol', in: ['webdav', 'git'] },
       buttons: configButtons(ctx, protocol, c),
-    }
-  );
+    });
+  }
 
   if (supportsSystem) {
     targetItems.push(notificationSwitch(c, locale));
@@ -1051,6 +1350,7 @@ export function buildSettingsPage(ctx, cfg = null) {
     supportsLogTimeline = false,
     supportsProgressBar = false,
     supportsSegmentedStatus = false,
+    supportsFormAutosave = false,
     supportsSystem = true,
     lastStatus = '',
   } = ctx;
@@ -1127,137 +1427,180 @@ export function buildSettingsPage(ctx, cfg = null) {
         value: protocol,
         options: protocolOptions,
       },
-      protocolEnableSwitch('local_mirror', c, locale),
-      protocolEnableSwitch('webdav', c, locale),
-      protocolEnableSwitch('git', c, locale),
-      {
-        kind: 'folder',
-        id: 'mirror_dir',
-        label: tr(locale, '目标文件夹', 'Destination Folder'),
-        layout: 'stacked',
-        value: resolveMirrorDir(c, downloadsDir, homeDir),
-        visible_when: { control_id: 'protocol', equals: 'local_mirror' },
-      },
-      {
-        kind: 'input',
-        id: 'webdav_url',
-        label: tr(locale, '服务器地址', 'Server Address'),
-        layout: 'stacked',
-        value: String(c.webdav_url || ''),
-        placeholder: 'https://dav.example.com',
-        visible_when: { control_id: 'protocol', equals: 'webdav' },
-      },
-      {
-        kind: 'input',
-        id: 'webdav_dir',
-        label: tr(locale, '远端目录', 'Remote Folder'),
-        layout: 'stacked',
-        value: String(c.webdav_dir || ''),
-        placeholder: '/BlockNotes',
-        visible_when: { control_id: 'protocol', equals: 'webdav' },
-      },
+      protocolEnableSwitch('local_mirror', c, locale, supportsFormAutosave),
+      protocolEnableSwitch('webdav', c, locale, supportsFormAutosave),
+      protocolEnableSwitch('git', c, locale, supportsFormAutosave),
+      withAutosave(
+        {
+          kind: 'folder',
+          id: 'mirror_dir',
+          label: tr(locale, '目标文件夹', 'Destination Folder'),
+          layout: 'stacked',
+          value: resolveMirrorDir(c, downloadsDir, homeDir),
+          visible_when: { control_id: 'protocol', equals: 'local_mirror' },
+        },
+        supportsFormAutosave
+      ),
+      withAutosave(
+        {
+          kind: 'input',
+          id: 'webdav_url',
+          label: tr(locale, '服务器地址', 'Server Address'),
+          layout: 'stacked',
+          value: String(c.webdav_url || ''),
+          placeholder: 'https://dav.example.com',
+          visible_when: { control_id: 'protocol', equals: 'webdav' },
+        },
+        supportsFormAutosave
+      ),
+      withAutosave(
+        {
+          kind: 'input',
+          id: 'webdav_dir',
+          label: tr(locale, '远端目录', 'Remote Folder'),
+          layout: 'stacked',
+          value: String(c.webdav_dir || ''),
+          placeholder: '/BlockNotes',
+          visible_when: { control_id: 'protocol', equals: 'webdav' },
+        },
+        supportsFormAutosave
+      ),
       {
         kind: 'group',
         visible_when: { control_id: 'protocol', equals: 'webdav' },
         fields: [
-          {
-            kind: 'input',
-            id: 'webdav_user',
-            label: tr(locale, '用户名', 'Username'),
-            layout: 'stacked',
-            value: String(c.webdav_user || ''),
-            placeholder: tr(locale, '账号', 'Account'),
-          },
-          {
-            kind: 'secret',
-            id: 'webdav_pass',
-            label: tr(locale, '密码', 'Password'),
-            layout: 'stacked',
-            value: credFieldValue(c, 'webdav_pass', supportsSystem),
-            placeholder: credPlaceholder(
-              c,
-              'webdav_pass',
-              tr(locale, '应用密码或口令', 'App password or passphrase'),
-              supportsSystem,
-              locale
-            ),
-          },
+          withAutosave(
+            {
+              kind: 'input',
+              id: 'webdav_user',
+              label: tr(locale, '用户名', 'Username'),
+              layout: 'stacked',
+              value: String(c.webdav_user || ''),
+              placeholder: tr(locale, '账号', 'Account'),
+            },
+            supportsFormAutosave
+          ),
+          withAutosave(
+            {
+              kind: 'secret',
+              id: 'webdav_pass',
+              label: tr(locale, '密码', 'Password'),
+              layout: 'stacked',
+              value: credFieldValue(c, 'webdav_pass', supportsSystem),
+              placeholder: credPlaceholder(
+                c,
+                'webdav_pass',
+                tr(locale, '应用密码或口令', 'App password or passphrase'),
+                supportsSystem,
+                locale
+              ),
+            },
+            supportsFormAutosave
+          ),
         ],
       },
-      {
-        kind: 'input',
-        id: 'git_remote',
-        label: tr(locale, '仓库地址', 'Repository Address'),
-        layout: 'stacked',
-        value: String(c.git_remote || ''),
-        placeholder: 'git@github.com:user/notes.git',
-        visible_when: { control_id: 'protocol', equals: 'git' },
-      },
-      {
-        kind: 'input',
-        id: 'git_branch',
-        label: tr(locale, '分支', 'Branch'),
-        layout: 'stacked',
-        value: String(c.git_branch || ''),
-        placeholder: 'main',
-        visible_when: { control_id: 'protocol', equals: 'git' },
-      },
+      ...(supportsFormAutosave && protocol === 'webdav'
+        ? [forgetCredentialRow(ctx, 'webdav', c, { control_id: 'protocol', equals: 'webdav' })].filter(Boolean)
+        : []),
+      withAutosave(
+        {
+          kind: 'input',
+          id: 'git_remote',
+          label: tr(locale, '仓库地址', 'Repository Address'),
+          layout: 'stacked',
+          value: String(c.git_remote || ''),
+          placeholder: 'git@github.com:user/notes.git',
+          visible_when: { control_id: 'protocol', equals: 'git' },
+        },
+        supportsFormAutosave
+      ),
+      withAutosave(
+        {
+          kind: 'input',
+          id: 'git_branch',
+          label: tr(locale, '分支', 'Branch'),
+          layout: 'stacked',
+          value: String(c.git_branch || ''),
+          placeholder: 'main',
+          visible_when: { control_id: 'protocol', equals: 'git' },
+        },
+        supportsFormAutosave
+      ),
       {
         kind: 'group',
         visible_when: { control_id: 'protocol', equals: 'git' },
         fields: [
-          {
-            kind: 'segmented',
-            id: 'git_auth',
-            label: tr(locale, '认证方式', 'Authentication'),
-            layout: 'stacked',
-            value: c.git_auth,
-            options: [
-              { value: 'ssh', label: 'SSH' },
-              { value: 'token', label: tr(locale, 'HTTPS 令牌', 'HTTPS Token') },
-            ],
-          },
-          {
-            kind: 'secret',
-            id: 'git_token',
-            label: tr(locale, '访问令牌', 'Access Token'),
-            layout: 'stacked',
-            value: credFieldValue(c, 'git_token', supportsSystem),
-            placeholder: credPlaceholder(c, 'git_token', 'ghp_...', supportsSystem, locale),
-            visible_when: { control_id: 'git_auth', equals: 'token' },
-          },
+          withAutosave(
+            {
+              kind: 'segmented',
+              id: 'git_auth',
+              label: tr(locale, '认证方式', 'Authentication'),
+              layout: 'stacked',
+              value: c.git_auth,
+              options: [
+                { value: 'ssh', label: 'SSH' },
+                { value: 'token', label: tr(locale, 'HTTPS 令牌', 'HTTPS Token') },
+              ],
+            },
+            supportsFormAutosave
+          ),
+          withAutosave(
+            {
+              kind: 'secret',
+              id: 'git_token',
+              label: tr(locale, '访问令牌', 'Access Token'),
+              layout: 'stacked',
+              value: credFieldValue(c, 'git_token', supportsSystem),
+              placeholder: credPlaceholder(c, 'git_token', 'ghp_...', supportsSystem, locale),
+              visible_when: { control_id: 'git_auth', equals: 'token' },
+            },
+            supportsFormAutosave
+          ),
         ],
       },
+      ...(supportsFormAutosave && protocol === 'git'
+        ? [forgetCredentialRow(ctx, 'git', c, { control_id: 'protocol', equals: 'git' })].filter(Boolean)
+        : []),
     ];
 
-    if (supportsProgressBar) {
+    if (supportsFormAutosave) {
       for (const p of VALID_PROTOCOLS) {
-        targetItems.push(buildProgressItem(ctx, p, c));
+        targetItems.push(buildStatusRowItem(ctx, p, c));
       }
-    }
+      const actRow = buildStatusActionRow(ctx, protocol, c);
+      if (actRow) {
+        targetItems.push(actRow);
+      }
+    } else {
+      if (supportsProgressBar) {
+        for (const p of VALID_PROTOCOLS) {
+          targetItems.push(buildProgressItem(ctx, p, c));
+        }
+      }
 
-    targetItems.push({
-      kind: 'actions',
-      visible_when: { control_id: 'protocol', in: ['webdav', 'git'] },
-      buttons: configButtons(ctx, protocol, c),
-    });
-
-    if (
-      protocolEnabled(c, 'local_mirror') &&
-      !protocolError(c, 'local_mirror', { ...ctx, requireNotebooks: true })
-    ) {
       targetItems.push({
         kind: 'actions',
-        visible_when: { control_id: 'protocol', equals: 'local_mirror' },
-        buttons: [
-          {
-            id: 'sync_local_mirror',
-            label: tr(locale, '同步目录镜像', 'Sync Mirror'),
-            variant: 'secondary',
-            ...syncButtonFeedback(locale),
-          },
-        ],
+        visible_when: { control_id: 'protocol', in: ['webdav', 'git'] },
+        buttons: configButtons(ctx, protocol, c),
       });
+
+      if (
+        protocolEnabled(c, 'local_mirror') &&
+        !protocolError(c, 'local_mirror', { ...ctx, requireNotebooks: true })
+      ) {
+        targetItems.push({
+          kind: 'actions',
+          visible_when: { control_id: 'protocol', equals: 'local_mirror' },
+          buttons: [
+            {
+              id: 'sync_local_mirror',
+              label: tr(locale, '同步目录镜像', 'Sync Mirror'),
+              variant: 'secondary',
+              ...syncButtonFeedback(locale),
+            },
+          ],
+        });
+      }
     }
 
     const enabledProtocols = configuredProtocols(c, ctx);
@@ -1286,7 +1629,7 @@ export function buildSettingsPage(ctx, cfg = null) {
         conflictPolicyItem(c, locale),
         autoSyncSwitch(c, locale),
         syncIntervalItem(c, locale),
-        ...fileSyncOptions(c, locale),
+        ...fileSyncOptions(c, locale, supportsFormAutosave),
       ],
     };
     if (supportsSystem) {
