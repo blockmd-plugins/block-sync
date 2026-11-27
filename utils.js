@@ -97,36 +97,63 @@ export function sha256File(filePath, callHost) {
 
 export function textToBytes(text) {
   const str = String(text ?? '');
-  const out = [];
-  for (let i = 0; i < str.length; i += 1) {
+  const len = str.length;
+  let byteLen = 0;
+  for (let i = 0; i < len; i += 1) {
+    const cp = str.charCodeAt(i);
+    if (cp < 0x80) {
+      byteLen += 1;
+    } else if (cp < 0x800) {
+      byteLen += 2;
+    } else if (cp >= 0xd800 && cp <= 0xdbff) {
+      const next = i + 1 < len ? str.charCodeAt(i + 1) : 0;
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        byteLen += 4;
+        i += 1;
+      } else {
+        byteLen += 3;
+      }
+    } else {
+      byteLen += 3;
+    }
+  }
+
+  const out = new Uint8Array(byteLen);
+  let pos = 0;
+  for (let i = 0; i < len; i += 1) {
     let cp = str.charCodeAt(i);
     if (cp < 0x80) {
-      out.push(cp);
+      out[pos++] = cp;
     } else if (cp < 0x800) {
-      out.push(0xc0 | (cp >> 6), 0x80 | (cp & 0x3f));
+      out[pos++] = 0xc0 | (cp >> 6);
+      out[pos++] = 0x80 | (cp & 0x3f);
     } else if (cp >= 0xd800 && cp <= 0xdbff) {
-      const next = i + 1 < str.length ? str.charCodeAt(i + 1) : 0;
+      const next = i + 1 < len ? str.charCodeAt(i + 1) : 0;
       if (next >= 0xdc00 && next <= 0xdfff) {
         cp = 0x10000 + (((cp - 0xd800) << 10) | (next - 0xdc00));
         i += 1;
-        out.push(
-          0xf0 | (cp >> 18),
-          0x80 | ((cp >> 12) & 0x3f),
-          0x80 | ((cp >> 6) & 0x3f),
-          0x80 | (cp & 0x3f)
-        );
+        out[pos++] = 0xf0 | (cp >> 18);
+        out[pos++] = 0x80 | ((cp >> 12) & 0x3f);
+        out[pos++] = 0x80 | ((cp >> 6) & 0x3f);
+        out[pos++] = 0x80 | (cp & 0x3f);
       } else {
         // Lone high surrogate -> U+FFFD
-        out.push(0xef, 0xbf, 0xbd);
+        out[pos++] = 0xef;
+        out[pos++] = 0xbf;
+        out[pos++] = 0xbd;
       }
     } else if (cp >= 0xdc00 && cp <= 0xdfff) {
       // Lone low surrogate -> U+FFFD
-      out.push(0xef, 0xbf, 0xbd);
+      out[pos++] = 0xef;
+      out[pos++] = 0xbf;
+      out[pos++] = 0xbd;
     } else {
-      out.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+      out[pos++] = 0xe0 | (cp >> 12);
+      out[pos++] = 0x80 | ((cp >> 6) & 0x3f);
+      out[pos++] = 0x80 | (cp & 0x3f);
     }
   }
-  return new Uint8Array(out);
+  return out;
 }
 
 export function bytesToText(bytes, { fatal = false } = {}) {
@@ -136,18 +163,31 @@ export function bytesToText(bytes, { fatal = false } = {}) {
       ? new Uint8Array(bytes)
       : new Uint8Array(0);
   const chunks = [];
+  const codeUnits = [];
+  const flush = () => {
+    if (codeUnits.length > 0) {
+      chunks.push(String.fromCharCode(...codeUnits));
+      codeUnits.length = 0;
+    }
+  };
+  const pushCode = (code) => {
+    codeUnits.push(code);
+    if (codeUnits.length >= 1024) {
+      flush();
+    }
+  };
   let i = 0;
   const failOrReplace = () => {
     if (fatal) {
       throw new Error('Invalid UTF-8 byte sequence');
     }
-    chunks.push('\ufffd');
+    pushCode(0xfffd);
   };
 
   while (i < arr.length) {
     const b0 = arr[i];
     if (b0 < 0x80) {
-      chunks.push(String.fromCharCode(b0));
+      pushCode(b0);
       i += 1;
       continue;
     }
@@ -164,7 +204,7 @@ export function bytesToText(bytes, { fatal = false } = {}) {
         continue;
       }
       const cp = ((b0 & 0x1f) << 6) | (b1 & 0x3f);
-      chunks.push(String.fromCharCode(cp));
+      pushCode(cp);
       i += 2;
       continue;
     }
@@ -187,7 +227,7 @@ export function bytesToText(bytes, { fatal = false } = {}) {
         continue;
       }
       const cp = ((b0 & 0x0f) << 12) | ((b1 & 0x3f) << 6) | (b2 & 0x3f);
-      chunks.push(String.fromCharCode(cp));
+      pushCode(cp);
       i += 3;
       continue;
     }
@@ -213,13 +253,18 @@ export function bytesToText(bytes, { fatal = false } = {}) {
       }
       const cp = ((b0 & 0x07) << 18) | ((b1 & 0x3f) << 12) | ((b2 & 0x3f) << 6) | (b3 & 0x3f);
       const u = cp - 0x10000;
-      chunks.push(String.fromCharCode(0xd800 + (u >> 10), 0xdc00 + (u & 0x3ff)));
+      pushCode(0xd800 + (u >> 10));
+      pushCode(0xdc00 + (u & 0x3ff));
       i += 4;
       continue;
     }
     failOrReplace();
     i += 1;
   }
+  if (chunks.length === 0) {
+    return codeUnits.length > 0 ? String.fromCharCode(...codeUnits) : '';
+  }
+  flush();
   return chunks.join('');
 }
 
@@ -1652,6 +1697,18 @@ export function makeUniqueConflictPath(
 // Sync Error Classification
 // ============================================================================
 
+const SCOPE_ERROR_TOKENS = [
+  'outside authorized filesystem scope',
+  'path is read-only without notes:write permission',
+  'missing permission:',
+  'not in manifest.exec_allowlist',
+  'program is invalid or forbidden',
+  'cwd must be within an authorized directory',
+  '拒绝访问不安全',
+  'refused unsafe',
+  'refused to delete unsafe path',
+];
+
 const AUTH_ERROR_TOKENS = [
   'permission denied (publickey)',
   'authentication failed',
@@ -1670,6 +1727,11 @@ const AUTH_ERROR_TOKENS = [
   'status 403',
   'unauthorized',
   'forbidden',
+  'gh013',
+  'protected branch',
+  'pre-receive hook declined',
+  '远端拒绝推送',
+  'remote rejected the push',
   '认证失败',
   '公钥认证',
   '访问令牌',
@@ -1686,6 +1748,12 @@ const CONFLICT_ERROR_TOKENS = [
   '冲突',
   'git 分支已更新',
   'branch advanced',
+  '已分叉',
+  'diverged',
+  '非同步提交',
+  'unpushed commits outside block sync',
+  '同名文件',
+  'differ only by case or unicode form',
 ];
 
 const CONFIG_ERROR_TOKENS = [
@@ -1718,6 +1786,30 @@ const CONFIG_ERROR_TOKENS = [
   'not writable',
   'invalid url',
   '无效的',
+  '不存在分支',
+  'does not have branch',
+  '疑似被删除或重置',
+  'no longer exists',
+  '请先切换到',
+  'before syncing',
+  '被忽略规则阻止',
+  'ignored by git ignore rules',
+  '暂存区已有',
+  'staged changes',
+  'index.lock',
+  'checkout is at',
+  'could not locate git',
+  '无法定位 git',
+  'git 缓存位置不安全',
+  'git cache location is unsafe',
+  '无法初始化',
+  'could not initialize',
+  'git is in progress',
+  '尚未结束',
+  '目录列表已截断',
+  'directory listing was truncated',
+  'git 输出已截断',
+  'git output was truncated',
 ];
 
 const TRANSIENT_NETWORK_TOKENS = [
@@ -1748,18 +1840,23 @@ const TRANSIENT_NETWORK_TOKENS = [
   'curl 35',
   'curl 56',
   // WebDAV / Node / HTTP transient network errors
+  'http 429',
   'http 502',
   'http 503',
   'http 504',
+  '(429)',
   '(502)',
   '(503)',
   '(504)',
+  'status 429',
   'status 502',
   'status 503',
   'status 504',
+  'returned error: 429',
   'returned error: 502',
   'returned error: 503',
   'returned error: 504',
+  'too many requests',
   '502 bad gateway',
   '503 service unavailable',
   '504 gateway timeout',
@@ -1787,6 +1884,19 @@ const TRANSIENT_NETWORK_TOKENS = [
   'reached the background deadline',
 ];
 
+export const DETERMINISTIC_ERROR_CLASSES = new Set([
+  'scope',
+  'auth',
+  'config',
+  'conflict',
+  'file_limit',
+  'quota_full',
+]);
+
+export function isDeterministicErrorClass(failClass) {
+  return DETERMINISTIC_ERROR_CLASSES.has(String(failClass || ''));
+}
+
 export function classifySyncError(msg) {
   const raw = msg && typeof msg === 'object' && 'message' in msg ? msg.message : msg;
   const lower = String(raw ?? '').toLowerCase();
@@ -1794,11 +1904,12 @@ export function classifySyncError(msg) {
   if (code === 413 || code === 'file_limit' || /exceeds (?:the )?(?:size limit|maximum (?:write )?size)|exceeds max_response_bytes|response body (?:too large|exceeds)|in-memory transfer limit|payload too large|gh001|(?:http |status |\()413\b|超过大小上限/.test(lower)) return 'file_limit';
   if (code === 507 || code === 'quota_full' || /\benospc\b|no space left|insufficient storage|(?:http |status |\()507\b/.test(lower)) return 'quota_full';
   if (!lower) return 'other';
+  if (SCOPE_ERROR_TOKENS.some((tok) => lower.includes(tok)) || /cannot modify .+ directly/.test(lower)) return 'scope';
   if ((code === 401 || code === 403 || AUTH_ERROR_TOKENS.some((tok) => lower.includes(tok))) && !lower.includes('missing permission:')) return 'auth';
-  if (code === 423 || code === 'fs_error' || /\b(?:eacces|eperm|ebusy|eilseq|enametoolong)\b|permission denied|operation not permitted|device or resource busy|illegal byte sequence|file name too long|regular file|not valid utf-8|changed while opening|changed during sync|disappeared during sync|(?:http |status |\()423\b|已中止覆盖/.test(lower)) return 'fs_error';
+  if (code === 423 || code === 'fs_error' || /\b(?:eacces|eperm|ebusy|eilseq|enametoolong)\b|permission denied|operation not permitted|device or resource busy|illegal byte sequence|file name too long|regular file|not valid utf-8|changed while opening|changed during sync|changed after scanning|disappeared during sync|(?:http |status |\()423\b|已中止覆盖|在扫描后发生变化|在扫描后消失/.test(lower)) return 'fs_error';
   if (CONFLICT_ERROR_TOKENS.some((tok) => lower.includes(tok))) return 'conflict';
-  if (CONFIG_ERROR_TOKENS.some((tok) => lower.includes(tok))) return 'config';
-  if (TRANSIENT_NETWORK_TOKENS.some((tok) => lower.includes(tok))) return 'network';
+  if (CONFIG_ERROR_TOKENS.some((tok) => lower.includes(tok)) || /remote branch .+ does not exist/.test(lower)) return 'config';
+  if (code === 429 || TRANSIENT_NETWORK_TOKENS.some((tok) => lower.includes(tok))) return 'network';
   return 'other';
 }
 

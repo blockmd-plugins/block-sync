@@ -16,6 +16,7 @@ import {
   resolveCallHost,
   sha256Text,
   sha256Bytes,
+  sha256File,
   textToBytes,
   bytesToText,
   decodeNoteBytes,
@@ -72,6 +73,8 @@ const DEFAULT_LOCK_TTL_MS = 120000;
 const MAX_STASH_ENTRIES = 64;
 const STASH_PROTECT_WINDOW_MS = 60000;
 const RECOVERY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const TEXT_DIRECT_READ_MAX_BYTES = 256 * 1024;
+const HOST_BUFFER_READ_MAX_BYTES = 2 * 1024 * 1024;
 
 function trimTrailingSlash(p) {
   const s = String(p ?? '').replace(/\\/g, '/');
@@ -113,11 +116,12 @@ export function fsList(callHost, path, recursive = false, locale = 'zh') {
 export function fsReadBytes(callHost, path) {
   const rpc = resolveCallHost(callHost);
   try {
+    const maxBytes = globalThis.BlockSDK ? HOST_BUFFER_READ_MAX_BYTES : MAX_SYNC_FILE_BYTES;
     if (globalThis.BlockSDK) checkSyncBufferSize(fsStat(rpc, path).size);
     const res = rpc('host.fs.read', {
       path: String(path ?? ''),
       encoding: 'base64',
-      max_bytes: MAX_SYNC_FILE_BYTES,
+      max_bytes: maxBytes,
     });
     if (!res || res.found === false) return null;
     if (typeof res.content_base64 === 'string') return base64ToBytes(res.content_base64);
@@ -127,6 +131,73 @@ export function fsReadBytes(callHost, path) {
     return null;
   } catch (exc) {
     if (isNotFoundError(exc)) return null;
+    throw exc;
+  }
+}
+
+/** Read UTF-8 note text via host.fs.read (bounded utf8 direct read, bounded base64 fallback); returns null if missing. */
+export function fsReadNoteText(callHost, path, relPath = '', entry = null) {
+  const rpc = resolveCallHost(callHost);
+  const cleanPath = String(path ?? '');
+  const isSizeLimitErr = (exc) => {
+    const low = String(exc?.message || exc || '').toLowerCase();
+    return low.includes('exceeds size limit') || low.includes('exceeds the size limit') || low.includes('exceeds maximum');
+  };
+  const decodeReadRes = (res) => {
+    if (!res || res.found === false) return null;
+    if (typeof res.content === 'string') return res.content;
+    if (typeof res.content_base64 === 'string') return decodeNoteBytes(base64ToBytes(res.content_base64), relPath);
+    if (typeof res.base64 === 'string') return decodeNoteBytes(base64ToBytes(res.base64), relPath);
+    if (res.content instanceof Uint8Array) return decodeNoteBytes(res.content, relPath);
+    return null;
+  };
+  try {
+    let knownSize = typeof entry?.size === 'number' && Number.isFinite(entry.size) ? entry.size : null;
+    if (globalThis.BlockSDK) {
+      if (knownSize === null) {
+        const st = fsStat(rpc, cleanPath);
+        if (typeof st?.size === 'number' && Number.isFinite(st.size)) {
+          knownSize = st.size;
+        }
+      }
+      if (knownSize !== null) checkSyncBufferSize(knownSize);
+    }
+    if (knownSize !== null && knownSize >= 0 && knownSize <= TEXT_DIRECT_READ_MAX_BYTES) {
+      try {
+        const res = rpc('host.fs.read', {
+          path: cleanPath,
+          encoding: 'utf8',
+          max_bytes: TEXT_DIRECT_READ_MAX_BYTES,
+        });
+        return decodeReadRes(res);
+      } catch (directExc) {
+        if (!isSizeLimitErr(directExc)) throw directExc;
+        // File grew past direct-read cap after stat/list; fall through to bounded base64 path.
+      }
+    }
+    const fallbackMax = globalThis.BlockSDK ? HOST_BUFFER_READ_MAX_BYTES : MAX_SYNC_FILE_BYTES;
+    if (globalThis.BlockSDK) {
+      const st = fsStat(rpc, cleanPath);
+      checkSyncBufferSize(st.size);
+    }
+    const res = rpc('host.fs.read', {
+      path: cleanPath,
+      encoding: 'base64',
+      max_bytes: fallbackMax,
+    });
+    return decodeReadRes(res);
+  } catch (exc) {
+    if (isNotFoundError(exc)) return null;
+    const low = String(exc?.message || exc || '').toLowerCase();
+    if (low.includes('not valid utf-8') || low.includes('invalid utf-8')) {
+      const label = relPath || 'note';
+      throw new Error(`Note is not valid UTF-8 (${label}): ${exc?.message || exc}`);
+    }
+    if (isSizeLimitErr(exc) && globalThis.BlockSDK) {
+      const err = new Error('File exceeds the current host’s 2 MiB in-memory transfer limit');
+      err.code = 'file_limit';
+      throw err;
+    }
     throw exc;
   }
 }
@@ -255,6 +326,31 @@ export function isCloudPlaceholder(callHost, rootDir, relPath) {
     const st = fsStat(callHost, icloudPath);
     return Boolean(st.exists);
   } catch (_err) {
+    return false;
+  }
+}
+
+/** Re-verify that rootDir is an existing directory and neither relPath nor its .icloud stub exists. */
+export function isConfirmedAbsentOnRoot(callHost, rootDir, relPath) {
+  if (!rootDir || !relPath) return false;
+  const cleanRoot = trimTrailingSlash(rootDir);
+  const norm = normalizeRelPath(relPath);
+  if (!norm) return false;
+  try {
+    const rootSt = fsStat(callHost, cleanRoot);
+    if (!rootSt.exists || !rootSt.is_dir) return false;
+    const st = fsStat(callHost, posixJoin(cleanRoot, norm));
+    if (st.exists || st.is_icloud_placeholder) return false;
+    const dirPart = posixDirname(norm);
+    const baseName = posixBasename(norm);
+    if (!baseName) return false;
+    const icloudName = `.${baseName}.icloud`;
+    const icloudPath = dirPart ? posixJoin(cleanRoot, dirPart, icloudName) : posixJoin(cleanRoot, icloudName);
+    const icloudSt = fsStat(callHost, icloudPath);
+    if (icloudSt.exists) return false;
+    return true;
+  } catch (_err) {
+    // Any stat I/O failure is treated conservatively as "cannot confirm absent" so deletion is aborted.
     return false;
   }
 }
@@ -478,6 +574,155 @@ function hasAssetSegment(rel) {
   return String(rel || '').split('/').slice(0, -1).includes('assets');
 }
 
+function listEntriesSkippingDotDirs(callHost, cleanRoot, excludedSubdirs = new Set(), locale = 'zh') {
+  const topEntries = fsList(callHost, cleanRoot, false, locale);
+  if (topEntries.some((e) => entryRelPath(e, cleanRoot).includes('/'))) {
+    return topEntries;
+  }
+  const topFiles = [];
+  const walkDirs = [];
+  let skippedRootDir = false;
+  for (const e of topEntries) {
+    if (!e) continue;
+    const rawName = String(e.name ?? '') || posixBasename(entryRelPath(e, cleanRoot));
+    if (!rawName) continue;
+    if (e.is_dir) {
+      if (rawName.startsWith('.') || inSyncSubdir(rawName, excludedSubdirs)) {
+        skippedRootDir = true;
+      } else {
+        walkDirs.push(rawName);
+      }
+    } else {
+      topFiles.push(e);
+    }
+  }
+  if (walkDirs.length === 0) {
+    return topFiles;
+  }
+  if (skippedRootDir && walkDirs.length <= 32) {
+    const out = [...topFiles];
+    for (const dirName of walkDirs) {
+      const subEntries = fsList(callHost, posixJoin(cleanRoot, dirName), true, locale);
+      for (const se of subEntries) {
+        if (!se) continue;
+        let relFromRoot = '';
+        if (typeof se.rel_path === 'string' && se.rel_path) {
+          relFromRoot = `${dirName}/${se.rel_path}`;
+        } else {
+          relFromRoot = entryRelPath(se, cleanRoot);
+          if (!relFromRoot || relFromRoot === String(se.name || '')) {
+            relFromRoot = `${dirName}/${String(se.name || '')}`;
+          }
+        }
+        out.push({ ...se, rel_path: relFromRoot });
+      }
+    }
+    return out;
+  }
+  return fsList(callHost, cleanRoot, true, locale);
+}
+
+/** Scan a directory once, partitioning notes, attachments, iCloud placeholders, and stale tmp files. */
+export function scanDirSnapshot(
+  callHost,
+  rootDir,
+  {
+    excludedSubdirs = new Set(),
+    locale = 'zh',
+  } = {}
+) {
+  if (!rootDir) return null;
+  const cleanRoot = trimTrailingSlash(rootDir);
+  const rootSt = fsStat(callHost, cleanRoot);
+  if (!rootSt.exists || !rootSt.is_dir) return null;
+
+  const entries = listEntriesSkippingDotDirs(callHost, cleanRoot, excludedSubdirs, locale);
+  const noteEntries = new Map();
+  const assetEntries = new Map();
+  const icloudPaths = new Set();
+  const icloudFoldedPaths = new Map();
+  const staleTmpPaths = [];
+  const addIcloudPath = (p) => {
+    icloudPaths.add(p);
+    const fk = foldSyncPath(p, { caseInsensitive: true, normalize: true });
+    if (!icloudFoldedPaths.has(fk)) icloudFoldedPaths.set(fk, []);
+    const list = icloudFoldedPaths.get(fk);
+    if (!list.includes(p)) list.push(p);
+  };
+
+  for (const entry of entries) {
+    if (!entry || entry.is_dir) continue;
+    const rel = entryRelPath(entry, cleanRoot);
+    if (!rel) continue;
+
+    if (entry.is_icloud_placeholder) {
+      addIcloudPath(rel);
+    }
+    const base = posixBasename(rel);
+    const icMatch = /^\.(.+)\.icloud$/i.exec(base);
+    if (icMatch) {
+      const dir = posixDirname(rel);
+      addIcloudPath(dir ? `${dir}/${icMatch[1]}` : icMatch[1]);
+      addIcloudPath(rel);
+    }
+    if (base.startsWith('.block-sync-') && base.endsWith('.tmp') && !rel.split('/').some((seg) => seg === '.git')) {
+      staleTmpPaths.push(rel);
+    }
+
+    if (inSyncSubdir(rel, excludedSubdirs)) continue;
+    if (isSyncAssetCandidate(rel)) {
+      assetEntries.set(rel, entry);
+    } else if (!hasDotSegment(rel) && !hasAssetSegment(rel) && isSafeRelMd(rel)) {
+      noteEntries.set(rel, entry);
+    }
+  }
+
+  return {
+    cleanRoot,
+    noteEntries,
+    assetEntries,
+    icloudPaths,
+    icloudFoldedPaths,
+    staleTmpPaths,
+  };
+}
+
+/** Check iCloud placeholder via pre-scanned snapshot set (case/norm aware), falling back to host stat on miss. */
+export function snapshotHasCloudPlaceholder(callHost, snapshot, rootDir, relPath) {
+  if (!relPath) return false;
+  const norm = String(relPath).replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+  if (!norm) return false;
+  const effectiveRoot = rootDir || snapshot?.cleanRoot || '';
+  if (snapshot && snapshot.icloudPaths) {
+    if (snapshot.icloudPaths.has(norm)) return true;
+    if (snapshot.icloudFoldedPaths && effectiveRoot) {
+      const fk = foldSyncPath(norm, { caseInsensitive: true, normalize: true });
+      const cands = snapshot.icloudFoldedPaths.get(fk);
+      if (cands && cands.length > 0) {
+        if (snapshot._ci === undefined) {
+          snapshot._ci = dirIsCaseInsensitive(callHost, effectiveRoot);
+        }
+        const ci = snapshot._ci;
+        for (const cand of cands) {
+          if (foldSyncPath(cand, { caseInsensitive: ci }) === foldSyncPath(norm, { caseInsensitive: ci })) {
+            return true;
+          }
+          if (
+            foldSyncPath(cand, { caseInsensitive: ci, normalize: true }) ===
+            foldSyncPath(norm, { caseInsensitive: ci, normalize: true })
+          ) {
+            if (snapshot._norm === undefined) {
+              snapshot._norm = dirIsNormalizationInsensitive(callHost, effectiveRoot);
+            }
+            if (snapshot._norm) return true;
+          }
+        }
+      }
+    }
+  }
+  return effectiveRoot ? isCloudPlaceholder(callHost, effectiveRoot, norm) : false;
+}
+
 /** Scan markdown notes in mirrorDir (or Git worktree) via host.fs.list + host.fs.read. */
 export function scanMirrorFiles(
   callHost,
@@ -514,8 +759,8 @@ export function scanMirrorFiles(
       if (!entry.exists || !skips.check(onlyPath, entry)) return;
       const actualRel = resolveActualRelCasing(callHost, cleanRoot, onlyPath, locale);
       if (!skips.check(actualRel)) return;
-      const rawBytes = fsReadBytes(callHost, posixJoin(cleanRoot, actualRel));
-      if (rawBytes !== null) remoteFiles[actualRel] = decodeNoteBytes(rawBytes, actualRel);
+      const text = fsReadNoteText(callHost, posixJoin(cleanRoot, actualRel), actualRel, entry);
+      if (text !== null) remoteFiles[actualRel] = text;
       else throw new Error('Note changed while opening');
     });
     return remoteFiles;
@@ -523,7 +768,7 @@ export function scanMirrorFiles(
 
   const mirrorCi = dirIsCaseInsensitive(callHost, cleanRoot);
   const mirrorNorm = dirIsNormalizationInsensitive(callHost, cleanRoot);
-  const entries = fsList(callHost, cleanRoot, true, locale);
+  const entries = listEntriesSkippingDotDirs(callHost, cleanRoot, excludedSubdirs, locale);
   for (const entry of entries) {
     if (!entry || entry.is_dir) continue;
     const rel = entryRelPath(entry, cleanRoot);
@@ -531,9 +776,9 @@ export function scanMirrorFiles(
     if (!isSafeRelMd(rel) || inSyncSubdir(rel, excludedSubdirs)) continue;
     if (!matchesScope(rel, scope, { caseInsensitive: mirrorCi, normalize: mirrorNorm }) || !skips.check(rel, entry)) continue;
     skips.run(rel, () => {
-      const rawBytes = fsReadBytes(callHost, posixJoin(cleanRoot, rel));
-      if (rawBytes === null) throw new Error('Note changed while opening');
-      remoteFiles[rel] = decodeNoteBytes(rawBytes, rel);
+      const text = fsReadNoteText(callHost, posixJoin(cleanRoot, rel), rel, entry);
+      if (text === null) throw new Error('Note changed while opening');
+      remoteFiles[rel] = text;
     });
   }
   return remoteFiles;
@@ -1097,7 +1342,7 @@ export function migrateLegacyRecoveryDirs(
       let ensuredRecoveryDir = false;
       for (const entry of entries) {
         if (!entry || entry.is_dir || entry.is_regular === false || entry.is_file === false) continue;
-        const name = String(entry.name || posixBasename(entry.path || '')).trim();
+        const name = String(entry.name ?? '') || posixBasename(entry.path || '');
         if (!name) continue;
         const srcPath = entry.path ? String(entry.path) : posixJoin(legacyDir, name);
         try {
@@ -1275,10 +1520,15 @@ export function writeMirrorPayload(
   const dest = isText
     ? safeMirrorDest(cleanMirror, relPath, excludedSubdirs, locale)
     : safeAssetDest(cleanMirror, relPath, excludedSubdirs, locale);
-  const bytes = sourcePath || copyFromPath
+  const isRawString = isText && typeof rawBytes === 'string' && !sourcePath && !copyFromPath;
+  const bytes = sourcePath || copyFromPath || isRawString
     ? null
     : (rawBytes instanceof Uint8Array ? rawBytes : textToBytes(String(rawBytes ?? '')));
-  const contentHash = sourcePath || copyFromPath ? sourceHash : sha256Bytes(bytes, rpc);
+  const contentHash = sourcePath || copyFromPath
+    ? sourceHash
+    : isRawString
+      ? sha256Text(rawBytes, rpc)
+      : sha256Bytes(bytes, rpc);
   const hashAt = (path) => hashSyncFile(path, rpc, () => fsReadBytes(rpc, path));
   const errMsg =
     changeErr ||
@@ -1331,6 +1581,9 @@ export function writeMirrorPayload(
         fsWriteBytes(rpc, tmpPath, fallbackBytes, { atomic: false, mkdirParents: false });
         tmpAlive = true;
       }
+    } else if (isRawString) {
+      fsWriteText(rpc, tmpPath, rawBytes, { atomic: false, mkdirParents: false });
+      tmpAlive = true;
     } else {
       fsWriteBytes(rpc, tmpPath, bytes, { atomic: false, mkdirParents: false });
       tmpAlive = true;
@@ -1421,7 +1674,7 @@ export function writeMirrorPayload(
 /** Write a markdown note atomically to mirrorDir. */
 export function writeMirrorFile(callHost, mirrorDir, relPath, content, opts = {}) {
   const locale = opts.locale || 'zh';
-  return writeMirrorPayload(callHost, mirrorDir, relPath, textToBytes(content), {
+  return writeMirrorPayload(callHost, mirrorDir, relPath, String(content ?? ''), {
     ...opts,
     isText: true,
     changeErr: tr(
@@ -1662,8 +1915,14 @@ export function planNotebookAssets({
   baseMap,
   policy,
   scope,
-  localNotes,
-  remoteNotes,
+  localNotes = {},
+  remoteNotes = {},
+  localSnapshot = null,
+  remoteSnapshot = null,
+  localNoteEntries = null,
+  remoteNoteEntries = null,
+  readLocalNote = null,
+  readRemoteNote = null,
   onlyPath = null,
   excludedSubdirs = new Set(),
   trackedRemotePaths = null,
@@ -1697,9 +1956,15 @@ export function planNotebookAssets({
 
   let explicitPaths = null;
   if (onlyPath !== null && onlyPath !== undefined) {
+    const lOnly = Object.hasOwn(localNotes, onlyPath)
+      ? localNotes[onlyPath]
+      : (typeof readLocalNote === 'function' ? readLocalNote(onlyPath) : '') || '';
+    const rOnly = Object.hasOwn(remoteNotes, onlyPath)
+      ? remoteNotes[onlyPath]
+      : (typeof readRemoteNote === 'function' ? readRemoteNote(onlyPath) : '') || '';
     explicitPaths = new Set([
-      ...noteAssetPaths(onlyPath, localNotes[onlyPath] || ''),
-      ...noteAssetPaths(onlyPath, remoteNotes[onlyPath] || ''),
+      ...noteAssetPaths(onlyPath, lOnly),
+      ...noteAssetPaths(onlyPath, rOnly),
     ]);
     if (isSafeRelAsset(onlyPath)) explicitPaths.add(onlyPath);
     if (explicitPaths.size === 0) return empty;
@@ -1707,9 +1972,20 @@ export function planNotebookAssets({
 
   const localMetadata = new Map();
   const remoteMetadata = new Map();
-  const localCandidates = explicitPaths !== null
-    ? new Set(explicitPaths)
-    : localAdapter.listAssets(nbRoot, excludedSubdirs, { cfg, locale, skips, metadata: localMetadata });
+  let localCandidates;
+  if (explicitPaths !== null) {
+    localCandidates = new Set(explicitPaths);
+  } else if (localSnapshot && localSnapshot.assetEntries) {
+    localCandidates = new Set();
+    for (const [rel, entry] of localSnapshot.assetEntries.entries()) {
+      if (inSyncSubdir(rel, excludedSubdirs)) continue;
+      if (!skips.check(rel, entry)) continue;
+      localCandidates.add(rel);
+      localMetadata.set(rel, entry);
+    }
+  } else {
+    localCandidates = localAdapter.listAssets(nbRoot, excludedSubdirs, { cfg, locale, skips, metadata: localMetadata });
+  }
   for (const rel of localCandidates) {
     if (inSyncSubdir(rel, excludedSubdirs)) {
       throw new Error(
@@ -1726,7 +2002,18 @@ export function planNotebookAssets({
   if (explicitPaths !== null) {
     remoteCandidates = new Set(explicitPaths);
   } else if (targetDir) {
-    const listed = listDirAssets(rpc, targetDir, excludedSubdirs, { cfg, locale, skips, metadata: remoteMetadata });
+    let listed;
+    if (remoteSnapshot && remoteSnapshot.assetEntries) {
+      listed = new Set();
+      for (const [rel, entry] of remoteSnapshot.assetEntries.entries()) {
+        if (inSyncSubdir(rel, excludedSubdirs)) continue;
+        if (!skips.check(rel, entry)) continue;
+        listed.add(rel);
+        remoteMetadata.set(rel, entry);
+      }
+    } else {
+      listed = listDirAssets(rpc, targetDir, excludedSubdirs, { cfg, locale, skips, metadata: remoteMetadata });
+    }
     remoteCandidates = trackedRemotePaths !== null && trackedRemotePaths !== undefined
       ? new Set([...listed].filter((p) => trackedRemotePaths.has(p)))
       : listed;
@@ -1735,14 +2022,34 @@ export function planNotebookAssets({
   const referenced = new Set();
   let candidates = new Set([...localCandidates, ...remoteCandidates]);
   if (explicitPaths === null && scope && scope !== 'all') {
-    for (const [np, txt] of Object.entries(localNotes)) {
-      for (const a of noteAssetPaths(np, txt)) referenced.add(a);
+    const localKeys = (localNoteEntries ? [...localNoteEntries.keys()] : Object.keys(localNotes))
+      .filter((np) => !skips.has(np));
+    const remoteKeys = (remoteNoteEntries ? [...remoteNoteEntries.keys()] : Object.keys(remoteNotes))
+      .filter((np) => !skips.has(np));
+    for (const np of localKeys) {
+      if (skips.has(np)) continue;
+      const txt = Object.hasOwn(localNotes, np)
+        ? localNotes[np]
+        : (typeof readLocalNote === 'function'
+          ? skips.run(np, () => readLocalNote(np, localNoteEntries?.get(np)))
+          : undefined);
+      if (!skips.has(np) && typeof txt === 'string') {
+        for (const a of noteAssetPaths(np, txt)) referenced.add(a);
+      }
     }
-    for (const [np, txt] of Object.entries(remoteNotes)) {
-      for (const a of noteAssetPaths(np, txt)) referenced.add(a);
+    for (const np of remoteKeys) {
+      if (skips.has(np)) continue;
+      const txt = Object.hasOwn(remoteNotes, np)
+        ? remoteNotes[np]
+        : (typeof readRemoteNote === 'function'
+          ? skips.run(np, () => readRemoteNote(np, remoteNoteEntries?.get(np)))
+          : undefined);
+      if (!skips.has(np) && typeof txt === 'string') {
+        for (const a of noteAssetPaths(np, txt)) referenced.add(a);
+      }
     }
-    const locCi = dirIsCaseInsensitive(rpc, nbRoot, Object.keys(localNotes));
-    const remCi = dirIsCaseInsensitive(rpc, targetDir, Object.keys(remoteNotes));
+    const locCi = dirIsCaseInsensitive(rpc, nbRoot, localKeys);
+    const remCi = dirIsCaseInsensitive(rpc, targetDir, remoteKeys);
     candidates = new Set([
       ...[...candidates].filter((p) => matchesScope(p, scope, { caseInsensitive: locCi || remCi })),
       ...referenced,
@@ -1756,7 +2063,7 @@ export function planNotebookAssets({
   const remoteAssets = Object.create(null);
   const remoteAssetPathMap = Object.create(null);
   const hashLocalAsset = (rel) => {
-    const options = { cfg, locale, skips, entry: localMetadata.get(rel) };
+    const options = { cfg, locale, skips, entry: localMetadata.get(rel), snapshot: localSnapshot };
     if (typeof localAdapter.hashAsset === 'function') return localAdapter.hashAsset(nbRoot, rel, options);
     const bytes = localAdapter.readAsset(nbRoot, rel);
     if (bytes === null) return null;
@@ -1764,10 +2071,10 @@ export function planNotebookAssets({
     return sha256Bytes(bytes, rpc);
   };
   const hashRemoteAsset = (rel) => {
-    if (!targetDir || isCloudPlaceholder(rpc, targetDir, rel)) return null;
+    if (!targetDir || snapshotHasCloudPlaceholder(rpc, remoteSnapshot, targetDir, rel)) return null;
     const full = safeAssetDest(targetDir, rel, excludedSubdirs, locale);
     const entry = remoteMetadata.get(rel) || fsStat(rpc, full);
-    if (entry.exists === false || !skips.check(rel, entry)) return null;
+    if (entry.exists === false || entry.is_icloud_placeholder || !skips.check(rel, entry)) return null;
     const hash = hashSyncFile(full, rpc, () => {
       const bytes = fsReadBytes(rpc, full);
       if (bytes !== null) checkSyncFileSize(bytes.length, cfg, locale);
@@ -1886,13 +2193,16 @@ export function planNotebookAssets({
   const assetDeleteExpectedHashes = {};
   const reservedCopies = new Set();
 
-  const nbExists = Boolean(nbRoot && fsStat(rpc, trimTrailingSlash(nbRoot)).is_dir);
-  const targetExists = Boolean(targetDir && fsStat(rpc, trimTrailingSlash(targetDir)).is_dir);
+  const nbSnapshotOk = Boolean(localSnapshot);
+  const remoteSnapshotOk = Boolean(remoteSnapshot);
+  const nbExists = nbSnapshotOk || Boolean(nbRoot && fsStat(rpc, trimTrailingSlash(nbRoot)).is_dir);
+  const targetExists = remoteSnapshotOk || Boolean(targetDir && fsStat(rpc, trimTrailingSlash(targetDir)).is_dir);
   const allowDeleteRemote = !isFirstSync && nbExists;
+  const hasRemoteNotes = remoteNoteEntries ? remoteNoteEntries.size > 0 : Object.keys(remoteNotes).length > 0;
   const allowDeleteLocal =
     !isFirstSync &&
     explicitPaths === null &&
-    (Object.keys(remoteNotes).length > 0 || Object.keys(remoteAssets).length > 0) &&
+    (hasRemoteNotes || Object.keys(remoteAssets).length > 0) &&
     targetExists;
 
   const allAssetPaths = [...new Set([...Object.keys(localAssets), ...Object.keys(remoteAssets)])].sort();
@@ -1905,7 +2215,7 @@ export function planNotebookAssets({
       continue;
     }
     if (lhash === null) {
-      if (isCloudPlaceholder(rpc, nbRoot, rel)) continue;
+      if (snapshotHasCloudPlaceholder(rpc, localSnapshot, nbRoot, rel)) continue;
       const assetKey = `asset:${rel}`;
       let matchedDelHash = null;
       if (allowDeleteRemote) {
@@ -1922,6 +2232,7 @@ export function planNotebookAssets({
         }
       }
       if (matchedDelHash !== null) {
+        if (!checkMissingSyncPath(nbRoot, rel, (path) => fsStat(rpc, path), skips)) continue;
         deleteRemote.push(rel);
         assetDeleteExpectedHashes[assetKey] = matchedDelHash;
       } else {
@@ -1930,10 +2241,11 @@ export function planNotebookAssets({
       continue;
     }
     if (rhash === null) {
-      if (targetDir && isCloudPlaceholder(rpc, targetDir, remoteAssetPathMap[rel] || rel)) continue;
+      const targetRel = remoteAssetPathMap[rel] || rel;
+      if (targetDir && snapshotHasCloudPlaceholder(rpc, remoteSnapshot, targetDir, targetRel)) continue;
       const baseDel = allowDeleteLocal ? baseMap[`asset:${rel}`] : undefined;
       if (baseDel !== undefined && lhash === baseDel) {
-        if (!checkMissingSyncPath(targetDir, rel, (path) => fsStat(rpc, path), skips)) continue;
+        if (!checkMissingSyncPath(targetDir, targetRel, (path) => fsStat(rpc, path), skips)) continue;
         deleteLocal.push(rel);
         assetDeleteExpectedHashes[`asset:${rel}`] = baseDel;
       } else {
@@ -2015,8 +2327,14 @@ export function computeThreeWaySyncPlan({
   legacyKey = null,
   aliases = [],
   legacyAliases = [],
-  localNotes,
-  remoteNotes,
+  localNotes = {},
+  remoteNotes = {},
+  localSnapshot = null,
+  remoteSnapshot = null,
+  localNoteEntries = null,
+  remoteNoteEntries = null,
+  readLocalNote = null,
+  readRemoteNote = null,
   remoteInspected,
   remoteError,
   trackedRemotePaths = null,
@@ -2059,17 +2377,45 @@ export function computeThreeWaySyncPlan({
   const remotePathMap = {};
   const baseKeyAliases = {};
 
+  const lazyMode = Boolean(localNoteEntries || remoteNoteEntries);
+  const validLocalEntries = new Map();
+  const validRemoteEntries = new Map();
+  let localKeysSet = new Set();
+  let remoteKeysSet = new Set();
+
   if (inspected && !errText) {
-    localNotes = Object.fromEntries(Object.entries(localNotes).filter(([path]) => skips.check(path)));
-    remoteNotes = Object.fromEntries(Object.entries(remoteNotes).filter(([path]) => skips.check(path)));
+    if (localNoteEntries) {
+      for (const [lp, entry] of localNoteEntries.entries()) {
+        if (skips.check(lp, entry)) {
+          validLocalEntries.set(lp, entry);
+          localKeysSet.add(lp);
+        }
+      }
+    } else {
+      localNotes = Object.fromEntries(Object.entries(localNotes).filter(([path]) => skips.check(path)));
+      localKeysSet = new Set(Object.keys(localNotes));
+    }
+
+    if (remoteNoteEntries) {
+      for (const [rp, entry] of remoteNoteEntries.entries()) {
+        if (skips.check(rp, entry)) {
+          validRemoteEntries.set(rp, entry);
+          remoteKeysSet.add(rp);
+        }
+      }
+    } else {
+      remoteNotes = Object.fromEntries(Object.entries(remoteNotes).filter(([path]) => skips.check(path)));
+      remoteKeysSet = new Set(Object.keys(remoteNotes));
+    }
+
     const localFolded = new Map();
-    for (const lp of Object.keys(localNotes).sort()) {
+    for (const lp of [...localKeysSet].sort()) {
       const fk = foldSyncPath(lp, { caseInsensitive: true, normalize: true });
       if (!localFolded.has(fk)) localFolded.set(fk, []);
       localFolded.get(fk).push(lp);
     }
     const remoteFolded = new Map();
-    for (const rp of Object.keys(remoteNotes).sort()) {
+    for (const rp of [...remoteKeysSet].sort()) {
       const fk = foldSyncPath(rp, { caseInsensitive: true, normalize: true });
       if (!remoteFolded.has(fk)) remoteFolded.set(fk, []);
       remoteFolded.get(fk).push(rp);
@@ -2098,11 +2444,19 @@ export function computeThreeWaySyncPlan({
         if (!rList || lList.length !== 1 || rList.length !== 1) continue;
         const lp = lList[0];
         const rp = rList[0];
-        if (lp === rp || Object.hasOwn(remoteNotes, lp) || Object.hasOwn(localNotes, rp)) continue;
+        if (lp === rp || remoteKeysSet.has(lp) || localKeysSet.has(rp)) continue;
         if (pathsCollapse(rpc, nbRoot, lp, rp) || pathsCollapse(rpc, targetDir, lp, rp)) {
           remotePathMap[lp] = rp;
-          remoteNotes[lp] = remoteNotes[rp];
-          delete remoteNotes[rp];
+          remoteKeysSet.delete(rp);
+          remoteKeysSet.add(lp);
+          if (validRemoteEntries.has(rp)) {
+            validRemoteEntries.set(lp, validRemoteEntries.get(rp));
+            validRemoteEntries.delete(rp);
+          }
+          if (Object.hasOwn(remoteNotes, rp)) {
+            remoteNotes[lp] = remoteNotes[rp];
+            delete remoteNotes[rp];
+          }
           if (!Object.hasOwn(baseMap, lp) && Object.hasOwn(baseMap, rp)) {
             baseMap[lp] = baseMap[rp];
           }
@@ -2110,18 +2464,80 @@ export function computeThreeWaySyncPlan({
       }
 
       const orphanBaseNotes = Object.keys(baseMap).filter(
-        (bp) => isSafeRelMd(bp) && !skips.has(bp) && !Object.hasOwn(localNotes, bp) && !Object.hasOwn(remoteNotes, bp)
+        (bp) => isSafeRelMd(bp) && !skips.has(bp) && !localKeysSet.has(bp) && !remoteKeysSet.has(bp)
       );
-      const onlyLocalNotes = Object.keys(localNotes).filter(
-        (lp) => !Object.hasOwn(remoteNotes, lp) && !Object.hasOwn(baseMap, lp)
+      const onlyLocalNotes = [...localKeysSet].filter(
+        (lp) => !remoteKeysSet.has(lp) && !Object.hasOwn(baseMap, lp)
       );
-      const onlyRemoteNotes = Object.keys(remoteNotes).filter(
-        (rp) => !Object.hasOwn(localNotes, rp) && !Object.hasOwn(baseMap, rp)
+      const onlyRemoteNotes = [...remoteKeysSet].filter(
+        (rp) => !localKeysSet.has(rp) && !Object.hasOwn(baseMap, rp)
       );
       pairOrphanBaseKeys(rpc, onlyLocalNotes, orphanBaseNotes, baseMap, '', nbRoot, targetDir, protocol, baseKeyAliases);
       pairOrphanBaseKeys(rpc, onlyRemoteNotes, orphanBaseNotes, baseMap, '', nbRoot, targetDir, protocol, baseKeyAliases);
     }
   }
+
+  const localHashes = Object.create(null);
+  const remoteHashes = Object.create(null);
+
+  const readSingleLocal = (relPath) => {
+    if (Object.hasOwn(localNotes, relPath)) return localNotes[relPath];
+    if (typeof readLocalNote !== 'function') return undefined;
+    const entry = validLocalEntries.get(relPath);
+    const txt = readLocalNote(relPath, entry);
+    if (txt === null || txt === undefined) throw new Error('Note changed while opening');
+    return txt;
+  };
+
+  const readSingleRemote = (relPath) => {
+    if (Object.hasOwn(remoteNotes, relPath)) return remoteNotes[relPath];
+    if (typeof readRemoteNote !== 'function') return undefined;
+    const actualRel = remotePathMap[relPath] || relPath;
+    const entry = validRemoteEntries.get(relPath);
+    const txt = readRemoteNote(actualRel, entry);
+    if (txt === null || txt === undefined) throw new Error('Note changed while opening');
+    return txt;
+  };
+
+  const hashSingleNote = ({ relPath, side, knownValidHash = '' }) => {
+    const hashMap = side === 'local' ? localHashes : remoteHashes;
+    if (Object.hasOwn(hashMap, relPath)) return hashMap[relPath];
+    const eagerMap = side === 'local' ? localNotes : remoteNotes;
+    const entriesMap = side === 'local' ? validLocalEntries : validRemoteEntries;
+    const rootDir = side === 'local' ? nbRoot : targetDir;
+    const actualRel = side === 'local' ? relPath : (remotePathMap[relPath] || relPath);
+    const entry = entriesMap.get(relPath) || null;
+    const full = rootDir && actualRel ? posixJoin(trimTrailingSlash(rootDir), actualRel) : '';
+
+    if (Object.hasOwn(eagerMap, relPath)) {
+      const h = sha256Text(eagerMap[relPath], rpc);
+      hashMap[relPath] = h;
+      return h;
+    }
+
+    const trustedExpected = (Object.hasOwn(baseMap, relPath) ? baseMap[relPath] : '') || knownValidHash || '';
+    if (trustedExpected && full && entry) {
+      try {
+        const fhash = sha256File(full, rpc);
+        if (fhash && fhash === trustedExpected) {
+          hashMap[relPath] = fhash;
+          return fhash;
+        }
+      } catch (exc) {
+        if (isNotFoundError(exc)) throw new Error('Note changed while opening');
+      }
+    }
+
+    const txt = side === 'local' ? readSingleLocal(relPath) : readSingleRemote(relPath);
+    const h = sha256Text(txt, rpc);
+    hashMap[relPath] = h;
+    return { hash: h, text: txt };
+  };
+
+  const resolveHashValue = (relPath, side, knownValidHash = '') => {
+    const res = hashSingleNote({ relPath, side, knownValidHash });
+    return typeof res === 'string' ? { hash: res, text: undefined } : res;
+  };
 
   let checkLocalNote = null;
   let checkRemoteNote = null;
@@ -2139,44 +2555,71 @@ export function computeThreeWaySyncPlan({
         const firstVal = Object.values(foundMap)[0];
         return firstVal !== undefined ? firstVal : null;
       };
+    } else if (lazyMode) {
+      checkLocalNote = (cand) => (localKeysSet.has(cand) ? readSingleLocal(cand) : undefined);
+      checkRemoteNote = (cand) => (remoteKeysSet.has(cand) ? readSingleRemote(cand) : undefined);
     }
 
-    const allPaths = [...new Set([...Object.keys(localNotes), ...Object.keys(remoteNotes)])].sort();
+    const allPaths = [...new Set([...localKeysSet, ...remoteKeysSet])].sort();
     for (const relPath of allPaths) {
       if (skips.has(relPath)) continue;
-      const inLocal = Object.hasOwn(localNotes, relPath);
-      const inRemote = Object.hasOwn(remoteNotes, relPath);
+      const inLocal = localKeysSet.has(relPath);
+      const inRemote = remoteKeysSet.has(relPath);
       if (inLocal && !inRemote) {
-        toPushNew.push(relPath);
+        skips.run(relPath, () => {
+          resolveHashValue(relPath, 'local');
+          toPushNew.push(relPath);
+        });
       } else if (inRemote && !inLocal) {
-        toPullNew.push(relPath);
+        skips.run(relPath, () => {
+          resolveHashValue(relPath, 'remote');
+          toPullNew.push(relPath);
+        });
       } else {
-        const [action] = resolveConflictPair(
-          rpc,
-          relPath,
-          localNotes[relPath],
-          remoteNotes[relPath],
-          baseMap[relPath],
-          policy
-        );
-        if (action === 'push') {
-          toPushOverwrite.push(relPath);
-        } else if (action === 'pull') {
-          toPullOverwrite.push(relPath);
-        } else if (action === 'keep_both') {
-          const conflictRel = makeUniqueConflictPath(relPath, remoteNotes[relPath], {
-            existingLocal: localNotes,
-            existingRemote: remoteNotes,
-            reserved: reservedConflictPaths,
-            checkLocal: checkLocalNote,
-            checkRemote: checkRemoteNote,
-            checkPath: skips.check,
-            callHost: rpc,
-          });
-          conflicts.push([relPath, conflictRel, remoteNotes[relPath]]);
-        } else {
-          synced.push(relPath);
-        }
+        skips.run(relPath, () => {
+          const lInfo = resolveHashValue(relPath, 'local');
+          const rInfo = resolveHashValue(relPath, 'remote', lInfo.hash);
+          const lhash = lInfo.hash;
+          const rhash = rInfo.hash;
+          const baseHash = baseMap[relPath];
+          let action = 'skip';
+          if (lhash !== rhash) {
+            if (baseHash && baseHash === lhash) action = 'pull';
+            else if (baseHash && baseHash === rhash) action = 'push';
+            else if (policy === 'local_first') action = 'push';
+            else if (policy === 'remote_first') action = 'pull';
+            else action = 'keep_both';
+          }
+          if (action === 'push') {
+            toPushOverwrite.push(relPath);
+          } else if (action === 'pull') {
+            toPullOverwrite.push(relPath);
+          } else if (action === 'keep_both') {
+            const rtext = rInfo.text !== undefined ? rInfo.text : readSingleRemote(relPath);
+            const conflictRel = makeUniqueConflictPath(relPath, rtext, {
+              existingLocal: localNotes,
+              existingRemote: remoteNotes,
+              reserved: reservedConflictPaths,
+              checkLocal: checkLocalNote,
+              checkRemote: checkRemoteNote,
+              checkPath: skips.check,
+              callHost: rpc,
+            });
+            conflicts.push([relPath, conflictRel, rtext]);
+          } else {
+            synced.push(relPath);
+          }
+        });
+      }
+      if (skips.has(relPath)) {
+        localKeysSet.delete(relPath);
+        remoteKeysSet.delete(relPath);
+        validLocalEntries.delete(relPath);
+        validRemoteEntries.delete(relPath);
+        delete localNotes[relPath];
+        delete remoteNotes[relPath];
+        delete localHashes[relPath];
+        delete remoteHashes[relPath];
       }
     }
   }
@@ -2187,10 +2630,10 @@ export function computeThreeWaySyncPlan({
   const deletionHeld = new Set();
 
   if (inspected && !errText && !isFirstSync) {
-    const localDirOk = Boolean(nbRoot && fsStat(rpc, trimTrailingSlash(nbRoot)).is_dir);
-    const remoteDirOk = Boolean(targetDir && fsStat(rpc, trimTrailingSlash(targetDir)).is_dir);
+    const localDirOk = Boolean(localSnapshot) || Boolean(nbRoot && fsStat(rpc, trimTrailingSlash(nbRoot)).is_dir);
+    const remoteDirOk = Boolean(remoteSnapshot) || Boolean(targetDir && fsStat(rpc, trimTrailingSlash(targetDir)).is_dir);
     for (const relPath of [...toPullNew]) {
-      const rhash = sha256Text(remoteNotes[relPath], rpc);
+      const rhash = remoteHashes[relPath] || sha256Text(readSingleRemote(relPath), rpc);
       const bhash = baseMap[relPath];
       let matchedDelHash = null;
       if (bhash !== undefined) {
@@ -2204,7 +2647,7 @@ export function computeThreeWaySyncPlan({
         }
       }
       if (matchedDelHash === null) continue;
-      if (isCloudPlaceholder(rpc, nbRoot, relPath)) {
+      if (snapshotHasCloudPlaceholder(rpc, localSnapshot, nbRoot, relPath)) {
         const idx = toPullNew.indexOf(relPath);
         if (idx >= 0) toPullNew.splice(idx, 1);
         deletionHeld.add(relPath);
@@ -2220,19 +2663,20 @@ export function computeThreeWaySyncPlan({
     for (const relPath of [...toPushNew]) {
       const bhash = baseMap[relPath];
       if (bhash === undefined) continue;
-      if (isCloudPlaceholder(rpc, targetDir, remotePathMap[relPath] || relPath)) {
+      const targetRel = remotePathMap[relPath] || relPath;
+      if (snapshotHasCloudPlaceholder(rpc, remoteSnapshot, targetDir, targetRel)) {
         const idx = toPushNew.indexOf(relPath);
         if (idx >= 0) toPushNew.splice(idx, 1);
         deletionHeld.add(relPath);
       } else if (
         onlyPath === null &&
-        Object.keys(remoteNotes).length > 0 &&
+        remoteKeysSet.size > 0 &&
         remoteDirOk &&
-        sha256Text(localNotes[relPath], rpc) === bhash
+        (localHashes[relPath] || sha256Text(readSingleLocal(relPath), rpc)) === bhash
       ) {
         const idx = toPushNew.indexOf(relPath);
         if (idx >= 0) toPushNew.splice(idx, 1);
-        if (!checkMissingSyncPath(targetDir, relPath, (path) => fsStat(rpc, path), skips)) continue;
+        if (!checkMissingSyncPath(targetDir, targetRel, (path) => fsStat(rpc, path), skips)) continue;
         toDeleteLocal.push(relPath);
         deleteExpectedHashes[relPath] = bhash;
       }
@@ -2271,6 +2715,12 @@ export function computeThreeWaySyncPlan({
         scope,
         localNotes,
         remoteNotes,
+        localSnapshot,
+        remoteSnapshot,
+        localNoteEntries: localNoteEntries ? validLocalEntries : null,
+        remoteNoteEntries: remoteNoteEntries ? validRemoteEntries : null,
+        readLocalNote: typeof readLocalNote === 'function' ? readSingleLocal : null,
+        readRemoteNote: typeof readRemoteNote === 'function' ? readSingleRemote : null,
         onlyPath,
         excludedSubdirs,
         trackedRemotePaths: protocol === 'git' ? trackedRemotePaths : null,
@@ -2302,8 +2752,22 @@ export function computeThreeWaySyncPlan({
   if (inspected && !errText && policy === 'keep_both' && assetPlan.asset_conflicts.length > 0) {
     const plannedAssetCopyMap = Object.fromEntries(assetPlan.asset_conflicts);
     for (const relPath of synced) {
-      const rtext = remoteNotes[relPath];
-      if (rtext === undefined) continue;
+      if (skips.has(relPath)) continue;
+      let rtext;
+      if (Object.hasOwn(remoteNotes, relPath)) {
+        rtext = remoteNotes[relPath];
+      } else if (typeof readRemoteNote === 'function') {
+        rtext = skips.run(relPath, () => {
+          const txt = readSingleRemote(relPath);
+          if (txt !== undefined && Object.hasOwn(remoteHashes, relPath) && sha256Text(txt, rpc) !== remoteHashes[relPath]) {
+            const err = new Error(tr(locale, `笔记在扫描后发生变化，已跳过等待重试：${relPath}`, `Note changed after scanning; skipped for retry: ${relPath}`));
+            err.code = 'fs_error';
+            throw err;
+          }
+          return txt;
+        });
+      }
+      if (rtext === undefined || skips.has(relPath)) continue;
       const rewritten = rewriteNoteAssetLinks(relPath, rtext, plannedAssetCopyMap);
       if (rewritten !== rtext) {
         const conflictRel = makeUniqueConflictPath(relPath, rewritten, {
@@ -2320,19 +2784,19 @@ export function computeThreeWaySyncPlan({
     }
   }
 
-  const missingScopeCi = dirIsCaseInsensitive(rpc, nbRoot);
+  const missingScopeCi = dirIsCaseInsensitive(rpc, nbRoot, [...localKeysSet]);
   let remoteMissing = [];
   let localMissing = [];
   if (inspected) {
     if (onlyPath === null || onlyPath === undefined) {
       for (const p of Object.keys(baseMap)) {
         if (!isSafeRelMd(p) || !matchesScope(p, scope, { caseInsensitive: missingScopeCi })) continue;
-        if (Object.hasOwn(localNotes, p) && !Object.hasOwn(remoteNotes, p)) remoteMissing.push(p);
-        if (Object.hasOwn(remoteNotes, p) && !Object.hasOwn(localNotes, p)) localMissing.push(p);
+        if (localKeysSet.has(p) && !remoteKeysSet.has(p)) remoteMissing.push(p);
+        if (remoteKeysSet.has(p) && !localKeysSet.has(p)) localMissing.push(p);
       }
     } else if (Object.hasOwn(baseMap, onlyPath)) {
-      if (Object.hasOwn(localNotes, onlyPath) && !Object.hasOwn(remoteNotes, onlyPath)) remoteMissing.push(onlyPath);
-      if (Object.hasOwn(remoteNotes, onlyPath) && !Object.hasOwn(localNotes, onlyPath)) localMissing.push(onlyPath);
+      if (localKeysSet.has(onlyPath) && !remoteKeysSet.has(onlyPath)) remoteMissing.push(onlyPath);
+      if (remoteKeysSet.has(onlyPath) && !localKeysSet.has(onlyPath)) localMissing.push(onlyPath);
     }
   }
 
@@ -2348,11 +2812,11 @@ export function computeThreeWaySyncPlan({
     }
   }
 
-  const localHashes = Object.fromEntries(
-    Object.keys(localNotes).sort().map((p) => [p, sha256Text(localNotes[p], rpc)])
+  const sortedLocalHashes = Object.fromEntries(
+    Object.keys(localHashes).sort().map((p) => [p, localHashes[p]])
   );
-  const remoteHashes = Object.fromEntries(
-    Object.keys(remoteNotes).sort().map((p) => [p, sha256Text(remoteNotes[p], rpc)])
+  const sortedRemoteHashes = Object.fromEntries(
+    Object.keys(remoteHashes).sort().map((p) => [p, remoteHashes[p]])
   );
   const localAssetHashes = Object.fromEntries(Object.entries(assetPlan.local_asset_hashes).sort());
   const remoteAssetHashes = Object.fromEntries(Object.entries(assetPlan.remote_asset_hashes).sort());
@@ -2361,8 +2825,8 @@ export function computeThreeWaySyncPlan({
       .sort()
       .filter(
         (p) =>
-          Object.hasOwn(localNotes, p) ||
-          Object.hasOwn(remoteNotes, p) ||
+          localKeysSet.has(p) ||
+          remoteKeysSet.has(p) ||
           (p.startsWith('asset:') &&
             (Object.hasOwn(localAssetHashes, p.slice(6)) || Object.hasOwn(remoteAssetHashes, p.slice(6))))
       )
@@ -2394,14 +2858,17 @@ export function computeThreeWaySyncPlan({
     delete_local: toDeleteLocal,
     assets_delete_remote: assetPlan.assets_to_delete_remote,
     assets_delete_local: assetPlan.assets_to_delete_local,
-    local_hashes: localHashes,
-    remote_hashes: remoteHashes,
+    local_hashes: sortedLocalHashes,
+    remote_hashes: sortedRemoteHashes,
     local_asset_hashes: localAssetHashes,
     remote_asset_hashes: remoteAssetHashes,
     base_hashes: baseHashes,
     remote_path_map: remotePathMap,
     remote_asset_path_map: assetPlan.remote_asset_path_map,
   });
+
+  const exposedReadLocal = typeof readLocalNote === 'function' ? readSingleLocal : null;
+  const exposedReadRemote = typeof readRemoteNote === 'function' ? readSingleRemote : null;
 
   return {
     cfg: { ...cfg },
@@ -2424,6 +2891,12 @@ export function computeThreeWaySyncPlan({
     remote_nonempty_on_first_sync: remoteNonemptyOnFirstSync,
     local_notes: localNotes,
     remote_notes: remoteNotes,
+    local_hashes: sortedLocalHashes,
+    remote_hashes: sortedRemoteHashes,
+    local_note_keys: [...localKeysSet],
+    remote_note_keys: [...remoteKeysSet],
+    read_local_note: exposedReadLocal,
+    read_remote_note: exposedReadRemote,
     remote_etags: {},
     remote_path_map: remotePathMap,
     remote_inspected: inspected,
@@ -2453,13 +2926,19 @@ export function planRiskMetrics(callHost, plan) {
   const baseMap = plan.base_map || {};
   const localNotes = plan.local_notes || {};
   const remoteNotes = plan.remote_notes || {};
+  const localHashes = plan.local_hashes || {};
+  const remoteHashes = plan.remote_hashes || {};
+  const getLocalHash = (p) =>
+    localHashes[p] || (Object.hasOwn(localNotes, p) ? sha256Text(localNotes[p], callHost) : '');
+  const getRemoteHash = (p) =>
+    remoteHashes[p] || (Object.hasOwn(remoteNotes, p) ? sha256Text(remoteNotes[p], callHost) : '');
   const nPullNew = plan.to_pull_new.length + (plan.assets_to_pull_new || []).length;
   const nPullTotal = plan.to_pull_overwrite.length + (plan.assets_to_pull_overwrite || []).length;
   const nPullConflict =
-    plan.to_pull_overwrite.filter((p) => baseMap[p] !== sha256Text(localNotes[p], callHost)).length +
+    plan.to_pull_overwrite.filter((p) => baseMap[p] !== getLocalHash(p)).length +
     (plan.assets_to_pull_overwrite || []).filter(([, isConf]) => Boolean(isConf)).length;
   const nPushConflict =
-    plan.to_push_overwrite.filter((p) => baseMap[p] !== sha256Text(remoteNotes[p], callHost)).length +
+    plan.to_push_overwrite.filter((p) => baseMap[p] !== getRemoteHash(p)).length +
     (plan.assets_to_push_overwrite || []).filter(([, isConf]) => Boolean(isConf)).length;
   const nConf =
     plan.conflicts.length +
@@ -2622,11 +3101,17 @@ export function buildPendingConfirm(
     const baseMap = plan.base_map || {};
     const localNotes = plan.local_notes || {};
     const remoteNotes = plan.remote_notes || {};
+    const localHashes = plan.local_hashes || {};
+    const remoteHashes = plan.remote_hashes || {};
+    const getLocalHash = (p) =>
+      localHashes[p] || (Object.hasOwn(localNotes, p) ? sha256Text(localNotes[p], callHost) : '');
+    const getRemoteHash = (p) =>
+      remoteHashes[p] || (Object.hasOwn(remoteNotes, p) ? sha256Text(remoteNotes[p], callHost) : '');
     for (const p of plan.to_pull_overwrite) {
-      addSample(baseMap[p] !== sha256Text(localNotes[p], callHost) ? 'pull_ow' : 'pull_upd', `${prefix}${p}`);
+      addSample(baseMap[p] !== getLocalHash(p) ? 'pull_ow' : 'pull_upd', `${prefix}${p}`);
     }
     for (const p of plan.to_push_overwrite) {
-      addSample(baseMap[p] !== sha256Text(remoteNotes[p], callHost) ? 'push_ow' : 'push_upd', `${prefix}${p}`);
+      addSample(baseMap[p] !== getRemoteHash(p) ? 'push_ow' : 'push_upd', `${prefix}${p}`);
     }
     for (const [p, cr] of plan.conflicts) {
       addSample('conflict', `${prefix}${p}`, cr);
@@ -2698,6 +3183,63 @@ export function applyMirrorOrGitNotebookPlan(
   const restoreBase = () => restoreSkippedBase(baseMap, originalBaseMap, skips);
   const localNotes = plan.local_notes || {};
   const remoteNotes = plan.remote_notes || {};
+  const localHashes = plan.local_hashes || {};
+  const remoteHashes = plan.remote_hashes || {};
+  const localNoteSet = plan.local_note_keys instanceof Set
+    ? plan.local_note_keys
+    : Array.isArray(plan.local_note_keys)
+      ? new Set(plan.local_note_keys)
+      : null;
+  const hasLocalNote = (relPath) =>
+    localNoteSet ? localNoteSet.has(relPath) : Object.hasOwn(localNotes, relPath);
+  const getLocalText = (relPath) => {
+    if (Object.hasOwn(localNotes, relPath)) return localNotes[relPath];
+    if (typeof plan.read_local_note === 'function') {
+      const txt = plan.read_local_note(relPath);
+      if (txt !== null && txt !== undefined) return txt;
+    }
+    return undefined;
+  };
+  const getRemoteText = (relPath) => {
+    if (Object.hasOwn(remoteNotes, relPath)) return remoteNotes[relPath];
+    if (typeof plan.read_remote_note === 'function') {
+      const txt = plan.read_remote_note(relPath);
+      if (txt !== null && txt !== undefined) return txt;
+    }
+    return undefined;
+  };
+  const getLocalHash = (relPath) => {
+    if (Object.hasOwn(localHashes, relPath)) return localHashes[relPath];
+    const txt = getLocalText(relPath);
+    return txt !== undefined ? sha256Text(txt, rpc) : null;
+  };
+  const getRemoteHash = (relPath) => {
+    if (Object.hasOwn(remoteHashes, relPath)) return remoteHashes[relPath];
+    const txt = getRemoteText(relPath);
+    return txt !== undefined ? sha256Text(txt, rpc) : null;
+  };
+  const verifyPlannedText = (relPath, txt, expectedHashes) => {
+    if (txt === undefined || txt === null) {
+      const err = new Error(tr(locale, `笔记在扫描后消失或变化：${relPath}`, `Note changed during sync: ${relPath}`));
+      err.code = 'fs_error';
+      throw err;
+    }
+    const expected = Object.hasOwn(expectedHashes, relPath) ? expectedHashes[relPath] : null;
+    if (expected && sha256Text(txt, rpc) !== expected) {
+      const err = new Error(tr(locale, `笔记在扫描后发生变化，已跳过等待重试：${relPath}`, `Note changed after scanning; skipped for retry: ${relPath}`));
+      err.code = 'fs_error';
+      throw err;
+    }
+    return txt;
+  };
+  const getVerifiedLocalText = (relPath) => {
+    if (Object.hasOwn(localNotes, relPath)) return localNotes[relPath];
+    return verifyPlannedText(relPath, getLocalText(relPath), localHashes);
+  };
+  const getVerifiedRemoteText = (relPath) => {
+    if (Object.hasOwn(remoteNotes, relPath)) return remoteNotes[relPath];
+    return verifyPlannedText(relPath, getRemoteText(relPath), remoteHashes);
+  };
   const localAssets = plan.local_asset_hashes || {};
   const remoteAssets = plan.remote_asset_hashes || {};
   const remotePathMap = plan.remote_path_map || {};
@@ -2943,14 +3485,14 @@ export function applyMirrorOrGitNotebookPlan(
 
     // 2. Sync notes.
     skips.each(plan.synced, (relPath) => {
-      baseMap[relPath] = sha256Text(localNotes[relPath], rpc);
+      baseMap[relPath] = getLocalHash(relPath);
       if (configStore) configStore.clearTombstone(nbKeyVal, relPath);
     });
 
     skips.each(plan.to_push_new, (relPath) => {
-      const text = localNotes[relPath];
+      const text = getVerifiedLocalText(relPath);
       writeRemoteNote(relPath, text, { createOnly: true });
-      baseMap[relPath] = sha256Text(text, rpc);
+      baseMap[relPath] = getLocalHash(relPath) || sha256Text(text, rpc);
       if (configStore) configStore.clearTombstone(nbKeyVal, relPath);
       pushed += 1;
       appendLog(tr(locale, `推送 ${prefix}${relPath}`, `Push ${prefix}${relPath}`), '成功', {
@@ -2963,11 +3505,11 @@ export function applyMirrorOrGitNotebookPlan(
     });
 
     skips.each(plan.to_push_overwrite, (relPath) => {
-      const text = localNotes[relPath];
-      const remoteHash = sha256Text(remoteNotes[relPath], rpc);
+      const text = getVerifiedLocalText(relPath);
+      const remoteHash = getRemoteHash(relPath);
       const isConflict = baseMap[relPath] !== remoteHash;
       writeRemoteNote(relPath, text, { expectedHash: remoteHash });
-      baseMap[relPath] = sha256Text(text, rpc);
+      baseMap[relPath] = getLocalHash(relPath) || sha256Text(text, rpc);
       if (configStore) configStore.clearTombstone(nbKeyVal, relPath);
       pushed += 1;
       appendLog(
@@ -2988,8 +3530,8 @@ export function applyMirrorOrGitNotebookPlan(
     });
 
     skips.each(plan.to_pull_new, (relPath) => {
-      const origText = remoteNotes[relPath];
-      const origHash = sha256Text(origText, rpc);
+      const origText = getVerifiedRemoteText(relPath);
+      const origHash = getRemoteHash(relPath) || sha256Text(origText, rpc);
       if (!plan.is_first_sync && configStore && configStore.lookupTombstoneHash(nbKeyVal, relPath) === origHash) {
         stepProgress();
         return;
@@ -2999,7 +3541,7 @@ export function applyMirrorOrGitNotebookPlan(
       if (text !== origText) {
         writeRemoteNote(relPath, text, { expectedHash: origHash });
       }
-      baseMap[relPath] = sha256Text(text, rpc);
+      baseMap[relPath] = text === origText ? origHash : sha256Text(text, rpc);
       if (configStore) configStore.clearTombstone(nbKeyVal, relPath);
       pulled += 1;
       appendLog(tr(locale, `拉取 ${prefix}${relPath}`, `Pull ${prefix}${relPath}`), '成功', {
@@ -3012,15 +3554,16 @@ export function applyMirrorOrGitNotebookPlan(
     });
 
     skips.each(plan.to_pull_overwrite, (relPath) => {
-      const origText = remoteNotes[relPath];
+      const origText = getVerifiedRemoteText(relPath);
+      const origHash = getRemoteHash(relPath) || sha256Text(origText, rpc);
       const text = rewriteNoteAssetLinks(relPath, origText, assetCopyMap);
-      const localHash = sha256Text(localNotes[relPath], rpc);
+      const localHash = getLocalHash(relPath);
       const isConflict = baseMap[relPath] !== localHash;
       localAdapter.writeNote(relPath, text, { nbRoot, expectedRevision: localHash });
       if (text !== origText) {
-        writeRemoteNote(relPath, text, { expectedHash: sha256Text(origText, rpc) });
+        writeRemoteNote(relPath, text, { expectedHash: origHash });
       }
-      baseMap[relPath] = sha256Text(text, rpc);
+      baseMap[relPath] = text === origText ? origHash : sha256Text(text, rpc);
       if (configStore) configStore.clearTombstone(nbKeyVal, relPath);
       pulled += 1;
       appendLog(
@@ -3042,12 +3585,13 @@ export function applyMirrorOrGitNotebookPlan(
 
     const conflictPaths = ([relPath, conflictRel]) => [relPath, conflictRel];
     skips.each(plan.conflicts, ([relPath, conflictRel, remoteText]) => {
-      const localText = localNotes[relPath];
+      verifyPlannedText(relPath, remoteText, remoteHashes);
+      const localText = getVerifiedLocalText(relPath);
       const savedConflictText = rewriteNoteAssetLinks(conflictRel, remoteText, assetCopyMap);
       localAdapter.writeNote(conflictRel, savedConflictText, { nbRoot });
       writeRemoteNote(conflictRel, savedConflictText, { createOnly: true });
-      writeRemoteNote(relPath, localText, { expectedHash: sha256Text(remoteText, rpc) });
-      baseMap[relPath] = sha256Text(localText, rpc);
+      writeRemoteNote(relPath, localText, { expectedHash: getRemoteHash(relPath) || sha256Text(remoteText, rpc) });
+      baseMap[relPath] = getLocalHash(relPath) || sha256Text(localText, rpc);
       baseMap[conflictRel] = sha256Text(savedConflictText, rpc);
       if (configStore) {
         configStore.clearTombstone(nbKeyVal, relPath);
@@ -3064,6 +3608,7 @@ export function applyMirrorOrGitNotebookPlan(
     }, conflictPaths);
 
     skips.each(plan.asset_view_copies, ([relPath, conflictRel, remoteText]) => {
+      verifyPlannedText(relPath, remoteText, remoteHashes);
       const savedConflictText = rewriteNoteAssetLinks(conflictRel, remoteText, assetCopyMap);
       if (savedConflictText === remoteText) {
         stepProgress();
@@ -3085,7 +3630,11 @@ export function applyMirrorOrGitNotebookPlan(
 
     // 3. Complete deferred remote original-asset overwrites.
     skips.each(deferredAssetOverwrites, (rel) => {
-      writeRemoteAsset(rel, readLocalAsset(rel), localAssets[rel], { expectedHash: remoteAssets[rel] });
+      writeRemoteAsset(rel, null, localAssets[rel], {
+        expectedHash: remoteAssets[rel],
+        copyFromPath: localAssetPath(rel),
+        readFallback: () => readLocalAsset(rel),
+      });
       baseMap[`asset:${rel}`] = localAssets[rel];
     });
 
@@ -3110,30 +3659,39 @@ export function applyMirrorOrGitNotebookPlan(
       let errText = '';
       try {
         if (side === 'remote') {
-          const matchesFn = isAsset
-            ? (raw) => sha256Bytes(raw, rpc) === expect
-            : (raw) => sha256Text(decodeNoteBytes(raw, rel), rpc) === expect;
           const targetRel = (isAsset ? remoteAssetPathMap : remotePathMap)[rel] || rel;
           verifyTarget();
-          outcome = deleteMirrorEntry(rpc, targetDir, targetRel, matchesFn, {
-            excludedSubdirs,
-            locale,
-            dataDir,
-            nowMsFn,
-            cfg,
-            expectedAssetHash: isAsset ? expect : null,
-          });
-          if (outcome === 'deleted' && protocol === 'git') {
-            const subTrim = subdir.replace(/^\/+|\/+$/g, '');
-            const gitRel = subTrim ? `${subTrim}/${targetRel}` : targetRel;
-            deletedGitPaths.push(gitRel);
-            if (typeof afterRemoteDelete === 'function') afterRemoteDelete(gitRel);
+          if (!isConfirmedAbsentOnRoot(rpc, nbRoot, rel)) {
+            outcome = 'changed';
+          } else {
+            const matchesFn = isAsset
+              ? (raw) => sha256Bytes(raw, rpc) === expect
+              : (raw) => sha256Text(decodeNoteBytes(raw, rel), rpc) === expect;
+            outcome = deleteMirrorEntry(rpc, targetDir, targetRel, matchesFn, {
+              excludedSubdirs,
+              locale,
+              dataDir,
+              nowMsFn,
+              cfg,
+              expectedAssetHash: isAsset ? expect : null,
+            });
+            if (outcome === 'deleted' && protocol === 'git') {
+              const subTrim = subdir.replace(/^\/+|\/+$/g, '');
+              const gitRel = subTrim ? `${subTrim}/${targetRel}` : targetRel;
+              deletedGitPaths.push(gitRel);
+              if (typeof afterRemoteDelete === 'function') afterRemoteDelete(gitRel);
+            }
           }
         } else {
-          const revision = isAsset
-            ? localAssets[rel] || expect || ''
-            : (Object.hasOwn(localNotes, rel) ? sha256Text(localNotes[rel], rpc) : expect || '');
-          outcome = localAdapter.trashFile(rel, revision, { nbRoot });
+          const targetRel = (isAsset ? remoteAssetPathMap : remotePathMap)[rel] || rel;
+          if (!isConfirmedAbsentOnRoot(rpc, targetDir, targetRel)) {
+            outcome = 'changed';
+          } else {
+            const revision = isAsset
+              ? localAssets[rel] || expect || ''
+              : (getLocalHash(rel) || expect || '');
+            outcome = localAdapter.trashFile(rel, revision, { nbRoot });
+          }
         }
       } catch (exc) {
         if (['file_limit', 'fs_error', 'quota_full'].includes(classifySyncError(exc))) throw exc;
@@ -3210,7 +3768,7 @@ export function applyMirrorOrGitNotebookPlan(
   }
 
   for (const [lp, rp] of Object.entries(remotePathMap)) {
-    if (rp !== lp && !skips.has(lp) && !skips.has(rp) && Object.hasOwn(baseMap, lp) && !Object.hasOwn(localNotes, rp)) {
+    if (rp !== lp && !skips.has(lp) && !skips.has(rp) && Object.hasOwn(baseMap, lp) && !hasLocalNote(rp)) {
       delete baseMap[rp];
     }
   }
@@ -3235,10 +3793,18 @@ export function applyMirrorOrGitNotebookPlan(
     const subPrefix = subTrim ? `${subTrim}/` : '';
     for (const relPath of plan.synced || []) {
       if (skips.has(relPath)) continue;
-      const repoRel = `${subPrefix}${remotePathMap[relPath] || relPath}`;
+      const remoteRel = remotePathMap[relPath] || relPath;
+      const repoRel = `${subPrefix}${remoteRel}`;
       syncedRepoPaths.push(repoRel);
-      if (!Object.hasOwn(plannedGitBlobs, repoRel) && Object.hasOwn(localNotes, relPath)) {
-        plannedGitBlobs[repoRel] = textToBytes(localNotes[relPath]);
+      if (!Object.hasOwn(plannedGitBlobs, repoRel)) {
+        const syncedHash = getLocalHash(relPath) || getRemoteHash(relPath) || '';
+        if (targetDir && syncedHash) {
+          plannedGitBlobs[repoRel] = { file_path: posixJoin(targetDir, remoteRel), hash: syncedHash };
+        } else if (Object.hasOwn(localNotes, relPath)) {
+          plannedGitBlobs[repoRel] = textToBytes(localNotes[relPath]);
+        } else if (syncedHash && nbRoot) {
+          plannedGitBlobs[repoRel] = { file_path: posixJoin(nbRoot, relPath), hash: syncedHash };
+        }
       }
     }
     for (const relPath of plan.assets_synced || []) {
@@ -3289,6 +3855,8 @@ export function createLocalMirrorSyncEngine({
     createHostLocalAdapter({
       callHost,
       supportsMultiNotebook: configStore ? configStore.state.supportsMultiNotebook : true,
+      configStore,
+      nowMsFn,
     });
   const getLocale = () => (configStore ? configStore.state.locale : locale);
   const getDownloadsDir = () => (configStore ? configStore.state.downloadsDir : '');
@@ -3344,18 +3912,6 @@ export function createLocalMirrorSyncEngine({
       : notebookLabel(effectiveNbRoot, loc, '', homeDir);
     const scope = cfg.sync_scope || 'all';
     const skips = createSyncSkips(cfg, loc, skipRound);
-    const localNotes = local.readNotes({ onlyPath, scope, nbRoot: effectiveNbRoot, cfg, locale: loc, skips });
-    for (const relPath of Object.keys(localNotes)) {
-      if (inSyncSubdir(relPath, excludedSubdirs)) {
-        throw new Error(
-          tr(
-            loc,
-            `笔记路径与其他笔记本的同步目录重叠：${relPath}`,
-            `Note path overlaps with another notebook's sync folder: ${relPath}`
-          )
-        );
-      }
-    }
 
     const baseDir = resolveMirrorDir(cfg, getDownloadsDir(), homeDir);
     const targetDir = subdir ? posixJoin(baseDir, subdir) : baseDir;
@@ -3365,21 +3921,92 @@ export function createLocalMirrorSyncEngine({
       : `nb:${nbKeyVal}|local_mirror:${metaTarget}`;
     const legacyKey = !subdir ? `local_mirror:${baseDir}` : null;
 
+    const canLazyLocal = onlyPath === null && typeof local.readNote === 'function';
+    let localNotes = {};
     let remoteNotes = {};
+    let localSnapshot = null;
+    let remoteSnapshot = null;
+    let localNoteEntries = null;
+    let remoteNoteEntries = null;
+    let readLocalNote = null;
+    let readRemoteNote = null;
     let remoteInspected = true;
     let remoteError = null;
-    try {
-      remoteNotes = scanMirrorFiles(rpc, targetDir, {
-        onlyPath,
-        scope,
-        excludedSubdirs,
-        locale: loc,
-        cfg,
-        skips,
-      });
-    } catch (exc) {
-      remoteInspected = false;
-      remoteError = errorDetail(loc, exc);
+
+    if (onlyPath === null) {
+      // Scan remote mirror directory first so out-of-scope errors fail fast before scanning the notebook.
+      try {
+        remoteSnapshot = scanDirSnapshot(rpc, targetDir, { excludedSubdirs, locale: loc });
+        remoteNoteEntries = new Map();
+        if (remoteSnapshot) {
+          const mirrorCi = scope && scope !== 'all' ? dirIsCaseInsensitive(rpc, remoteSnapshot.cleanRoot) : false;
+          const mirrorNorm = scope && scope !== 'all' ? dirIsNormalizationInsensitive(rpc, remoteSnapshot.cleanRoot) : false;
+          for (const [rel, entry] of remoteSnapshot.noteEntries.entries()) {
+            if (!scope || scope === 'all' || matchesScope(rel, scope, { caseInsensitive: mirrorCi, normalize: mirrorNorm })) {
+              remoteNoteEntries.set(rel, entry);
+            }
+          }
+          readRemoteNote = (relPath, entry = null) => fsReadNoteText(rpc, posixJoin(remoteSnapshot.cleanRoot, relPath), relPath, entry);
+        }
+      } catch (exc) {
+        remoteInspected = false;
+        remoteError = errorDetail(loc, exc);
+      }
+    } else {
+      try {
+        remoteNotes = scanMirrorFiles(rpc, targetDir, {
+          onlyPath,
+          scope,
+          excludedSubdirs,
+          locale: loc,
+          cfg,
+          skips,
+        });
+      } catch (exc) {
+        remoteInspected = false;
+        remoteError = errorDetail(loc, exc);
+      }
+    }
+
+    if (remoteInspected && !remoteError) {
+      if (canLazyLocal) {
+        try {
+          localSnapshot = scanDirSnapshot(rpc, effectiveNbRoot, { excludedSubdirs: new Set(), locale: loc });
+        } catch (exc) {
+          if (!String(exc?.message || exc).includes('unknown host method')) throw exc;
+        }
+      }
+      if (localSnapshot) {
+        localNoteEntries = new Map();
+        for (const [relPath, entry] of localSnapshot.noteEntries.entries()) {
+          if (inSyncSubdir(relPath, excludedSubdirs)) {
+            throw new Error(
+              tr(
+                loc,
+                `笔记路径与其他笔记本的同步目录重叠：${relPath}`,
+                `Note path overlaps with another notebook's sync folder: ${relPath}`
+              )
+            );
+          }
+          if (!scope || scope === 'all' || matchesScope(relPath, scope)) {
+            localNoteEntries.set(relPath, entry);
+          }
+        }
+        readLocalNote = (relPath, entry = null) => local.readNote(relPath, { nbRoot: effectiveNbRoot, cfg, locale: loc, skips, entry });
+      } else {
+        localNotes = local.readNotes({ onlyPath, scope, nbRoot: effectiveNbRoot, cfg, locale: loc, skips });
+        for (const relPath of Object.keys(localNotes)) {
+          if (inSyncSubdir(relPath, excludedSubdirs)) {
+            throw new Error(
+              tr(
+                loc,
+                `笔记路径与其他笔记本的同步目录重叠：${relPath}`,
+                `Note path overlaps with another notebook's sync folder: ${relPath}`
+              )
+            );
+          }
+        }
+      }
     }
 
     return computeThreeWaySyncPlan({
@@ -3399,6 +4026,12 @@ export function createLocalMirrorSyncEngine({
       legacyKey,
       localNotes,
       remoteNotes,
+      localSnapshot,
+      remoteSnapshot,
+      localNoteEntries,
+      remoteNoteEntries,
+      readLocalNote,
+      readRemoteNote,
       remoteInspected,
       remoteError,
       onlyPath,

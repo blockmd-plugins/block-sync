@@ -32,6 +32,7 @@ import {
   sanitizeUrlForDisplay,
   sha256Text,
   classifySyncError,
+  isDeterministicErrorClass,
 } from './utils.js';
 import {
   VALID_PROTOCOLS,
@@ -88,6 +89,23 @@ const LEGACY_SYNC_INTERVAL_EVENT = 'plugin.sync_interval';
 const BG_ERROR_KEY = 'sync_state';
 const AUTO_SYNC_JOB_ID = 'auto-sync';
 const LEGACY_IGNORED_DIRS = ['.block-sync-replaced', '.block-sync-recovery'];
+const FOCUS_COOLDOWN_MS = 120 * 1000;
+const WAKE_COOLDOWN_MS = 30 * 1000;
+const NETWORK_TRIGGER_COOLDOWN_MS = 60 * 1000;
+const GRANTS_CHECK_COOLDOWN_MS = 30 * 1000;
+const NETWORK_BACKOFF_STEPS_MS = [120 * 1000, 300 * 1000, 900 * 1000, 1800 * 1000, 3600 * 1000];
+const SOFT_ERROR_BACKOFF_STEPS_MS = [300 * 1000, 1800 * 1000];
+const AUTO_PROBE_INTERVAL_MS = 60 * 60 * 1000;
+
+function isAutoProbeError(failClass, detail = '') {
+  const fc = String(failClass || '');
+  if (fc === 'fs_error' || fc === 'other' || fc === 'quota_full') return true;
+  if (fc === 'config') {
+    const low = String(detail || '').toLowerCase();
+    return /index\.lock|git is in progress|尚未结束|target lock busy|stale temporary/.test(low);
+  }
+  return false;
+}
 
 class SyncStateError extends Error {
   constructor(message, notified = false) {
@@ -196,10 +214,221 @@ function createSyncController() {
   let nextSystemNotebook = '';
   const intervalSyncedAt = new Map();
   const protocolNextAllowedMs = new Map();
+  const lastSyncAttemptMs = new Map();
+  const pendingDirty = new Map();
   const legacyNoticeReceipts = new Map();
+  let lastKnownOnline = null;
+  let lastGrantsCheckMs = 0;
+  let cachedGrantsSig = null;
 
   const getLocale = () => (configStore ? configStore.state.locale : locale);
   const t = (zh, en) => tr(getLocale(), zh, en);
+
+  const dirtyKey = (scopeKey, proto) => `${scopeKey}:${proto}`;
+  const markPendingDirty = (scopeKey, proto, onlyPath = null, onlyNbRoot = null) => {
+    if (!scopeKey || !proto) return;
+    const k = dirtyKey(scopeKey, proto);
+    const prev = pendingDirty.get(k);
+    if (!prev) {
+      pendingDirty.set(k, { onlyPath: onlyPath ?? null, onlyNbRoot: onlyNbRoot ?? null });
+    } else if (prev.onlyPath === null || prev.onlyPath !== (onlyPath ?? null) || prev.onlyNbRoot !== (onlyNbRoot ?? null)) {
+      pendingDirty.set(k, {
+        onlyPath: null,
+        onlyNbRoot: prev.onlyNbRoot === (onlyNbRoot ?? null) ? (onlyNbRoot ?? null) : null,
+      });
+    }
+  };
+  const clearPendingDirty = (scopeKey, proto) => {
+    if (!proto) return;
+    if (scopeKey) {
+      pendingDirty.delete(dirtyKey(scopeKey, proto));
+    } else {
+      const suffix = `:${proto}`;
+      for (const k of [...pendingDirty.keys()]) {
+        if (k.endsWith(suffix)) pendingDirty.delete(k);
+      }
+    }
+  };
+  const hasPendingDirty = (scopeKey, proto) => Boolean(scopeKey && proto && pendingDirty.has(dirtyKey(scopeKey, proto)));
+  const currentDirtyScopeKey = (nbRootOverride = null) => {
+    if (!configStore) return 'default';
+    const st = configStore.state;
+    if (supportsMultiNotebook && st.storedGlobal && Object.hasOwn(st.storedGlobal, 'selected_notebooks')) {
+      return '__multi__';
+    }
+    return nbRootOverride ? configStore.notebookKey(nbRootOverride) : configStore.resultKey();
+  };
+
+  const getGrantsSignature = (force = false) => {
+    const now = Date.now();
+    if (!force && cachedGrantsSig !== null && now - lastGrantsCheckMs < GRANTS_CHECK_COOLDOWN_MS) {
+      return cachedGrantsSig;
+    }
+    try {
+      const res = callHost('host.fs.list_grants', {});
+      const list = Array.isArray(res?.grants)
+        ? res.grants
+        : Array.isArray(res?.entries)
+          ? res.entries
+          : Array.isArray(res)
+            ? res
+            : [];
+      const items = list.map((g) => (typeof g === 'string' ? g : JSON.stringify(g))).sort();
+      const nbs = Array.isArray(res?.notebooks)
+        ? res.notebooks.map((n) => (typeof n === 'string' ? n : JSON.stringify(n))).sort()
+        : [];
+      const dl = typeof res?.downloads_dir === 'string' ? res.downloads_dir : '';
+      cachedGrantsSig = JSON.stringify({ grants: items, notebooks: nbs, downloads_dir: dl });
+    } catch (_err) {
+      cachedGrantsSig = '';
+    }
+    lastGrantsCheckMs = now;
+    return cachedGrantsSig;
+  };
+
+  const resetProtoBackoffFields = (entryObj) => {
+    if (!entryObj || typeof entryObj !== 'object') return false;
+    const fields = ['bg_paused', 'next_retry_at_ms', 'fail_streak', 'target_sig', 'error_sig', 'grants_sig', 'transient_streak', 'outage_since_ms', 'outage_notified', 'notified_key'];
+    let mutated = false;
+    for (const k of fields) {
+      if (Object.hasOwn(entryObj, k) && entryObj[k]) {
+        mutated = true;
+      }
+      if (k === 'fail_streak' || k === 'next_retry_at_ms' || k === 'transient_streak') {
+        if (Object.hasOwn(entryObj, k)) {
+          delete entryObj[k];
+        }
+      } else if (Object.hasOwn(entryObj, k)) {
+        delete entryObj[k];
+      }
+    }
+    return mutated;
+  };
+
+  const clearProtocolBackoff = (nbKey, proto, { persist = false } = {}) => {
+    if (!proto) return false;
+    const prefix = `:${proto}`;
+    if (nbKey) {
+      const bKey = `${nbKey}:${proto}`;
+      protocolNextAllowedMs.delete(bKey);
+      lastSyncAttemptMs.delete(bKey);
+    } else {
+      for (const k of [...protocolNextAllowedMs.keys()]) {
+        if (k.endsWith(prefix)) protocolNextAllowedMs.delete(k);
+      }
+      for (const k of [...lastSyncAttemptMs.keys()]) {
+        if (k.endsWith(prefix)) lastSyncAttemptMs.delete(k);
+      }
+    }
+    if (!configStore) return false;
+    let mutated = false;
+    const keys = nbKey ? [nbKey] : Object.keys(configStore.state.notebookResults || {});
+    for (const rk of keys) {
+      const entry = configStore.state.notebookResults[rk];
+      if (!entry || typeof entry !== 'object') continue;
+      if (entry.protocols && typeof entry.protocols[proto] === 'object') {
+        if (resetProtoBackoffFields(entry.protocols[proto])) mutated = true;
+      }
+      if (entryMatchesProtocol(entry, proto)) {
+        if (resetProtoBackoffFields(entry)) mutated = true;
+      }
+    }
+    if (persist && mutated) {
+      try {
+        storageSet(callHost, 'notebook_results', configStore.state.notebookResults);
+      } catch (_err) {
+        // Best-effort backoff state persistence.
+      }
+    }
+    return mutated;
+  };
+
+  const getProtoResultEntry = (nbKey, proto) => {
+    if (!configStore || !nbKey) return null;
+    const entry = configStore.state.notebookResults[nbKey];
+    if (!entry || typeof entry !== 'object') return null;
+    if (entry.protocols && typeof entry.protocols[proto] === 'object') {
+      return entry.protocols[proto];
+    }
+    return entryMatchesProtocol(entry, proto) ? entry : null;
+  };
+
+  const shouldSkipBackgroundSync = (nbKey, proto, cfg, bgTrigger, params = null, prevOnline = null) => {
+    const now = Date.now();
+    const key = `${nbKey}:${proto}`;
+    const lastAttempt = lastSyncAttemptMs.get(key) || 0;
+    const protoRes = getProtoResultEntry(nbKey, proto);
+    const curTargetSig = connConfigSignature(cfg, proto, downloadsDir, homeDir);
+    if (protoRes && protoRes.target_sig && protoRes.target_sig !== curTargetSig) {
+      clearProtocolBackoff(nbKey, proto, { persist: true });
+      return false;
+    }
+
+    const isNetworkOnlineEvent = bgTrigger === 'network' && Boolean(params && params.online === true);
+    const isOfflineToOnline = isNetworkOnlineEvent && prevOnline === false;
+    // Host may coalesce a brief offline->online transition into a single online=true event;
+    // always allow an online event to break an active network-failure backoff.
+    const networkRecovered = isNetworkOnlineEvent && Boolean(protoRes && protoRes.fail_class === 'network');
+
+    let autoProbeDue = false;
+    if (protoRes && protoRes.bg_paused) {
+      if (protoRes.fail_class === 'scope') {
+        const curGrantsSig = getGrantsSignature(false);
+        if (curGrantsSig && curGrantsSig !== String(protoRes.grants_sig || '')) {
+          clearProtocolBackoff(nbKey, proto, { persist: true });
+          return false;
+        }
+        return true;
+      }
+      if (isAutoProbeError(protoRes.fail_class, protoRes.error_sig || protoRes.summary)) {
+        const memNext = protocolNextAllowedMs.get(key) || 0;
+        const storedNext = Number(protoRes.next_retry_at_ms || 0) || 0;
+        const probeAt = Math.max(memNext, storedNext);
+        if (probeAt > 0 && now < probeAt) {
+          return true;
+        }
+        autoProbeDue = true;
+      } else {
+        return true;
+      }
+    }
+
+    const memNext = protocolNextAllowedMs.get(key) || 0;
+    const storedNext = Number((protoRes && protoRes.next_retry_at_ms) || 0) || 0;
+    const nextAllowed = Math.max(memNext, storedNext);
+    if (now < nextAllowed && !networkRecovered) {
+      return true;
+    }
+
+    const dirtyCatchup =
+      hasPendingDirty(nbKey, proto) &&
+      (bgTrigger === 'interval' ||
+        bgTrigger === 'focus' ||
+        bgTrigger === 'wake' ||
+        (bgTrigger === 'network' && params?.online !== false));
+    if (dirtyCatchup || isOfflineToOnline || networkRecovered || autoProbeDue) {
+      return false;
+    }
+
+    if (bgTrigger === 'focus' && now - lastAttempt < FOCUS_COOLDOWN_MS) {
+      return true;
+    }
+    if (bgTrigger === 'wake' && now - lastAttempt < WAKE_COOLDOWN_MS) {
+      return true;
+    }
+    if (bgTrigger === 'network' && now - lastAttempt < NETWORK_TRIGGER_COOLDOWN_MS) {
+      return true;
+    }
+    if (bgTrigger === 'interval') {
+      const lastMs = intervalSyncedAt.get(key);
+      const intervalSec = (Number.parseInt(cfg.sync_interval || '5', 10) || 5) * 60;
+      if (lastMs !== undefined && now - lastMs < intervalSec * 1000 - 5000) {
+        return true;
+      }
+    }
+
+    return false;
+  };
 
   const rebuildEngines = () => {
     const loc = getLocale();
@@ -503,10 +732,29 @@ function createSyncController() {
   };
 
   const saveConfig = (nextCfg = null, { forget = null, clearPending = false } = {}) => {
+    const prevCfg = { ...configStore.state.config };
     const res = configStore.saveConfig(nextCfg, { forget, clearPending });
+    const afterCfg = configStore.state.config;
+    const clearProtos = clearPending === true
+      ? new Set(VALID_PROTOCOLS)
+      : new Set([
+          ...(clearPending ? [...clearPending] : []),
+          ...changedProtocols(prevCfg, afterCfg),
+        ]);
+    let backoffCleared = false;
+    for (const proto of clearProtos) {
+      if (clearProtocolBackoff(null, proto)) backoffCleared = true;
+    }
+    if (backoffCleared) {
+      try {
+        storageSet(callHost, 'notebook_results', configStore.state.notebookResults);
+      } catch (_err) {
+        // Best-effort backoff cleanup persistence.
+      }
+    }
     if (!configStore.state.supportsSystem && clearPending) {
-      const clearProtos = clearPending === true ? VALID_PROTOCOLS : [...clearPending];
-      for (const proto of clearProtos) {
+      const targetProtos = clearPending === true ? VALID_PROTOCOLS : [...clearPending];
+      for (const proto of targetProtos) {
         configStore.clearPendingConfirm(proto);
       }
       storageSet(callHost, 'pending_confirms', configStore.state.pendingConfirms);
@@ -808,12 +1056,20 @@ function createSyncController() {
         : null;
 
     const prevStreak = Number.parseInt((prevProto && prevProto.transient_streak) || 0, 10) || 0;
+    const prevFailStreak = Number.parseInt((prevProto && prevProto.fail_streak) || 0, 10) || 0;
+    const prevErrorSig = String((prevProto && prevProto.error_sig) || '');
     const prevOutageNotified = Boolean(prevProto && prevProto.outage_notified);
     const prevNotifiedKey = String((prevProto && prevProto.notified_key) || '');
     const prevOutageSince = Number.parseInt((prevProto && prevProto.outage_since_ms) || 0, 10) || 0;
 
     let failClass = String((prevProto && prevProto.fail_class) || '');
     let transientStreak = prevStreak;
+    let failStreak = 0;
+    let nextRetryAtMs = 0;
+    let bgPaused = false;
+    let targetSig = '';
+    let errorSig = '';
+    let grantsSig = '';
     let outageNotified = prevOutageNotified;
     let notifiedKey = prevNotifiedKey;
     let outageSinceMs = prevOutageSince;
@@ -842,6 +1098,12 @@ function createSyncController() {
       protoLastSuccess = { ...successSnap };
       failClass = '';
       transientStreak = 0;
+      failStreak = 0;
+      nextRetryAtMs = 0;
+      bgPaused = false;
+      targetSig = '';
+      errorSig = '';
+      grantsSig = '';
       outageNotified = false;
       notifiedKey = '';
       outageSinceMs = 0;
@@ -867,15 +1129,22 @@ function createSyncController() {
       lastSuccess = prevSuccess;
       protoLastSuccess = prevProtoSuccess;
       failClass = classifySyncError(summaryStr);
+      targetSig = connConfigSignature(configStore.state.config, proto, downloadsDir, homeDir);
+      errorSig = `${failClass}:${firstLineSummary(summaryStr, 120)}`;
+      failStreak = prevErrorSig === errorSig ? prevFailStreak + 1 : 1;
+
       if (failClass === 'network') {
         transientStreak = prevStreak + 1;
         outageSinceMs = prevOutageSince > 0 ? prevOutageSince : nowMs;
         const offlineMs = calcOfflineMs(protoLastSuccess, outageSinceMs, nowMs, nowStr);
         const offlineMin = Math.max(1, Math.round(offlineMs / 60000));
         const intervalMin = Number.parseInt(configStore.state.config.sync_interval || '5', 10) || 5;
-        const baseIntervalMs = Math.max(60000, intervalMin * 60 * 1000);
-        const backoffMs = Math.min(baseIntervalMs * (2 ** Math.max(0, transientStreak - 1)), 60 * 60 * 1000);
-        protocolNextAllowedMs.set(backoffKey, nowMs + backoffMs);
+        const baseIntervalMs = intervalMin >= 15 ? intervalMin * 60 * 1000 : 0;
+        const stepIdx = Math.min(Math.max(0, transientStreak - 1), NETWORK_BACKOFF_STEPS_MS.length - 1);
+        const backoffMs = Math.min(60 * 60 * 1000, Math.max(NETWORK_BACKOFF_STEPS_MS[stepIdx], baseIntervalMs));
+        nextRetryAtMs = nowMs + backoffMs;
+        bgPaused = false;
+        protocolNextAllowedMs.set(backoffKey, nextRetryAtMs);
 
         if (!isBackground) {
           resultNotice = null;
@@ -887,10 +1156,47 @@ function createSyncController() {
         } else {
           resultNotice = null;
         }
+      } else if (isAutoProbeError(failClass, summaryStr)) {
+        transientStreak = 0;
+        outageSinceMs = 0;
+        if (failStreak <= SOFT_ERROR_BACKOFF_STEPS_MS.length) {
+          const backoffMs = SOFT_ERROR_BACKOFF_STEPS_MS[failStreak - 1];
+          nextRetryAtMs = nowMs + backoffMs;
+          bgPaused = false;
+        } else {
+          nextRetryAtMs = nowMs + AUTO_PROBE_INTERVAL_MS;
+          bgPaused = true;
+        }
+        protocolNextAllowedMs.set(backoffKey, nextRetryAtMs);
+        const dedupKey = `${proto}:${failClass}`;
+        if (!isBackground || prevNotifiedKey === dedupKey) {
+          resultNotice = null;
+        } else {
+          notifiedKey = dedupKey;
+          resultNotice = [statusStr, 0, dedupKey, { reason: summaryStr, failClass, protocol: proto }];
+        }
+      } else if (isDeterministicErrorClass(failClass)) {
+        transientStreak = 0;
+        outageSinceMs = 0;
+        nextRetryAtMs = 0;
+        bgPaused = true;
+        protocolNextAllowedMs.delete(backoffKey);
+        if (failClass === 'scope') {
+          grantsSig = getGrantsSignature(true) || '';
+        }
+        const dedupKey = `${proto}:${failClass}`;
+        if (!isBackground || prevNotifiedKey === dedupKey) {
+          resultNotice = null;
+        } else {
+          notifiedKey = dedupKey;
+          resultNotice = [statusStr, 0, dedupKey, { reason: summaryStr, failClass, protocol: proto }];
+        }
       } else {
         transientStreak = 0;
         outageSinceMs = 0;
-        protocolNextAllowedMs.delete(backoffKey);
+        nextRetryAtMs = nowMs + AUTO_PROBE_INTERVAL_MS;
+        bgPaused = true;
+        protocolNextAllowedMs.set(backoffKey, nextRetryAtMs);
         const dedupKey = `${proto}:${failClass}`;
         if (!isBackground || prevNotifiedKey === dedupKey) {
           resultNotice = null;
@@ -922,9 +1228,21 @@ function createSyncController() {
       summary: summaryStr,
       fail_class: failClass,
       transient_streak: transientStreak,
+      fail_streak: failStreak,
+      next_retry_at_ms: nextRetryAtMs,
+      bg_paused: bgPaused,
       outage_notified: outageNotified,
       notified_key: notifiedKey,
     };
+    if (targetSig) {
+      protoEntry.target_sig = targetSig;
+    }
+    if (errorSig) {
+      protoEntry.error_sig = errorSig;
+    }
+    if (failClass === 'scope') {
+      protoEntry.grants_sig = grantsSig;
+    }
     if (outageSinceMs > 0) {
       protoEntry.outage_since_ms = outageSinceMs;
     }
@@ -1164,6 +1482,9 @@ function createSyncController() {
       time: nowHms(),
       locale: getLocale(),
     });
+    if (ok) {
+      clearProtocolBackoff(null, protocol);
+    }
     const pLabel = protocolLabel(getLocale(), protocol);
     logProtocol = protocol;
     appendLog(t(`测试连接 (${pLabel})`, `Test connection (${pLabel})`), ok ? '通过' : '未连通', {
@@ -1439,6 +1760,9 @@ function createSyncController() {
 
     lastSyncOutcome = 'synced';
     lastSyncedNotebooks = (batch.plans || []).map((p) => p.nb_root).filter(Boolean);
+    if (!isBackground && onlyPath === null) {
+      clearPendingDirty(onlyNbRoot ? configStore.notebookKey(onlyNbRoot) : null, proto);
+    }
     saveRuntime({
       onlyPath,
       notebookRoot: onlyNbRoot,
@@ -1606,7 +1930,7 @@ function createSyncController() {
     }
   };
 
-  const syncSystemTarget = (eventName, params, deadlineMs = 0) => {
+  const syncSystemTarget = (eventName, params, deadlineMs = 0, prevOnline = lastKnownOnline) => {
     const skipped = { handled: true, outcome: 'skipped' };
     const cfg = configStore.state.config;
     if (!cfg.auto_sync || configStore.selectedNotebooks(cfg).length === 0) {
@@ -1623,42 +1947,50 @@ function createSyncController() {
     const isIntervalTrigger =
       eventName === LEGACY_SYNC_INTERVAL_EVENT ||
       (eventName === SYNC_INTERVAL_EVENT && (!trigger || trigger === 'interval'));
+    const bgTrigger = isNetworkTrigger
+      ? 'network'
+      : trigger === 'focus' || eventName === 'app.focus'
+        ? 'focus'
+        : eventName === 'system.wake' || trigger === 'wake'
+          ? 'wake'
+          : isIntervalTrigger
+            ? 'interval'
+            : trigger || eventName;
 
     const outcomes = new Set();
     const synced = [];
     const seenNbs = new Set();
     let notified = false;
+    const resultNbKey = configStore.resultKey();
 
     for (const protocol of activeProtocols) {
       if (deadlineMs > 0 && Date.now() >= deadlineMs) break;
+      if (eventName === 'app.focus' && !hasPendingDirty(resultNbKey, protocol)) continue;
       if (configStore.getPendingConfirm(protocol)) continue;
       if (protocolError(cfg, protocol, { ...uiContext(), requireNotebooks: true })) continue;
       const needsNetwork = protocolNeedsNetwork(protocol, cfg);
-      if (isNetworkTrigger && (params.online !== true || !needsNetwork)) continue;
+      if (isNetworkTrigger && (params?.online !== true || !needsNetwork)) continue;
       if (
         (eventName === 'system.wake' || eventName === SYNC_INTERVAL_EVENT || eventName === LEGACY_SYNC_INTERVAL_EVENT) &&
-        params.online === false &&
+        params?.online === false &&
         needsNetwork
       ) {
         continue;
       }
 
-      const intervalKey = `${configStore.resultKey()}:${protocol}`;
-      if (isIntervalTrigger) {
-        const nextAllowed = protocolNextAllowedMs.get(intervalKey) || 0;
-        if (Date.now() < nextAllowed) {
-          continue;
-        }
-        const lastMs = intervalSyncedAt.get(intervalKey);
-        const intervalSec = (Number.parseInt(cfg.sync_interval || '5', 10) || 5) * 60;
-        if (lastMs !== undefined && Date.now() - lastMs < intervalSec * 1000 - 5000) {
-          continue;
-        }
+      if (shouldSkipBackgroundSync(resultNbKey, protocol, cfg, bgTrigger, params, prevOnline)) {
+        continue;
       }
-      intervalSyncedAt.set(intervalKey, Date.now());
+      const nowAttempt = Date.now();
+      const intervalKey = `${resultNbKey}:${protocol}`;
+      lastSyncAttemptMs.set(intervalKey, nowAttempt);
+      intervalSyncedAt.set(intervalKey, nowAttempt);
       try {
         runBackgroundSync({ deadlineMs, protocol });
         outcomes.add(lastSyncOutcome);
+        if (lastSyncOutcome === 'synced') {
+          clearPendingDirty(resultNbKey, protocol);
+        }
         for (const nb of lastSyncedNotebooks) {
           if (!seenNbs.has(nb)) {
             seenNbs.add(nb);
@@ -1689,11 +2021,18 @@ function createSyncController() {
   const syncAfterSystemEvent = (eventName, params) => {
     configStore.refreshKnownNotebooks();
     const st = configStore.state;
+    const prevOnline = lastKnownOnline;
+    const updateOnlineAfter = () => {
+      if (params && typeof params.online === 'boolean') {
+        lastKnownOnline = params.online;
+      }
+    };
     if (
       !supportsMultiNotebook ||
       (st.storedGlobal && Object.hasOwn(st.storedGlobal, 'selected_notebooks'))
     ) {
-      const result = syncSystemTarget(eventName, params);
+      const result = syncSystemTarget(eventName, params, 0, prevOnline);
+      updateOnlineAfter();
       const nbKey = (params && params.notebook_root) || notebookRoot;
       return { ...result, notebook_outcomes: { [nbKey]: result } };
     }
@@ -1702,6 +2041,7 @@ function createSyncController() {
         (k) => k === '__multi__' || k.startsWith('__multi__:')
       )
     ) {
+      updateOnlineAfter();
       return { handled: true, outcome: 'skipped' };
     }
 
@@ -1731,7 +2071,7 @@ function createSyncController() {
         st.notebookRoot = root;
         st.config = { ...saved, selected_notebooks: [root] };
         st.pendingConfirm = configStore.getPendingConfirm();
-        const result = syncSystemTarget(eventName, params, deadlineMs);
+        const result = syncSystemTarget(eventName, params, deadlineMs, prevOnline);
         results[root] = result;
         if (Array.isArray(result.synced_notebooks)) {
           synced.push(...result.synced_notebooks);
@@ -1742,6 +2082,7 @@ function createSyncController() {
       st.config = savedState.config;
       lastStatus = savedState.lastStatus;
       st.pendingConfirm = configStore.getPendingConfirm();
+      updateOnlineAfter();
     }
 
     const outcomes = new Set(Object.values(results).map((r) => r.outcome));
@@ -2256,6 +2597,9 @@ function createSyncController() {
       const connChanged = hasConnectionFieldChanged(prevCfg, nextCfg, proto);
       const changed = changedProtocols(prevCfg, nextCfg);
       saveConfig(nextCfg, { clearPending: changed.size > 0 ? changed : false });
+      if (!isAutosave && !clearingConfigured) {
+        clearProtocolBackoff(null, proto, { persist: true });
+      }
       syncAutoSyncScheduler();
 
       if (isAutosave) {
@@ -2745,7 +3089,14 @@ function createSyncController() {
       retryResultNotices();
     }
 
-    if (eventName === 'app.focus' || eventName === 'plugin.notifications_retry') {
+    if (eventName === 'plugin.notifications_retry') {
+      return { handled: true, outcome: 'skipped' };
+    }
+
+    if (eventName === 'app.focus') {
+      if (pendingDirty.size > 0) {
+        return syncAfterSystemEvent(eventName, { ...(params || {}), trigger: 'focus' });
+      }
       return { handled: true, outcome: 'skipped' };
     }
 
@@ -2808,6 +3159,7 @@ function createSyncController() {
       ) {
         const outcomes = new Set();
         let lastExc = null;
+        const dirtyScopeKey = currentDirtyScopeKey(localDir);
         for (const proto of activeProtocols) {
           if (
             protocolError(configStore.state.config, proto, {
@@ -2821,14 +3173,40 @@ function createSyncController() {
             outcomes.add('pending_confirm');
             continue;
           }
+          if (
+            shouldSkipBackgroundSync(
+              dirtyScopeKey,
+              proto,
+              configStore.state.config,
+              'note_event',
+              params,
+              lastKnownOnline
+            )
+          ) {
+            markPendingDirty(dirtyScopeKey, proto, syncOnlyPath, eventNb || null);
+            continue;
+          }
+          const existingDirty = pendingDirty.get(dirtyKey(dirtyScopeKey, proto));
+          const effectiveOnlyPath =
+            existingDirty && (existingDirty.onlyPath !== syncOnlyPath || existingDirty.onlyNbRoot !== (eventNb || null))
+              ? null
+              : syncOnlyPath;
+          const effectiveOnlyNbRoot =
+            existingDirty && existingDirty.onlyNbRoot !== (eventNb || null)
+              ? null
+              : (eventNb || null);
           try {
             runBackgroundSync({
-              onlyPath: syncOnlyPath,
-              onlyNbRoot: eventNb || null,
+              onlyPath: effectiveOnlyPath,
+              onlyNbRoot: effectiveOnlyNbRoot,
               protocol: proto,
             });
             outcomes.add(lastSyncOutcome);
+            if (lastSyncOutcome === 'synced') {
+              clearPendingDirty(dirtyScopeKey, proto);
+            }
           } catch (exc) {
+            markPendingDirty(dirtyScopeKey, proto, effectiveOnlyPath, effectiveOnlyNbRoot);
             if (exc instanceof SyncStateError) {
               outcomes.add('state_error');
             } else {

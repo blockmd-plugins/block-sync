@@ -38,6 +38,7 @@ import {
   collectSkippedItems,
   classifySyncError,
   hashSyncFile,
+  sha256File,
   restoreSkippedBase,
 } from './utils.js';
 import {
@@ -59,11 +60,14 @@ import {
   fsWriteText,
   fsMkdir,
   fsDelete,
+  fsReadNoteText,
   dirIsCaseInsensitive,
   dirIsNormalizationInsensitive,
   pathsCollapse,
   groupCollapses,
   collapsedNameError,
+  scanDirSnapshot,
+  snapshotHasCloudPlaceholder,
   scanMirrorFiles,
   cleanupStaleTempFiles,
   withTargetLock,
@@ -225,8 +229,25 @@ export function runGit(
     returncode: res?.timed_out && returncode === 0 ? 124 : returncode,
     stdout,
     stderr,
+    stdout_truncated: Boolean(res?.stdout_truncated || res?.truncated),
+    stderr_truncated: Boolean(res?.stderr_truncated),
     timed_out: Boolean(res?.timed_out),
   };
+}
+
+function assertGitOutputComplete(proc, cmdLabel, { nulTerminated = false, locale = 'zh' } = {}) {
+  if (
+    proc?.stdout_truncated ||
+    (nulTerminated && typeof proc?.stdout === 'string' && proc.stdout.length > 0 && !proc.stdout.endsWith('\u0000'))
+  ) {
+    throw new Error(
+      tr(
+        locale,
+        `Git 输出已截断（${cmdLabel}），已中止同步`,
+        `Git output was truncated (${cmdLabel}); sync aborted`
+      )
+    );
+  }
 }
 
 /** Return true if raw_text looks like a transient network/SSH/TLS failure worth retrying. */
@@ -775,6 +796,9 @@ export function gitRemoteHeads(
   if (proc.returncode !== 0) {
     return [false, gitErrorMessage(locale, proc.stderr || proc.stdout, tr(locale, '连接失败', 'Connection failed'))];
   }
+  if (proc.stdout_truncated) {
+    return [false, tr(locale, 'Git 远端分支列表输出已截断', 'Git remote branch list output was truncated')];
+  }
   const heads = [];
   for (const line of proc.stdout.split(/\r?\n/)) {
     const parts = line.trim().split('\t');
@@ -789,6 +813,7 @@ export function gitRemoteHeads(
 export function verifyGitPushHistory(callHost, repo, branch, head, remote, cfg, locale = 'zh') {
   const revRange = remote ? `${remote}..${head}` : head;
   const commits = runGit(callHost, ['rev-list', revRange], { cwd: repo, cfg, locale });
+  if (commits.returncode === 0) assertGitOutputComplete(commits, 'git rev-list', { locale });
   const commitList = commits.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
   if (commits.returncode === 0 && commitList.length === 0) return;
 
@@ -797,6 +822,7 @@ export function verifyGitPushHistory(callHost, repo, branch, head, remote, cfg, 
     ['reflog', 'show', '--format=%H%x00%gs', `refs/heads/${branch}`],
     { cwd: repo, cfg, locale }
   );
+  if (reflog.returncode === 0) assertGitOutputComplete(reflog, 'git reflog', { locale });
   const owned = new Set();
   for (const line of reflog.stdout.split(/\r?\n/)) {
     const idx = line.indexOf('\u0000');
@@ -815,6 +841,211 @@ export function verifyGitPushHistory(callHost, repo, branch, head, remote, cfg, 
         'The Git branch has unpushed commits outside Block Sync. Review and handle them in Git, then retry sync.'
       )
     );
+  }
+}
+
+// ============================================================================
+// Git Maintenance & Pending-Push Branch Deduplication / Cleanup
+// ============================================================================
+
+const GIT_AUTO_GC_THRESHOLD = 256;
+const GIT_AUTO_GC_INTERVAL_MS = 12 * 60 * 60 * 1000;
+const GIT_AUTO_GC_SYNC_COUNT = 20;
+const MIN_GIT_GC_BUDGET_MS = 12000;
+const MAX_GIT_GC_TIMEOUT_MS = 30000;
+const LS_TREE_BATCH_SIZE = 150;
+
+function listPendingPushRefs(callHost, repoDir, branch, { cfg = null, locale = 'zh' } = {}) {
+  const prefix = `pending-push-${branch}-`;
+  const proc = runGit(
+    callHost,
+    ['for-each-ref', '--sort=-creatordate', '--format=%(refname)%09%(objectname)', 'refs/heads/'],
+    { cwd: repoDir, cfg, locale }
+  );
+  if (proc.returncode !== 0 || proc.stdout_truncated) return null;
+  if (!proc.stdout) return [];
+  const items = [];
+  for (const line of proc.stdout.split(/\r?\n/)) {
+    if (!line) continue;
+    const tab = line.indexOf('\t');
+    if (tab < 0) continue;
+    const fullRef = line.slice(0, tab).trim();
+    const oid = line.slice(tab + 1).trim();
+    if (!fullRef.startsWith('refs/heads/')) continue;
+    const ref = fullRef.slice('refs/heads/'.length);
+    if (ref.startsWith(prefix) && oid) {
+      items.push({ ref, fullRef, oid });
+    }
+  }
+  return items;
+}
+
+function isShallowGitRepo(callHost, repoDir, { cfg = null, locale = 'zh' } = {}) {
+  const shallowFile = gitPath(callHost, repoDir, 'shallow', cfg, locale);
+  if (shallowFile) {
+    try {
+      if (fsStat(callHost, shallowFile).exists) return true;
+    } catch (_err) {
+      return true;
+    }
+  }
+  const proc = runGit(callHost, ['rev-parse', '--is-shallow-repository'], { cwd: repoDir, cfg, locale });
+  if (proc.returncode !== 0) return true;
+  return proc.stdout.trim() === 'true';
+}
+
+function cleanupPendingPushBranches(
+  callHost,
+  repoDir,
+  branch,
+  { targetRemoteRef = '', keepOid = '', cfg = null, locale = 'zh' } = {}
+) {
+  const refs = listPendingPushRefs(callHost, repoDir, branch, { cfg, locale });
+  if (!refs || refs.length === 0) return '';
+
+  let keptRefForKeepOid = '';
+  if (keepOid) {
+    for (const { ref, oid } of refs) {
+      if (oid === keepOid) {
+        keptRefForKeepOid = ref;
+        break;
+      }
+    }
+  }
+
+  if (!targetRemoteRef) return keptRefForKeepOid;
+  const chk = runGit(callHost, ['rev-parse', '--verify', `${targetRemoteRef}^{commit}`], { cwd: repoDir, cfg, locale });
+  const remoteOid = chk.returncode === 0 ? chk.stdout.trim() : '';
+  if (!remoteOid || isShallowGitRepo(callHost, repoDir, { cfg, locale })) {
+    return keptRefForKeepOid;
+  }
+
+  for (const { ref, fullRef, oid } of refs) {
+    const anc = runGit(callHost, ['merge-base', '--is-ancestor', oid, remoteOid], {
+      cwd: repoDir,
+      cfg,
+      locale,
+    });
+    if (anc.returncode === 0) {
+      const delProc = runGit(callHost, ['update-ref', '--no-deref', '-d', fullRef, oid], { cwd: repoDir, cfg, locale });
+      if (delProc.returncode === 0 && ref === keptRefForKeepOid) {
+        keptRefForKeepOid = '';
+      }
+    }
+  }
+  return keptRefForKeepOid;
+}
+
+function ensurePendingPushBackupRef(
+  callHost,
+  repoDir,
+  branch,
+  localOid,
+  _localRef,
+  { targetRemoteRef = '', cfg = null, locale = 'zh' } = {}
+) {
+  const existing = cleanupPendingPushBranches(callHost, repoDir, branch, {
+    targetRemoteRef,
+    keepOid: localOid,
+    cfg,
+    locale,
+  });
+  if (existing) return existing;
+  if (!localOid) return '';
+  const shortOid = String(localOid).slice(0, 12);
+  const baseName = `pending-push-${branch}-${shortOid}`;
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    const candShort = attempt === 0 ? baseName : `${baseName}-${attempt + 1}`;
+    const candFull = `refs/heads/${candShort}`;
+    const checkProc = runGit(callHost, ['rev-parse', '--verify', candFull], { cwd: repoDir, cfg, locale });
+    if (checkProc.returncode === 0) {
+      if (checkProc.stdout.trim() === localOid) return candShort;
+      continue;
+    }
+    const createProc = runGit(callHost, ['update-ref', candFull, localOid, ''], { cwd: repoDir, cfg, locale });
+    if (createProc.returncode === 0) return candShort;
+    const verifyProc = runGit(callHost, ['rev-parse', '--verify', candFull], { cwd: repoDir, cfg, locale });
+    if (verifyProc.returncode === 0 && verifyProc.stdout.trim() === localOid) return candShort;
+  }
+  return '';
+}
+
+function maybeRunGitAutoGc(
+  callHost,
+  repoDir,
+  { dataDir = '', nowMsFn = () => Date.now(), cfg = null, locale = 'zh', didCommit = false, deadlineMs = 0 } = {}
+) {
+  if (!repoDir || !isManagedGitDir(repoDir, dataDir)) return false;
+  const rpc = resolveCallHost(callHost);
+  const [hasMarker, rawGitDir] = resolveGitDir(rpc, repoDir);
+  if (!hasMarker || !rawGitDir) return false;
+  const metaPath = posixJoin(trimTrailingSlash(rawGitDir), 'block-sync-maintenance.json');
+  const now = nowMsFn();
+  let meta = { last_gc_ms: 0, syncs_since_gc: 0 };
+  try {
+    const raw = fsReadText(rpc, metaPath);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        meta = {
+          last_gc_ms: Number(parsed.last_gc_ms) || 0,
+          syncs_since_gc: Number(parsed.syncs_since_gc) || 0,
+        };
+      }
+    }
+  } catch (_err) {
+    // Missing or corrupt maintenance state; reinitialize safely.
+  }
+
+  const nextCount = didCommit ? meta.syncs_since_gc + 1 : meta.syncs_since_gc;
+  const persistDeferredCount = () => {
+    if (!didCommit) return;
+    try {
+      fsWriteText(rpc, metaPath, JSON.stringify({ last_gc_ms: meta.last_gc_ms, syncs_since_gc: nextCount }), {
+        atomic: false,
+      });
+    } catch (_err) {
+      // Best-effort counter update.
+    }
+  };
+  const due =
+    meta.last_gc_ms <= 0 ||
+    now - meta.last_gc_ms >= GIT_AUTO_GC_INTERVAL_MS ||
+    nextCount >= GIT_AUTO_GC_SYNC_COUNT;
+  if (!due) {
+    persistDeferredCount();
+    return false;
+  }
+
+  let gcTimeoutMs = MAX_GIT_GC_TIMEOUT_MS;
+  if (deadlineMs > 0) {
+    const remaining = deadlineMs - nowMsFn();
+    if (remaining < MIN_GIT_GC_BUDGET_MS) {
+      persistDeferredCount();
+      return false;
+    }
+    gcTimeoutMs = Math.min(MAX_GIT_GC_TIMEOUT_MS, Math.max(1000, remaining - 2000));
+  }
+
+  try {
+    const proc = runGit(
+      rpc,
+      ['-c', `gc.auto=${GIT_AUTO_GC_THRESHOLD}`, '-c', 'gc.autoDetach=false', 'gc', '--auto', '--quiet'],
+      { cwd: repoDir, timeoutMs: gcTimeoutMs, cfg, locale }
+    );
+    if (proc.returncode === 0 && !proc.timed_out) {
+      try {
+        fsWriteText(rpc, metaPath, JSON.stringify({ last_gc_ms: nowMsFn(), syncs_since_gc: 0 }), { atomic: false });
+      } catch (_writeErr) {
+        // Best-effort maintenance timestamp write.
+      }
+      return true;
+    }
+    persistDeferredCount();
+    return false;
+  } catch (_err) {
+    persistDeferredCount();
+    return false;
   }
 }
 
@@ -1092,16 +1323,25 @@ export function prepareGitRepo(
                     }
                   );
                   const oidP2 = runGit(rpc, ['rev-parse', '--verify', remoteRef], { cwd: activeRepoDir, cfg, locale });
-                  if (oidP2.returncode === 0 && oidP2.stdout.trim()) {
-                    recordGitSyncedBranch(rpc, activeRepoDir, branch, oidP2.stdout.trim(), {
+                  const syncedOid = oidP2.returncode === 0 ? oidP2.stdout.trim() : '';
+                  if (syncedOid) {
+                    recordGitSyncedBranch(rpc, activeRepoDir, branch, syncedOid, {
                       remoteName: 'origin',
                       cfg,
                       locale,
                     });
                   }
+                  cleanupPendingPushBranches(rpc, activeRepoDir, branch, {
+                    targetRemoteRef: syncedOid || remoteRef,
+                    cfg,
+                    locale,
+                  });
                 } else {
-                  const backupRef = `pending-push-${branch}-${Math.floor(nowMsFn() / 1000)}`;
-                  runGit(rpc, ['branch', '-f', backupRef, localRef], { cwd: activeRepoDir, cfg, locale });
+                  const backupRef = ensurePendingPushBackupRef(rpc, activeRepoDir, branch, localOid, localRef, {
+                    targetRemoteRef: remoteRef,
+                    cfg,
+                    locale,
+                  });
                   const err = gitErrorMessage(
                     locale,
                     retryPush.stderr || retryPush.stdout,
@@ -1109,23 +1349,38 @@ export function prepareGitRepo(
                   );
                   return [
                     false,
-                    tr(
-                      locale,
-                      `上次未推送的 Git 提交重试推送失败（已保留于分支 ${backupRef}）: ${err}`,
-                      `Retry push of pending Git commits failed (preserved on branch ${backupRef}): ${err}`
-                    ),
+                    backupRef
+                      ? tr(
+                          locale,
+                          `上次未推送的 Git 提交重试推送失败（已保留于分支 ${backupRef}）: ${err}`,
+                          `Retry push of pending Git commits failed (preserved on branch ${backupRef}): ${err}`
+                        )
+                      : tr(
+                          locale,
+                          `上次未推送的 Git 提交重试推送失败（未能创建备份分支，请检查本地 Git 状态）: ${err}`,
+                          `Retry push of pending Git commits failed (backup branch could not be created; check local Git state): ${err}`
+                        ),
                   ];
                 }
               } else {
-                const backupRef = `pending-push-${branch}-${Math.floor(nowMsFn() / 1000)}`;
-                runGit(rpc, ['branch', '-f', backupRef, localRef], { cwd: activeRepoDir, cfg, locale });
+                const backupRef = ensurePendingPushBackupRef(rpc, activeRepoDir, branch, localOid, localRef, {
+                  targetRemoteRef: remoteRef,
+                  cfg,
+                  locale,
+                });
                 return [
                   false,
-                  tr(
-                    locale,
-                    `检测到 ${aheadN} 个尚未推送的本地提交与远端 ${branch} 分叉，已保留于分支 ${backupRef}，请先处理分叉`,
-                    `Found ${aheadN} unpushed local commits diverged from remote ${branch}; preserved on branch ${backupRef}`
-                  ),
+                  backupRef
+                    ? tr(
+                        locale,
+                        `检测到 ${aheadN} 个尚未推送的本地提交与远端 ${branch} 分叉，已保留于分支 ${backupRef}，请先处理分叉`,
+                        `Found ${aheadN} unpushed local commits diverged from remote ${branch}; preserved on branch ${backupRef}`
+                      )
+                    : tr(
+                        locale,
+                        `检测到 ${aheadN} 个尚未推送的本地提交与远端 ${branch} 分叉，且未能创建备份分支，请先手动检查本地仓库后再处理分叉`,
+                        `Found ${aheadN} unpushed local commits diverged from remote ${branch}, and failed to create a backup branch; inspect the local repository manually`
+                      ),
                 ];
               }
             }
@@ -1146,6 +1401,13 @@ export function prepareGitRepo(
         }
         runGit(rpc, ['reset', '--hard', `refs/remotes/origin/${branch}`], { cwd: activeRepoDir, cfg, locale });
         runGit(rpc, ['clean', '-fdx'], { cwd: activeRepoDir, cfg, locale });
+        if (isManagedGitDir(activeRepoDir, dataDir)) {
+          cleanupPendingPushBranches(rpc, activeRepoDir, branch, {
+            targetRemoteRef: `refs/remotes/origin/${branch}`,
+            cfg,
+            locale,
+          });
+        }
       }
     }
     return [true, activeRepoDir];
@@ -1327,6 +1589,12 @@ export function gitTrackedRelPaths(callHost, repoRoot, { subdir = '', cfg = null
     }
     return null;
   }
+  if (proc.stdout_truncated || (proc.stdout && !proc.stdout.endsWith('\u0000'))) {
+    if (strict) {
+      assertGitOutputComplete(proc, 'git ls-files', { nulTerminated: true, locale });
+    }
+    return null;
+  }
   const sub = String(subdir || '').replace(/^\/+|\/+$/g, '');
   const prefix = sub ? `${sub}/` : '';
   const tracked = new Set();
@@ -1361,6 +1629,30 @@ export function alignPathsToTracked(callHost, itemsMap, trackedPaths, targetDir)
     const hits = (trackedByFold.get(fk) || []).filter((tp) => pathsCollapse(callHost, targetDir, k, tp));
     if (hits.length === 1) {
       aligned[hits[0]] = v;
+    }
+  }
+  return aligned;
+}
+
+/** Align Map<relPath, entry> keys to exact git-tracked path casings when disks fold case/NFC. */
+export function alignEntryMapToTracked(callHost, entriesMap, trackedPaths, targetDir) {
+  if (!trackedPaths || !(entriesMap instanceof Map)) return entriesMap;
+  const trackedByFold = new Map();
+  for (const tp of [...trackedPaths].sort()) {
+    const fk = foldSyncPath(tp, { caseInsensitive: true, normalize: true });
+    if (!trackedByFold.has(fk)) trackedByFold.set(fk, []);
+    trackedByFold.get(fk).push(tp);
+  }
+  const aligned = new Map();
+  for (const [k, v] of entriesMap.entries()) {
+    if (trackedPaths.has(k)) {
+      aligned.set(k, v);
+      continue;
+    }
+    const fk = foldSyncPath(k, { caseInsensitive: true, normalize: true });
+    const hits = (trackedByFold.get(fk) || []).filter((tp) => pathsCollapse(callHost, targetDir, k, tp));
+    if (hits.length === 1) {
+      aligned.set(hits[0], v);
     }
   }
   return aligned;
@@ -1416,6 +1708,7 @@ export function repairGitIndexToHead(callHost, repoRoot, { cfg = null, locale = 
         )
       );
     }
+    assertGitOutputComplete(listed, 'git ls-tree', { nulTerminated: true, locale });
     for (const entry of listed.stdout.split('\u0000')) {
       const tabIdx = entry.indexOf('\t');
       if (tabIdx < 0) continue;
@@ -1436,6 +1729,7 @@ export function repairGitIndexToHead(callHost, repoRoot, { cfg = null, locale = 
       )
     );
   }
+  assertGitOutputComplete(diff, 'git diff-index', { nulTerminated: true, locale });
 
   const rawParts = diff.stdout.split('\u0000');
   const updates = [];
@@ -1524,22 +1818,24 @@ export function checkGitStagedConflicts(
   if (isManagedGitDir(repoRoot, dataDir)) return;
 
   const hasHead = runGit(callHost, ['rev-parse', '--verify', 'HEAD'], { cwd: repoRoot, cfg, locale }).returncode === 0;
-  const args = hasHead
-    ? ['--literal-pathspecs', 'diff', '--cached', '--name-only', '-z', '--', ...cleaned]
-    : ['--literal-pathspecs', 'ls-files', '--cached', '-z', '--', ...cleaned];
-  const proc = runGit(callHost, args, { cwd: repoRoot, cfg, locale });
-  if (proc.returncode !== 0) {
-    const err = errorDetail(locale, proc.stderr || proc.stdout || tr(locale, 'git 暂存区检查失败', 'git staged index check failed'));
-    throw new Error(tr(locale, `Git 暂存区检查失败: ${err}`, `Git staged index check failed: ${err}`));
+  const stagedSet = new Set();
+  for (let i = 0; i < cleaned.length; i += LS_TREE_BATCH_SIZE) {
+    const chunk = cleaned.slice(i, i + LS_TREE_BATCH_SIZE);
+    const args = hasHead
+      ? ['--literal-pathspecs', 'diff', '--cached', '--name-only', '-z', '--', ...chunk]
+      : ['--literal-pathspecs', 'ls-files', '--cached', '-z', '--', ...chunk];
+    const proc = runGit(callHost, args, { cwd: repoRoot, cfg, locale });
+    if (proc.returncode !== 0) {
+      const err = errorDetail(locale, proc.stderr || proc.stdout || tr(locale, 'git 暂存区检查失败', 'git staged index check failed'));
+      throw new Error(tr(locale, `Git 暂存区检查失败: ${err}`, `Git staged index check failed: ${err}`));
+    }
+    assertGitOutputComplete(proc, hasHead ? 'git diff --cached' : 'git ls-files --cached', { nulTerminated: true, locale });
+    for (const raw of proc.stdout.split('\u0000')) {
+      const p = raw.replace(/\\/g, '/');
+      if (p) stagedSet.add(p);
+    }
   }
-  const stagedHits = [
-    ...new Set(
-      proc.stdout
-        .split('\u0000')
-        .map((s) => s.replace(/\\/g, '/'))
-        .filter(Boolean)
-    ),
-  ].sort();
+  const stagedHits = [...stagedSet].sort();
   if (stagedHits.length > 0) {
     const sample = stagedHits.slice(0, 3).join(', ') + (stagedHits.length > 3 ? '...' : '');
     throw new Error(
@@ -1567,6 +1863,7 @@ export function checkGitIgnored(callHost, repoRoot, relPaths, { cfg = null, loca
     const err = errorDetail(locale, chk.stderr || chk.stdout || tr(locale, 'git check-ignore 失败', 'git check-ignore failed'));
     throw new Error(tr(locale, `Git 忽略规则检查失败: ${err}`, `Git ignore check failed: ${err}`));
   }
+  assertGitOutputComplete(chk, 'git check-ignore', { nulTerminated: true, locale });
   const ignored = [];
   for (const raw of chk.stdout.split('\u0000')) {
     if (!raw) continue;
@@ -1652,6 +1949,7 @@ function buildGitTreeFromChanges(callHost, repoRoot, oldTree, changedEntries, { 
           const err = errorDetail(locale, lsProc.stderr || lsProc.stdout || 'git ls-tree failed');
           throw new Error(tr(locale, `Git 树读取失败: ${err}`, `Git ls-tree failed: ${err}`));
         }
+        assertGitOutputComplete(lsProc, 'git ls-tree', { nulTerminated: true, locale });
         for (const item of parseLsTreeEntries(lsProc.stdout)) {
           entriesMap.set(item.name, { mode: item.mode, type: item.type, oid: item.oid });
         }
@@ -1789,6 +2087,7 @@ export function commitAndPushGit(
     sleepFn = null,
     deadlineMs = 0,
     locale = 'zh',
+    skipStaleTmpScan = false,
   } = {}
 ) {
   const rpc = resolveCallHost(callHost);
@@ -1796,7 +2095,9 @@ export function commitAndPushGit(
   if (checkout) {
     gitCheckoutState(rpc, repoRoot, cfg, checkout, locale);
   }
-  cleanupStaleTempFiles(rpc, repoRoot, { locale });
+  if (!skipStaleTmpScan) {
+    cleanupStaleTempFiles(rpc, repoRoot, { locale });
+  }
   recoverAbandonedGitIndex(rpc, repoRoot, { cfg, pid, locale });
 
   const branch = gitBranch(cfg);
@@ -1841,17 +2142,21 @@ export function commitAndPushGit(
       oldTree = treeChk.stdout.trim();
     }
     if (allCheckPaths.length > 0) {
-      const lsProc = runGit(
-        rpc,
-        ['--literal-pathspecs', 'ls-tree', '-r', '-z', oldHead, '--', ...allCheckPaths],
-        { cwd: repoRoot, cfg, locale }
-      );
-      if (lsProc.returncode !== 0) {
-        const err = errorDetail(locale, lsProc.stderr || lsProc.stdout || tr(locale, 'git ls-tree 失败', 'git ls-tree failed'));
-        throw new Error(tr(locale, `Git 树检查失败: ${err}`, `Git tree inspection failed: ${err}`));
-      }
-      for (const item of parseLsTreeEntries(lsProc.stdout)) {
-        headEntries[item.name] = [item.mode, item.oid];
+      for (let i = 0; i < allCheckPaths.length; i += LS_TREE_BATCH_SIZE) {
+        const chunk = allCheckPaths.slice(i, i + LS_TREE_BATCH_SIZE);
+        const lsProc = runGit(
+          rpc,
+          ['--literal-pathspecs', 'ls-tree', '-r', '-z', oldHead, '--', ...chunk],
+          { cwd: repoRoot, cfg, locale }
+        );
+        if (lsProc.returncode !== 0) {
+          const err = errorDetail(locale, lsProc.stderr || lsProc.stdout || tr(locale, 'git ls-tree 失败', 'git ls-tree failed'));
+          throw new Error(tr(locale, `Git 树检查失败: ${err}`, `Git tree inspection failed: ${err}`));
+        }
+        assertGitOutputComplete(lsProc, 'git ls-tree', { nulTerminated: true, locale });
+        for (const item of parseLsTreeEntries(lsProc.stdout)) {
+          headEntries[item.name] = [item.mode, item.oid];
+        }
       }
     }
   }
@@ -1900,6 +2205,7 @@ export function commitAndPushGit(
       if (prevOid) changedEntries.push([p, '0', '0'.repeat(prevOid.length)]);
       continue;
     }
+    if (!fileInfo.has(p)) continue;
     const { filePath, size, plannedBlob } = fileInfo.get(p);
     const [prevMode, prevOid] = headEntries[p] || ['100644', ''];
     if (prevMode === '160000') {
@@ -2112,6 +2418,13 @@ export function commitAndPushGit(
           throw new Error(tr(locale, `已提交到本地 Git，但远端推送未完成: ${err}`, `Committed locally. Git push failed: ${err}`));
         }
         recordGitSyncedBranch(rpc, repoRoot, branch, headOid, { remoteName, cfg, locale });
+        if (isManagedGitDir(repoRoot, dataDir)) {
+          cleanupPendingPushBranches(rpc, repoRoot, branch, {
+            targetRemoteRef: headOid,
+            cfg,
+            locale,
+          });
+        }
         return true;
       }
     }
@@ -2144,6 +2457,8 @@ export function createGitSyncEngine({
     createHostLocalAdapter({
       callHost,
       supportsMultiNotebook: configStore ? configStore.state.supportsMultiNotebook : true,
+      configStore,
+      nowMsFn,
     });
   const getLocale = () => (configStore ? configStore.state.locale : locale);
   const getHomeDir = () => (configStore ? configStore.state.homeDir : '');
@@ -2355,19 +2670,6 @@ export function createGitSyncEngine({
       : notebookLabel(effectiveNbRoot, loc, '', homeDir);
     const scope = cfg.sync_scope || 'all';
     const skips = createSyncSkips(cfg, loc, skipRound);
-    const localNotes = local.readNotes({ onlyPath, scope, nbRoot: effectiveNbRoot, cfg, locale: loc, skips });
-    const scanOptions = { onlyPath, scope, excludedSubdirs, locale: loc, cfg, skips };
-    for (const relPath of Object.keys(localNotes)) {
-      if (inSyncSubdir(relPath, excludedSubdirs)) {
-        throw new Error(
-          tr(
-            loc,
-            `笔记路径与其他笔记本的同步目录重叠：${relPath}`,
-            `Note path overlaps with another notebook's sync folder: ${relPath}`
-          )
-        );
-      }
-    }
 
     const branch = gitBranch(cfg);
     let repoDir = preparedRepoDir || resolveLocalGitDir(rpc, cfg, { dataDir: dDir, nbRoot: effectiveNbRoot, homeDir, locale: loc });
@@ -2379,11 +2681,21 @@ export function createGitSyncEngine({
       : `nb:${nbKeyVal}|git:${metaTarget}`;
     const legacyKey = !subdir ? `git:${repoDir}:${branch}` : null;
 
+    const canLazyLocal = onlyPath === null && typeof local.readNote === 'function';
+    let localNotes = {};
     let remoteNotes = {};
+    let localSnapshot = null;
+    let remoteSnapshot = null;
+    let localNoteEntries = null;
+    let remoteNoteEntries = null;
+    let readLocalNote = null;
+    let readRemoteNote = null;
     let remoteInspected = true;
     let remoteError = null;
+    const scanOptions = { onlyPath, scope, excludedSubdirs, locale: loc, cfg, skips };
+
     if (preparedRepoDir) {
-      remoteNotes = scanMirrorFiles(rpc, targetDir, scanOptions);
+      // Prepared by caller (computeBatchPlan).
     } else if (inspectRemote) {
       const [ok, res] = prepareGitRepo(rpc, cfg, {
         allowInitOrClone: true,
@@ -2400,15 +2712,71 @@ export function createGitSyncEngine({
       if (ok) {
         repoRoot = res;
         targetDir = subdir ? posixJoin(res, subdir) : res;
-        remoteNotes = scanMirrorFiles(rpc, targetDir, scanOptions);
       } else {
         remoteInspected = false;
         remoteError = res;
       }
-    } else if (hasGitMarker(rpc, repoDir)) {
-      remoteNotes = scanMirrorFiles(rpc, targetDir, scanOptions);
-    } else {
+    } else if (!hasGitMarker(rpc, repoDir)) {
       remoteInspected = false;
+    }
+
+    if (remoteInspected && !remoteError) {
+      if (onlyPath === null) {
+        remoteSnapshot = scanDirSnapshot(rpc, targetDir, { excludedSubdirs, locale: loc });
+        remoteNoteEntries = new Map();
+        if (remoteSnapshot) {
+          const mirrorCi = scope && scope !== 'all' ? dirIsCaseInsensitive(rpc, remoteSnapshot.cleanRoot) : false;
+          const mirrorNorm = scope && scope !== 'all' ? dirIsNormalizationInsensitive(rpc, remoteSnapshot.cleanRoot) : false;
+          for (const [rel, entry] of remoteSnapshot.noteEntries.entries()) {
+            if (!scope || scope === 'all' || matchesScope(rel, scope, { caseInsensitive: mirrorCi, normalize: mirrorNorm })) {
+              remoteNoteEntries.set(rel, entry);
+            }
+          }
+          readRemoteNote = (relPath, entry = null) =>
+            fsReadNoteText(rpc, entry?.path || posixJoin(remoteSnapshot.cleanRoot, relPath), relPath, entry);
+        }
+      } else {
+        remoteNotes = scanMirrorFiles(rpc, targetDir, scanOptions);
+      }
+
+      if (canLazyLocal) {
+        try {
+          localSnapshot = scanDirSnapshot(rpc, effectiveNbRoot, { excludedSubdirs: new Set(), locale: loc });
+        } catch (exc) {
+          if (!String(exc?.message || exc).includes('unknown host method')) throw exc;
+        }
+      }
+      if (localSnapshot) {
+        localNoteEntries = new Map();
+        for (const [relPath, entry] of localSnapshot.noteEntries.entries()) {
+          if (inSyncSubdir(relPath, excludedSubdirs)) {
+            throw new Error(
+              tr(
+                loc,
+                `笔记路径与其他笔记本的同步目录重叠：${relPath}`,
+                `Note path overlaps with another notebook's sync folder: ${relPath}`
+              )
+            );
+          }
+          if (!scope || scope === 'all' || matchesScope(relPath, scope)) {
+            localNoteEntries.set(relPath, entry);
+          }
+        }
+        readLocalNote = (relPath, entry = null) => local.readNote(relPath, { nbRoot: effectiveNbRoot, cfg, locale: loc, skips, entry });
+      } else {
+        localNotes = local.readNotes({ onlyPath, scope, nbRoot: effectiveNbRoot, cfg, locale: loc, skips });
+        for (const relPath of Object.keys(localNotes)) {
+          if (inSyncSubdir(relPath, excludedSubdirs)) {
+            throw new Error(
+              tr(
+                loc,
+                `笔记路径与其他笔记本的同步目录重叠：${relPath}`,
+                `Note path overlaps with another notebook's sync folder: ${relPath}`
+              )
+            );
+          }
+        }
+      }
     }
 
     let trackedRemotePaths = null;
@@ -2417,7 +2785,11 @@ export function createGitSyncEngine({
       try {
         trackedRemotePaths = gitTrackedRelPaths(rpc, repoRoot, { subdir, cfg, strict: true, locale: loc });
         gitTreePaths = trackedRemotePaths;
-        remoteNotes = alignPathsToTracked(rpc, remoteNotes, trackedRemotePaths, targetDir);
+        if (remoteNoteEntries) {
+          remoteNoteEntries = alignEntryMapToTracked(rpc, remoteNoteEntries, trackedRemotePaths, targetDir);
+        } else {
+          remoteNotes = alignPathsToTracked(rpc, remoteNotes, trackedRemotePaths, targetDir);
+        }
       } catch (exc) {
         remoteInspected = false;
         remoteError = errorDetail(loc, exc);
@@ -2448,9 +2820,11 @@ export function createGitSyncEngine({
         }
         if (isSafeRelAsset(onlyPath)) onlyAssetCfs.add(onlyKey);
       }
+      const localNoteKeyList = localNoteEntries ? [...localNoteEntries.keys()] : Object.keys(localNotes);
+      const remoteNoteKeyList = remoteNoteEntries ? [...remoteNoteEntries.keys()] : Object.keys(remoteNotes);
       const gitScopeCi =
-        dirIsCaseInsensitive(rpc, effectiveNbRoot, Object.keys(localNotes)) ||
-        dirIsCaseInsensitive(rpc, targetDir, Object.keys(remoteNotes));
+        dirIsCaseInsensitive(rpc, effectiveNbRoot, localNoteKeyList) ||
+        dirIsCaseInsensitive(rpc, targetDir, remoteNoteKeyList);
       const gitScopeNorm =
         dirIsNormalizationInsensitive(rpc, effectiveNbRoot) ||
         dirIsNormalizationInsensitive(rpc, targetDir);
@@ -2484,7 +2858,7 @@ export function createGitSyncEngine({
     });
     const legacyAliases = !subdir ? (targetBases || []).map((base) => `git:${base}`) : [];
 
-    return computeThreeWaySyncPlan({
+    const plan = computeThreeWaySyncPlan({
       callHost: rpc,
       configStore,
       localAdapter: local,
@@ -2504,6 +2878,12 @@ export function createGitSyncEngine({
       legacyAliases,
       localNotes,
       remoteNotes,
+      localSnapshot,
+      remoteSnapshot,
+      localNoteEntries,
+      remoteNoteEntries,
+      readLocalNote,
+      readRemoteNote,
       remoteInspected,
       remoteError,
       trackedRemotePaths,
@@ -2512,6 +2892,8 @@ export function createGitSyncEngine({
       locale: loc,
       skips,
     });
+    plan._remote_stale_tmp_clear = Boolean(remoteSnapshot && remoteSnapshot.staleTmpPaths.length === 0);
+    return plan;
   };
 
   const computeBatchPlan = ({
@@ -2803,15 +3185,29 @@ export function createGitSyncEngine({
         for (const p of plan.to_push_new) allPlannedGitWrites.push(`${subPrefix}${rpm[p] || p}`);
         for (const p of plan.to_push_overwrite) allPlannedGitWrites.push(`${subPrefix}${rpm[p] || p}`);
         if (Object.keys(assetCopyMap).length > 0) {
+          const readVerifiedRemote = (p) => {
+            if (Object.hasOwn(remoteNotes, p)) return remoteNotes[p];
+            if (typeof plan.read_remote_note !== 'function') return undefined;
+            return plan.skips.run(p, () => {
+              const txt = plan.read_remote_note(p);
+              const expected = plan.remote_hashes?.[p];
+              if (txt !== undefined && expected && sha256Text(txt, rpc) !== expected) {
+                const err = new Error(tr(loc, `笔记在扫描后发生变化，已跳过等待重试：${p}`, `Note changed after scanning; skipped for retry: ${p}`));
+                err.code = 'fs_error';
+                throw err;
+              }
+              return txt;
+            });
+          };
           for (const p of plan.to_pull_new) {
-            const origText = remoteNotes[p];
-            if (origText !== undefined && rewriteNoteAssetLinks(p, origText, assetCopyMap) !== origText) {
+            const origText = readVerifiedRemote(p);
+            if (!plan.skips.has(p) && origText !== undefined && rewriteNoteAssetLinks(p, origText, assetCopyMap) !== origText) {
               allPlannedGitWrites.push(`${subPrefix}${rpm[p] || p}`);
             }
           }
           for (const p of plan.to_pull_overwrite) {
-            const origText = remoteNotes[p];
-            if (origText !== undefined && rewriteNoteAssetLinks(p, origText, assetCopyMap) !== origText) {
+            const origText = readVerifiedRemote(p);
+            if (!plan.skips.has(p) && origText !== undefined && rewriteNoteAssetLinks(p, origText, assetCopyMap) !== origText) {
               allPlannedGitWrites.push(`${subPrefix}${rpm[p] || p}`);
             }
           }
@@ -2891,11 +3287,14 @@ export function createGitSyncEngine({
           running: true,
         });
       }
+      const skipStaleTmpScan = Boolean(
+        batch.plans.length === 1 && !batch.plans[0].subdir && batch.plans[0]._remote_stale_tmp_clear === true
+      );
       didPush = withTargetLock(
         rpc,
         repo,
-        () =>
-          commitAndPushGit(rpc, repo, cfg, {
+        () => {
+          const committed = commitAndPushGit(rpc, repo, cfg, {
             stagedRelPaths: stagedGitPaths,
             trackedPlanPaths: trackedGitPaths,
             plannedBlobs: plannedGitBlobs,
@@ -2913,7 +3312,18 @@ export function createGitSyncEngine({
             sleepFn,
             deadlineMs,
             locale: loc,
-          }),
+            skipStaleTmpScan,
+          });
+          maybeRunGitAutoGc(rpc, repo, {
+            dataDir: dDir,
+            nowMsFn,
+            cfg,
+            locale: loc,
+            didCommit: committed,
+            deadlineMs,
+          });
+          return committed;
+        },
         { dataDir: dDir, pid, nowMsFn, sleepFn }
       );
       if (configStore) {

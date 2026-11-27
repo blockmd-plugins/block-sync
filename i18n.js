@@ -462,6 +462,7 @@ export function formatSyncFailureLabel(locale, code) {
   if (code === 'file_limit') return tr(locale, '文件超过大小上限', 'File size limit exceeded');
   if (code === 'quota_full') return tr(locale, '存储空间不足', 'Insufficient storage');
   if (code === 'fs_error') return tr(locale, '文件访问失败', 'File access failed');
+  if (code === 'scope') return tr(locale, '目录未授权', 'Folder access denied');
   return tr(locale, '同步失败', 'Sync failed');
 }
 
