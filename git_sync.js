@@ -146,6 +146,16 @@ export function buildGitEnv({ cfg = null, args = [], locale = 'zh', baseEnv = nu
   const op = Array.isArray(args) && args.length > 0 ? String(args[0] || '') : '';
   let encoded = '';
 
+  if (op === 'push') {
+    // Git's sparse pack walk can miss uninteresting trees (seen with Unicode paths)
+    // and resend most of the repo, making pushes time out on slow links.
+    let count = Number.parseInt(String(env.GIT_CONFIG_COUNT || '0'), 10);
+    if (!Number.isFinite(count) || count < 0) count = 0;
+    env[`GIT_CONFIG_KEY_${count}`] = 'pack.useSparse';
+    env[`GIT_CONFIG_VALUE_${count}`] = 'false';
+    env.GIT_CONFIG_COUNT = String(count + 1);
+  }
+
   if (
     c.git_auth === 'token' &&
     token &&
@@ -1296,10 +1306,10 @@ export function prepareGitRepo(
                   ['push', leaseArg, '-u', 'origin', `${localOid}:refs/heads/${branch}`],
                   {
                     cwd: activeRepoDir,
-                    timeoutMs: 12000,
+                    timeoutMs: 60000,
                     cfg,
-                    retries: 2,
-                    totalBudgetMs: 22000,
+                    retries: 1,
+                    totalBudgetMs: 80000,
                     locale,
                     nowMsFn,
                     sleepFn,
@@ -2403,10 +2413,10 @@ export function commitAndPushGit(
           ['push', leaseArg, '-u', remoteName, `${headOid}:refs/heads/${branch}`],
           {
             cwd: repoRoot,
-            timeoutMs: 12000,
+            timeoutMs: 60000,
             cfg,
-            retries: 2,
-            totalBudgetMs: 22000,
+            retries: 1,
+            totalBudgetMs: 80000,
             locale,
             nowMsFn,
             sleepFn,
