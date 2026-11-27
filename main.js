@@ -59,6 +59,9 @@ import {
   dirIsCaseInsensitive,
   dirIsNormalizationInsensitive,
   pathsCollapse,
+  clearRecoveryDirCache,
+  migrateLegacyRecoveryDirs,
+  cleanupRecoveryDirs,
   createLocalMirrorSyncEngine,
 } from './local_mirror.js';
 import { createWebDAVSyncEngine } from './webdav.js';
@@ -1285,8 +1288,8 @@ function createSyncController() {
     try {
       const notebooks = configStore.selectedNotebooks(protoCfg);
       if (onlyNbRoot) {
-        const normOnly = configStore.notebookKey(onlyNbRoot);
-        if (!notebooks.includes(normOnly)) return '';
+        const normOnly = normAbsPath(onlyNbRoot, homeDir);
+        if (!normOnly || !notebooks.includes(normOnly)) return '';
       }
       if (!notebooks || notebooks.length === 0) {
         const msg = t('请至少选择一个笔记本', 'Select at least one notebook');
@@ -1837,6 +1840,15 @@ function createSyncController() {
 
   const runInitialMaintenance = () => {
     if (!configStore) return;
+    try {
+      const nbs = configStore.state.knownNotebooks.map((nb) => nb.path).filter(Boolean);
+      for (const nbPath of nbs) {
+        migrateLegacyRecoveryDirs(callHost, nbPath, { dataDir });
+      }
+      cleanupRecoveryDirs(callHost, { dataDir, notebooks: nbs });
+    } catch (_err) {
+      // Best-effort maintenance; never fail initialization.
+    }
     if (supportsSystem) {
       for (let i = 0; i < 4; i += 1) {
         const res = configStore.migrateCredentials();
@@ -2682,6 +2694,36 @@ function createSyncController() {
       lastStatus = '';
       rebuildEngines();
       return { handled: true, locale: nextLoc };
+    }
+
+    if (eventName === 'notebook.renamed') {
+      const renamed = configStore.onNotebookRenamed(params);
+      if (renamed.activeRenamed && renamed.newPath) {
+        notebookRoot = renamed.newPath;
+      }
+      if (renamed.oldPath) {
+        clearRecoveryDirCache(callHost, renamed.oldPath);
+      }
+      if (renamed.newPath) {
+        try {
+          migrateLegacyRecoveryDirs(callHost, renamed.newPath, {
+            dataDir,
+            extraHashRoots: renamed.oldPath ? [renamed.oldPath] : [],
+          });
+        } catch (_err) {
+          // Best-effort migration.
+        }
+      }
+      lastStatus = '';
+      rebuildEngines();
+      syncAutoSyncScheduler();
+      return { handled: true, outcome: 'updated' };
+    }
+
+    if (eventName === 'notebook.removed') {
+      configStore.onNotebookRemoved();
+      syncAutoSyncScheduler();
+      return { handled: true, outcome: 'skipped' };
     }
 
     if (eventName === 'plugin.credentials_migrate') {

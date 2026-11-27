@@ -71,6 +71,7 @@ import { createHostLocalAdapter } from './webdav.js';
 const DEFAULT_LOCK_TTL_MS = 120000;
 const MAX_STASH_ENTRIES = 64;
 const STASH_PROTECT_WINDOW_MS = 60000;
+const RECOVERY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 function trimTrailingSlash(p) {
   const s = String(p ?? '').replace(/\\/g, '/');
@@ -609,12 +610,76 @@ export function resolvePluginDataDir(callHost, dataDir = '') {
   return '';
 }
 
-/** Return the plugin-private recovery stash directory for rootDir, or '' if dataDir is unavailable. */
-export function recoveryDirForRoot(callHost, rootDir, dataDir = '') {
-  const pluginDataDir = resolvePluginDataDir(callHost, dataDir);
+const hostDataDirCacheByRpc = new WeakMap();
+
+function isRecoveryMethodUnsupportedError(err) {
+  if (!err) return false;
+  if (typeof err === 'object' && err.code === -32601) return true;
+  const msg = String(err && err.message ? err.message : err).toLowerCase();
+  return (
+    msg.includes('unknown host method') ||
+    msg.includes('method not found') ||
+    msg.includes('-32601')
+  );
+}
+
+export function clearRecoveryDirCache(callHost, rootDir = '') {
+  const rpc = typeof callHost === 'function' ? callHost : null;
+  if (!rpc) return;
+  const st = hostDataDirCacheByRpc.get(rpc);
+  if (!st) return;
   const cleanRoot = trimTrailingSlash(rootDir);
-  if (!pluginDataDir || !cleanRoot) return '';
-  const rootHash = sha256Text(cleanRoot, callHost).slice(0, 16);
+  if (cleanRoot) {
+    st.dirs.delete(cleanRoot);
+  } else {
+    st.dirs.clear();
+  }
+}
+
+function resolveNotebookRecoveryDir(rpc, cleanRoot) {
+  if (typeof rpc !== 'function' || !cleanRoot) return '';
+  let cache = hostDataDirCacheByRpc.get(rpc);
+  if (!cache) {
+    cache = { unsupported: false, dirs: new Map() };
+    hostDataDirCacheByRpc.set(rpc, cache);
+  }
+  if (cache.unsupported) return '';
+  if (cache.dirs.has(cleanRoot)) return cache.dirs.get(cleanRoot) || '';
+  try {
+    const res = rpc('host.notebooks.data_dir', { path: cleanRoot });
+    const nbDataPath = trimTrailingSlash(res && res.path ? res.path : '');
+    if (nbDataPath) {
+      const recDir = posixJoin(nbDataPath, 'recovery');
+      cache.dirs.set(cleanRoot, recDir);
+      return recDir;
+    }
+  } catch (exc) {
+    if (isRecoveryMethodUnsupportedError(exc)) {
+      cache.unsupported = true;
+      return '';
+    }
+    cache.dirs.set(cleanRoot, '');
+    return '';
+  }
+  cache.dirs.set(cleanRoot, '');
+  return '';
+}
+
+/**
+ * Return the plugin-private recovery stash directory for rootDir.
+ * Prefers host.notebooks.data_dir (<dataDir>/notebooks/<id>/recovery) for
+ * registered notebooks, falling back to <dataDir>/recovery/<hash16>/ on
+ * unregistered external directories or older hosts.
+ */
+export function recoveryDirForRoot(callHost, rootDir, dataDir = '') {
+  const rpc = resolveCallHost(callHost);
+  const cleanRoot = trimTrailingSlash(rootDir);
+  if (!cleanRoot) return '';
+  const nbRecoveryDir = resolveNotebookRecoveryDir(rpc, cleanRoot);
+  if (nbRecoveryDir) return nbRecoveryDir;
+  const pluginDataDir = resolvePluginDataDir(rpc, dataDir);
+  if (!pluginDataDir) return '';
+  const rootHash = sha256Text(cleanRoot, rpc).slice(0, 16);
   return posixJoin(pluginDataDir, 'recovery', rootHash);
 }
 
@@ -778,24 +843,61 @@ function stashCandidatesForRoot(callHost, rootDir, relPath, nowMsFn = () => Date
   return { nowMs, tag, gitDir, candidates };
 }
 
+function stashEntryTimestampMs(entry, name) {
+  const tsPart = String(name || '').split('-', 1)[0];
+  if (/^\d+$/.test(tsPart)) {
+    const parsed = Number.parseInt(tsPart, 10);
+    if (Number.isFinite(parsed) && parsed >= 1_000_000_000_000) {
+      return parsed;
+    }
+  }
+  const mtimeMs = Number(entry && entry.mod_time_ms);
+  if (Number.isFinite(mtimeMs) && mtimeMs > 0) {
+    return mtimeMs;
+  }
+  return 0;
+}
+
 function pruneStashDir(callHost, stashDir, keepName, nowMs) {
   try {
-    const cutoffMs = nowMs - STASH_PROTECT_WINDOW_MS;
-    const names = fsList(callHost, stashDir, false)
-      .map((e) => String(e?.name || ''))
-      .filter(Boolean)
-      .sort();
-    if (names.length <= MAX_STASH_ENTRIES) return;
-    for (const oldName of names.slice(0, names.length - MAX_STASH_ENTRIES)) {
-      if (oldName === keepName) continue;
-      const tsPart = oldName.split('-', 1)[0];
-      if (/^\d+$/.test(tsPart) && Number.parseInt(tsPart, 10) >= cutoffMs) {
+    const expireBeforeMs = nowMs - RECOVERY_RETENTION_MS;
+    const protectAfterMs = nowMs - STASH_PROTECT_WINDOW_MS;
+    const entries = fsList(callHost, stashDir, false);
+    const surviving = [];
+    for (const entry of entries) {
+      if (!entry || entry.is_dir) continue;
+      const name = String(entry.name || posixBasename(entry.path || ''));
+      if (!name) continue;
+      const tsMs = stashEntryTimestampMs(entry, name);
+      if (name !== keepName && tsMs > 0 && tsMs < expireBeforeMs) {
+        try {
+          fsDelete(callHost, posixJoin(stashDir, name));
+        } catch (_err) {
+          // Ignore prune errors.
+        }
         continue;
       }
+      surviving.push({ name, tsMs });
+    }
+    if (surviving.length > MAX_STASH_ENTRIES) {
+      surviving.sort((a, b) => (a.tsMs !== b.tsMs ? a.tsMs - b.tsMs : a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+      for (const item of surviving.slice(0, surviving.length - MAX_STASH_ENTRIES)) {
+        if (item.name === keepName) continue;
+        if (keepName && item.tsMs >= protectAfterMs) continue;
+        try {
+          fsDelete(callHost, posixJoin(stashDir, item.name));
+        } catch (_err) {
+          // Ignore prune errors.
+        }
+      }
+    }
+    if (!keepName) {
       try {
-        fsDelete(callHost, posixJoin(stashDir, oldName));
+        if (fsList(callHost, stashDir, false).length === 0) {
+          fsDelete(callHost, stashDir, false);
+        }
       } catch (_err) {
-        // Ignore prune errors.
+        // Ignore empty dir cleanup errors.
       }
     }
   } catch (_err) {
@@ -901,14 +1003,56 @@ function moveToRecoveryStash(callHost, srcPath, rootDir, relPath, nowMsFn = () =
   return '';
 }
 
+function moveDirFilesToRecovery(rpc, srcDir, recoveryDir, nowMs) {
+  let dirSt;
+  try {
+    dirSt = fsStat(rpc, srcDir);
+  } catch (_statErr) {
+    return;
+  }
+  if (!dirSt.exists || !dirSt.is_dir) return;
+  let entries = [];
+  try {
+    entries = fsList(rpc, srcDir, false);
+  } catch (_listErr) {
+    return;
+  }
+  let ensuredRecoveryDir = false;
+  for (const entry of entries) {
+    if (!entry || entry.is_dir || entry.is_regular === false || entry.is_file === false) continue;
+    const name = String(entry.name || posixBasename(entry.path || '')).trim();
+    if (!name) continue;
+    const srcPath = entry.path ? String(entry.path) : posixJoin(srcDir, name);
+    try {
+      if (!ensuredRecoveryDir) {
+        const recSt = fsStat(rpc, recoveryDir);
+        if (recSt.exists && !recSt.is_dir) return;
+        fsMkdir(rpc, recoveryDir, true);
+        ensuredRecoveryDir = true;
+      }
+      moveFileIntoRecovery(rpc, srcPath, recoveryDir, name, nowMs);
+    } catch (_moveErr) {
+      // Best-effort per entry; never block sync.
+    }
+  }
+  try {
+    const remaining = fsList(rpc, srcDir, false);
+    if (remaining.length === 0) {
+      fsDelete(rpc, srcDir, false);
+    }
+  } catch (_delErr) {
+    // Best-effort empty directory cleanup.
+  }
+}
+
 /**
  * Best-effort migration of legacy workspace .block-sync-replaced / .block-sync-recovery
- * regular files into <dataDir>/recovery/<rootHash>/, removing empty legacy directories.
+ * and path-hash recovery directories into recoveryDirForRoot(rootDir).
  */
 export function migrateLegacyRecoveryDirs(
   callHost,
   rootDir,
-  { dataDir = '', nowMsFn = () => Date.now() } = {}
+  { dataDir = '', nowMsFn = () => Date.now(), extraHashRoots = [] } = {}
 ) {
   try {
     const rpc = resolveCallHost(callHost);
@@ -917,6 +1061,21 @@ export function migrateLegacyRecoveryDirs(
     const recoveryDir = recoveryDirForRoot(rpc, cleanRoot, dataDir);
     if (!recoveryDir) return;
     const nowMs = nowMsFn();
+
+    const pluginDataDir = resolvePluginDataDir(rpc, dataDir);
+    if (pluginDataDir) {
+      const hashRoots = [cleanRoot];
+      for (const extra of extraHashRoots || []) {
+        const cleanExtra = trimTrailingSlash(extra);
+        if (cleanExtra && !hashRoots.includes(cleanExtra)) hashRoots.push(cleanExtra);
+      }
+      for (const hr of hashRoots) {
+        const legacyHashDir = posixJoin(pluginDataDir, 'recovery', sha256Text(hr, rpc).slice(0, 16));
+        if (legacyHashDir && legacyHashDir !== recoveryDir) {
+          moveDirFilesToRecovery(rpc, legacyHashDir, recoveryDir, nowMs);
+        }
+      }
+    }
 
     for (const legacyName of ['.block-sync-replaced', '.block-sync-recovery']) {
       const legacyDir = posixJoin(cleanRoot, legacyName);
@@ -963,8 +1122,64 @@ export function migrateLegacyRecoveryDirs(
         // Best-effort empty directory cleanup.
       }
     }
+    if (pluginDataDir) {
+      try {
+        const legacyRecoveryBase = posixJoin(pluginDataDir, 'recovery');
+        const st = fsStat(rpc, legacyRecoveryBase);
+        if (st.exists && st.is_dir && fsList(rpc, legacyRecoveryBase, false).length === 0) {
+          fsDelete(rpc, legacyRecoveryBase, false);
+        }
+      } catch (_cleanErr) {
+        // Ignore cleanup errors.
+      }
+    }
   } catch (_err) {
     // Best-effort migration; never block sync.
+  }
+}
+
+/** Enforce 7-day retention and 64-entry cap across notebook and legacy recovery dirs. */
+export function cleanupRecoveryDirs(
+  callHost,
+  { dataDir = '', notebooks = [], nowMsFn = () => Date.now() } = {}
+) {
+  try {
+    const rpc = resolveCallHost(callHost);
+    const nowMs = nowMsFn();
+    const seenDirs = new Set();
+    for (const nb of notebooks || []) {
+      const cleanNb = trimTrailingSlash(nb);
+      if (!cleanNb) continue;
+      const recDir = recoveryDirForRoot(rpc, cleanNb, dataDir);
+      if (recDir && !seenDirs.has(recDir)) {
+        seenDirs.add(recDir);
+        pruneStashDir(rpc, recDir, '', nowMs);
+      }
+    }
+    const pluginDataDir = resolvePluginDataDir(rpc, dataDir);
+    if (pluginDataDir) {
+      const base = posixJoin(pluginDataDir, 'recovery');
+      const st = fsStat(rpc, base);
+      if (st.exists && st.is_dir) {
+        for (const ent of fsList(rpc, base, false)) {
+          if (!ent || !ent.is_dir) continue;
+          const p = ent.path ? String(ent.path) : posixJoin(base, String(ent.name || ''));
+          if (p && !seenDirs.has(p)) {
+            seenDirs.add(p);
+            pruneStashDir(rpc, p, '', nowMs);
+          }
+        }
+        try {
+          if (fsList(rpc, base, false).length === 0) {
+            fsDelete(rpc, base, false);
+          }
+        } catch (_delErr) {
+          // Ignore empty dir cleanup.
+        }
+      }
+    }
+  } catch (_err) {
+    // Best-effort maintenance; never block plugin startup.
   }
 }
 
