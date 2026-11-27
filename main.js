@@ -422,7 +422,7 @@ function createSyncController() {
     }
     if (bgTrigger === 'interval') {
       const lastMs = intervalSyncedAt.get(key);
-      const intervalSec = (Number.parseInt(cfg.sync_interval || '5', 10) || 5) * 60;
+      const intervalSec = (Number.parseInt(cfg.sync_interval || '10', 10) || 10) * 60;
       if (lastMs !== undefined && now - lastMs < intervalSec * 1000 - 5000) {
         return true;
       }
@@ -710,7 +710,7 @@ function createSyncController() {
       (!supportsMultiNotebook || selected.length > 0);
     try {
       if (shouldRegister) {
-        const intervalMin = Number.parseInt(cfg.sync_interval || '5', 10) || 5;
+        const intervalMin = Number.parseInt(cfg.sync_interval || '10', 10) || 10;
         const intervalSec = Math.max(60, intervalMin * 60);
         const requireNetwork = activeProtos.every((p) => protocolNeedsNetwork(p, cfg));
         callHost('host.scheduler.register', {
@@ -1139,7 +1139,7 @@ function createSyncController() {
         outageSinceMs = prevOutageSince > 0 ? prevOutageSince : nowMs;
         const offlineMs = calcOfflineMs(protoLastSuccess, outageSinceMs, nowMs, nowStr);
         const offlineMin = Math.max(1, Math.round(offlineMs / 60000));
-        const intervalMin = Number.parseInt(configStore.state.config.sync_interval || '5', 10) || 5;
+        const intervalMin = Number.parseInt(configStore.state.config.sync_interval || '10', 10) || 10;
         const baseIntervalMs = intervalMin >= 15 ? intervalMin * 60 * 1000 : 0;
         const stepIdx = Math.min(Math.max(0, transientStreak - 1), NETWORK_BACKOFF_STEPS_MS.length - 1);
         const backoffMs = Math.min(60 * 60 * 1000, Math.max(NETWORK_BACKOFF_STEPS_MS[stepIdx], baseIntervalMs));

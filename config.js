@@ -16,6 +16,7 @@ import {
   syncDirKey,
   sanitizeUrlForDisplay,
   DEFAULT_MAX_FILE_SIZE_MB,
+  DEFAULT_IGNORE_PATTERNS,
   normalizeMaxFileSizeMb,
 } from './utils.js';
 
@@ -27,7 +28,7 @@ export const PROTOCOL_ENABLED_KEYS = Object.freeze({
 });
 export const VALID_CONFLICT_POLICIES = Object.freeze(['keep_both', 'remote_first', 'local_first']);
 export const VALID_GIT_AUTHS = Object.freeze(['ssh', 'token']);
-export const VALID_SYNC_INTERVALS = Object.freeze(['5', '30', '60']);
+export const VALID_SYNC_INTERVALS = Object.freeze(['10', '30', '60']);
 export const SYNC_INTERVAL_EVENT = 'plugin.sync_interval';
 export const DELETE_GUARD_THRESHOLD = 5;
 export const MAX_LOG_ENTRIES = 100;
@@ -43,6 +44,9 @@ export const MAX_WEBDAV_DIRS = 2000;
 export const CREDENTIAL_FIELDS = Object.freeze(['git_token', 'webdav_pass']);
 export const CREDENTIAL_MAX_BYTES = 1536;
 export const CREDENTIAL_REF_RE = /^sync\.(git_token|webdav_pass)\.[0-9a-f]{32}$/;
+
+// Bump when defaults change in a way existing configs should adopt once.
+export const CONFIG_DEFAULTS_REV = 2;
 
 export const DEFAULT_CONFIG = Object.freeze({
   selected_notebooks: [],
@@ -61,13 +65,14 @@ export const DEFAULT_CONFIG = Object.freeze({
   git_auth: 'ssh',
   git_token: '',
   auto_sync: true,
-  sync_interval: '5',
+  sync_interval: '10',
   system_notifications: true,
   sync_assets: true,
   max_file_size_mb: DEFAULT_MAX_FILE_SIZE_MB,
-  ignore_patterns: '',
+  ignore_patterns: DEFAULT_IGNORE_PATTERNS,
   conflict_policy: 'keep_both',
   delete_guard: true,
+  defaults_rev: CONFIG_DEFAULTS_REV,
 });
 
 export function cloneDefaultConfig() {
@@ -513,6 +518,12 @@ export function normalizeConfig(
 
 export function loadConfigRecord(raw, opts = {}) {
   const config = normalizeConfig(raw, { ...opts, base: DEFAULT_CONFIG });
+  if (raw && typeof raw === 'object' && (Number(raw.defaults_rev) || 0) < CONFIG_DEFAULTS_REV) {
+    // One-time migration: adopt GitHub-sized limit and default media ignore rules.
+    if (String(raw.max_file_size_mb ?? '50') === '50') config.max_file_size_mb = DEFAULT_MAX_FILE_SIZE_MB;
+    if (!String(raw.ignore_patterns ?? '').trim()) config.ignore_patterns = DEFAULT_IGNORE_PATTERNS;
+  }
+  config.defaults_rev = CONFIG_DEFAULTS_REV;
   const refs = raw && typeof raw === 'object' ? raw.credential_refs : null;
   if (refs && typeof refs === 'object' && !Array.isArray(refs)) {
     const cleanRefs = {};

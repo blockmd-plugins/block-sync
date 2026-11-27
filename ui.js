@@ -687,9 +687,9 @@ function syncIntervalItem(cfg, locale) {
     kind: 'segmented',
     id: 'sync_interval',
     label: tr(locale, '定时同步间隔', 'Scheduled Sync Interval'),
-    value: String(cfg.sync_interval || '5'),
+    value: String(cfg.sync_interval || '10'),
     options: [
-      { value: '5', label: tr(locale, '5 分钟', '5 min') },
+      { value: '10', label: tr(locale, '10 分钟', '10 min') },
       { value: '30', label: tr(locale, '30 分钟', '30 min') },
       { value: '60', label: tr(locale, '1 小时', '1 hour') },
     ],
@@ -704,8 +704,8 @@ function fileSyncOptions(cfg, locale, supportsFormAutosave = false) {
         kind: 'input',
         id: 'max_file_size_mb',
         label: tr(locale, '单文件大小上限 (MB)', 'Per-file size limit (MB)'),
-        value: String(cfg.max_file_size_mb ?? '50'),
-        placeholder: '50 (1–64)',
+        value: String(cfg.max_file_size_mb ?? '100'),
+        placeholder: '100 (1–100)',
       },
       supportsFormAutosave
     ),

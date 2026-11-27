@@ -8,7 +8,10 @@
 import { tr } from './i18n.js';
 
 export const MAX_SYNC_FILE_BYTES = 64 * 1024 * 1024;
-export const DEFAULT_MAX_FILE_SIZE_MB = '50';
+// GitHub rejects files larger than 100 MiB, so use that as both default and cap.
+export const DEFAULT_MAX_FILE_SIZE_MB = '100';
+export const MAX_FILE_SIZE_MB_CAP = 100;
+export const DEFAULT_IGNORE_PATTERNS = ['*.mp4', '*.mov', '*.m4v', '*.mkv', '*.avi', '*.webm', '*.wmv', '*.flv', '*.iso', '*.dmg'].join('\n');
 
 export const NOTE_EXTENSIONS = new Set([
   '.md',
@@ -607,7 +610,7 @@ export function isSafeRelAsset(relPath) {
 export function normalizeMaxFileSizeMb(value) {
   const input = String(value ?? '').trim();
   const size = Number(input);
-  return /^\d+$/.test(input) && size >= 1 && size <= 64
+  return /^\d+$/.test(input) && size >= 1 && size <= MAX_FILE_SIZE_MB_CAP
     ? String(size) : DEFAULT_MAX_FILE_SIZE_MB;
 }
 
@@ -690,7 +693,8 @@ export function createSyncSkips(cfg, locale = 'zh', round = { consecutive: 0 }) 
   const blocked = new Set();
   const patterns = String(cfg?.ignore_patterns || '').split(/\r?\n|\\n/).map((rule) => rule.trim().replace(/^\/+|\/+$/g, '')).filter(Boolean);
   const globs = patterns.filter((rule) => rule.includes('*')).map((rule) => new RegExp(
-    `^${rule.split('*').map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('[\\s\\S]*')}$`
+    `^${rule.split('*').map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('[\\s\\S]*')}$`,
+    'i'
   ));
   const prefixes = patterns.filter((rule) => !rule.includes('*'));
   const key = (path) => foldSyncPath(path, { caseInsensitive: true, normalize: true });
