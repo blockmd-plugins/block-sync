@@ -5,7 +5,7 @@
  * deterministic conflict copy naming, and host.crypto.hash wrappers.
  */
 
-import { tr, sanitizeErrorText } from './i18n.js';
+import { tr } from './i18n.js';
 
 export const MAX_SYNC_FILE_BYTES = 64 * 1024 * 1024;
 export const DEFAULT_MAX_FILE_SIZE_MB = '50';
