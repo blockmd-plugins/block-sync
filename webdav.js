@@ -11,6 +11,7 @@ import {
   protocolLabel,
   formatReasonItem,
   formatSkippedCount,
+  mergeOnlyRoundNote,
 } from './i18n.js';
 import {
   resolveCallHost,
@@ -76,6 +77,7 @@ import {
   WEBDAV_TRASH_DIR,
   INITIALIZED_META_KEY,
   LAYOUTS_META_KEY,
+  evaluateBaselineState,
   resolveWebdavDir,
   resolveCredentials,
   computeNotebookSubdirMap,
@@ -2407,18 +2409,20 @@ export function createWebDAVSyncEngine({
     const metaKey = configStore ? configStore.metaKey('webdav', metaTarget, nbKeyVal) : `nb:${nbKeyVal}|webdav:${metaTarget}`;
     const legacyKey = rootBaseUrl && !subdir ? `webdav:${rootBaseUrl}` : null;
 
-    const hasVerifiedBase =
-      !configStore ||
-      typeof configStore.hasVerifiedBaseline !== 'function' ||
-      configStore.hasVerifiedBaseline(effectiveNbRoot, {
-        metaKey,
-        legacyKeys: legacyKey ? [legacyKey] : [],
-        nbKeyVal,
-        protocol: 'webdav',
-      });
+    const preEval = configStore
+      ? evaluateBaselineState(configStore, {
+          protocol: 'webdav',
+          nbRoot: effectiveNbRoot,
+          metaKey,
+          legacyKeys: legacyKey ? [legacyKey] : [],
+          nbKeyVal,
+          callHost: rpc,
+          homeDir,
+        })
+      : null;
     let onlyPath = rawOnlyPath;
     let scope = (rawCfg && rawCfg.sync_scope) || 'all';
-    if (!hasVerifiedBase && (onlyPath !== null || scope !== 'all')) {
+    if (preEval && preEval.forceFullSync && (onlyPath !== null || scope !== 'all')) {
       onlyPath = null;
       scope = 'all';
     }
@@ -2495,46 +2499,23 @@ export function createWebDAVSyncEngine({
 
     localNotes = Object.fromEntries(Object.entries(localNotes).filter(([path]) => skips.check(path)));
     remoteNotes = Object.fromEntries(Object.entries(remoteNotes).filter(([path]) => skips.check(path)));
-    const allowLegacy =
-      Boolean(legacyKey) &&
-      !(
-        configStore &&
-        configStore.state &&
-        (configStore.state.hostSupportsNotebookIds ||
-          (configStore.state.notebookIdMap &&
-            configStore.state.notebookIdMap.by_id &&
-            Object.hasOwn(configStore.state.notebookIdMap.by_id, nbKeyVal)))
-      );
-    const effectiveLegacyKey = allowLegacy ? legacyKey : null;
-    const rawBaseMap = configStore ? configStore.getBaseMap(metaKey, effectiveLegacyKey) : {};
-    const initMap = (configStore && configStore.state.syncMeta[INITIALIZED_META_KEY]) || {};
-    const hasMeta = Boolean(
-      Object.keys(rawBaseMap).length > 0 ||
-      (initMap && (initMap[metaKey] || (effectiveLegacyKey && initMap[effectiveLegacyKey])))
-    );
-    const idCheck =
-      configStore && typeof configStore.verifyNotebookIdentity === 'function'
-        ? configStore.verifyNotebookIdentity(effectiveNbRoot, {
-            metaKey,
-            legacyKeys: effectiveLegacyKey ? [effectiveLegacyKey] : [],
-            nbKeyVal,
-            hasExistingBaseline: hasMeta,
-          })
-        : (() => {
-            const live = queryLiveNotebookIdentity(rpc, effectiveNbRoot, homeDir);
-            return {
-              identity_ok: Boolean(live.verified && live.rootIdentity),
-              verified: Boolean(live.verified),
-              root_identity: live.rootIdentity || '',
-              recorded_root_identity: '',
-              live_id: live.id || '',
-              reason: live.verified ? '' : 'host_unverified',
-            };
-          })();
-    const identityVerified = Boolean(idCheck && idCheck.identity_ok === true);
-    const identityDegraded = Boolean(hasMeta && !identityVerified);
-    const baseMap = identityVerified ? rawBaseMap : {};
-    const isFirstSync = !identityVerified || !hasMeta;
+    const evalState = evaluateBaselineState(configStore, {
+      protocol: 'webdav',
+      nbRoot: effectiveNbRoot,
+      metaKey,
+      legacyKeys: legacyKey ? [legacyKey] : [],
+      nbKeyVal,
+      callHost: rpc,
+      homeDir,
+    });
+    const effectiveLegacyKey = evalState.effectiveLegacyKeys[0] || null;
+    const rawBaseMap = evalState.originalBaseMap;
+    const hasMeta = evalState.hasExistingMeta;
+    const idCheck = evalState.idCheck;
+    const identityVerified = evalState.identityVerified;
+    const identityDegraded = evalState.identityDegraded;
+    const baseMap = evalState.baseMap;
+    const isFirstSync = evalState.isFirstSync;
 
     let remoteNonemptyOnFirstSync = false;
     if (remoteInspected && !remoteError && isFirstSync && onlyPath === null) {
@@ -2809,6 +2790,12 @@ export function createWebDAVSyncEngine({
       skipped_items: skips.items,
       skips,
       is_first_sync: isFirstSync,
+      has_existing_baseline: hasMeta,
+      merge_only: evalState.mergeOnly,
+      merge_only_rule: evalState.mergeOnlyRule,
+      merge_only_reason: evalState.reason,
+      fingerprint_matched: evalState.fingerprintMatch,
+      meta_aliases: effectiveLegacyKey ? [effectiveLegacyKey] : [],
       is_partial_sync: Boolean((onlyPath !== null && onlyPath !== undefined && onlyPath !== '') || (scope && scope !== 'all')),
       identity_verified: identityVerified,
       live_identity_verified: Boolean(idCheck && idCheck.verified === true),
@@ -2888,7 +2875,7 @@ export function createWebDAVSyncEngine({
     const policy = plan.policy || cfg.conflict_policy || 'keep_both';
     const m = planRiskMetrics(plan);
 
-    if (plan.is_first_sync) {
+    if (plan.is_first_sync && !plan.has_existing_baseline) {
       if (m.pull_new > 0 || m.pull_conflict > 0 || m.push_conflict > 0 || m.conflicts > 0) {
         items.push({
           kind: 'first_sync',
@@ -3196,12 +3183,27 @@ export function createWebDAVSyncEngine({
         plan.is_first_sync === true ||
         !startIdCheck ||
         startIdCheck.identity_ok !== true;
-      const unverifiedAtStart = Boolean(
-        plan.identity_degraded ||
-          (plan.identity_verified !== true && plan.identity_reason !== 'missing_baseline_identity') ||
-          (plan.identity_verified === true && (!startIdCheck || startIdCheck.identity_ok !== true))
+      const mergeOnlyRuleStart = Boolean(
+        plan.merge_only_rule === true &&
+          startIdCheck &&
+          startIdCheck.verified === true &&
+          (!plan.live_root_identity || startIdCheck.root_identity === plan.live_root_identity)
       );
-      if (unverifiedAtStart) {
+      const unverifiedAtStart =
+        !mergeOnlyRuleStart &&
+        Boolean(
+          plan.identity_degraded ||
+            (plan.identity_verified !== true && plan.identity_reason !== 'missing_baseline_identity') ||
+            (plan.identity_verified === true && (!startIdCheck || startIdCheck.identity_ok !== true))
+        );
+      if (mergeOnlyRuleStart) {
+        const note = mergeOnlyRoundNote(loc);
+        appendLog(state, tr(loc, `${prefix}${note}`, `${prefix}${note}`), '成功', {
+          tone: 'success',
+          logKey: 'merge_only_refresh',
+          logArgs: { prefix, reason: plan.merge_only_reason || '' },
+        });
+      } else if (unverifiedAtStart) {
         appendLog(
           state,
           tr(loc, `${prefix}未验证笔记本身份，已降级为仅合并`, `${prefix}Notebook identity unverified; downgraded to merge-only`),
@@ -3450,10 +3452,12 @@ export function createWebDAVSyncEngine({
       const deleteExpectedHashes = plan.delete_expected_hashes || {};
 
       const preDeleteIdCheck = verifyPlanLiveIdentity(rpc, configStore, plan);
+      const allowLiveRefresh =
+        plan.merge_only_rule === true || plan.identity_reason === 'missing_baseline_identity';
       const liveMissingPinOk =
         plan.identity_verified !== true &&
         plan.live_identity_verified === true &&
-        plan.identity_reason === 'missing_baseline_identity' &&
+        allowLiveRefresh &&
         Boolean(preDeleteIdCheck && preDeleteIdCheck.verified === true) &&
         (!plan.live_root_identity || preDeleteIdCheck.root_identity === plan.live_root_identity);
       const preDeleteIdentityOk =
@@ -3462,7 +3466,7 @@ export function createWebDAVSyncEngine({
       const midSyncIdentityLost =
         rootMismatchAborted ||
         (plan.identity_verified === true && !preDeleteIdentityOk) ||
-        (plan.live_identity_verified === true && plan.identity_reason === 'missing_baseline_identity' && !liveMissingPinOk);
+        (plan.live_identity_verified === true && allowLiveRefresh && !liveMissingPinOk);
       if (forceSkipDeletions || !preDeleteIdentityOk || rootMismatchAborted) {
         if (midSyncIdentityLost || (deletions.length > 0 && !preDeleteIdentityOk)) {
           plan._deletions_aborted = true;
@@ -3772,6 +3776,7 @@ export function createWebDAVSyncEngine({
 
     const skippedItems = collectSkippedItems(batch.plans);
     const skippedSummary = skippedItems.length ? formatSkippedCount(loc, skippedItems.length) : '';
+    const mergeOnlyRule = batch.plans.some((p) => p.merge_only_rule === true);
     const totalNotes = totalPushed + totalPulled + totalConflicts;
     if (totalNotes === 0 && totalAssets === 0 && totalDeleted === 0) {
       if (batch.plans.some((p) => p._deletions_aborted)) {
@@ -3786,9 +3791,14 @@ export function createWebDAVSyncEngine({
           deleted: 0,
         };
       }
+      let noopSummary = skippedSummary || tr(loc, '已是最新', 'Up to date');
+      if (mergeOnlyRule) {
+        noopSummary += ` · ${mergeOnlyRoundNote(loc)}`;
+      }
       return {
         status: '无变更',
-        summary: skippedSummary || tr(loc, '已是最新', 'Up to date'),
+        summary: noopSummary,
+        merge_only_rule: mergeOnlyRule,
         skipped_items: skippedItems,
         pushed: 0,
         pulled: 0,
@@ -3811,9 +3821,11 @@ export function createWebDAVSyncEngine({
     }
 
     if (skippedSummary) summary += ` · ${skippedSummary}`;
+    if (mergeOnlyRule) summary += ` · ${mergeOnlyRoundNote(loc)}`;
     return {
       status: '成功',
       summary,
+      merge_only_rule: mergeOnlyRule,
       skipped_items: skippedItems,
       pushed: totalPushed,
       pulled: totalPulled,

@@ -290,6 +290,7 @@ jobs:
             storageWriteError: null,
             identityVerified: true,
             previousPaths: [],
+            hostOverride: null,
             secrets: new Map(),
             logs: [],
             bgErrors: [],
@@ -312,6 +313,7 @@ jobs:
             state.storageWriteError = null;
             state.identityVerified = opts.identityVerified !== undefined ? Boolean(opts.identityVerified) : true;
             state.previousPaths = Array.isArray(opts.previousPaths) ? [...opts.previousPaths] : [];
+            state.hostOverride = null;
             state.secrets = new Map();
             state.logs = [];
             state.bgErrors = [];
@@ -325,6 +327,10 @@ jobs:
           export function notifyHost(_method, _params = {}) {}
 
           export function callHost(method, params = {}) {
+            if (typeof state.hostOverride === 'function') {
+              const over = state.hostOverride(method, params);
+              if (over !== undefined) return over;
+            }
             if (method === 'host.storage.get') {
               const key = params.key;
               if (!key) {
@@ -439,6 +445,7 @@ jobs:
                   size: st.size,
                   mtime_ms: st.mtimeMs,
                   mod_time_ms: st.mtimeMs,
+                  ...(st.isDirectory() && !st.isSymbolicLink() ? { root_identity: st.dev + ':' + st.ino } : {}),
                 };
               } catch (err) {
                 if (err && err.code === 'ENOENT') {
@@ -1124,6 +1131,9 @@ jobs:
             const davDegPlan = davEngine.computeSyncPlan({ cfg: { protocol: 'webdav', webdav_url: 'https://dav.example.invalid', webdav_dir: '/BlockNotes', sync_scope: 'all', conflict_policy: 'keep_both' }, inspectRemote: true, forceRefresh: true, nbRoot: notebook });
             requireCond(davDegPlan.identity_verified === false && davDegPlan.is_first_sync === true && davDegPlan.to_delete_remote.length === 0, 'Issue 1 (WebDAV): unverified identity must force merge-only without deletions');
             sdk.state.identityVerified = true;
+            const davMissingFpPlan = davEngine.computeSyncPlan({ cfg: { protocol: 'webdav', webdav_url: 'https://dav.example.invalid', webdav_dir: '/BlockNotes', sync_scope: 'all', conflict_policy: 'keep_both' }, inspectRemote: true, forceRefresh: true, nbRoot: notebook });
+            requireCond(davMissingFpPlan.merge_only_rule === true && davMissingFpPlan.is_first_sync === true && davMissingFpPlan.to_delete_remote.length === 0, 'Core rule (WebDAV): legacy baseline without fingerprint must force merge-only without deletions');
+            davStore.state.syncMeta[configMod.BASELINE_FINGERPRINTS_META_KEY] = { [davMetaKey]: { nb_root_identity: liveRootId } };
             const davOkPlan = davEngine.computeSyncPlan({ cfg: { protocol: 'webdav', webdav_url: 'https://dav.example.invalid', webdav_dir: '/BlockNotes', sync_scope: 'all', conflict_policy: 'keep_both' }, inspectRemote: true, forceRefresh: true, nbRoot: notebook });
             requireCond(davOkPlan.identity_verified === true && davOkPlan.is_first_sync === false && davOkPlan.to_delete_remote.includes('gone.md'), 'Issue 1 (WebDAV): verified plan should schedule remote deletion before mid-sync flip');
             sdk.state.identityVerified = false;
@@ -1131,7 +1141,7 @@ jobs:
             requireCond(davOkPlan._deletions_aborted === true && !davTrashCalled, 'Issue 1 (WebDAV): Step 4 must abort remote deletion when live identity turns unverified');
             sdk.state.identityVerified = true;
 
-            // Item 2: Startup-only legacy path migration for current verified notebook + rename without baseline migration + downgrade ID reverse lookup.
+            // Item 1 & Item 2: Per-key legacy path claiming without pinning identity/fingerprint + delayed claiming (unverified / external drive / previous_paths) + merge-only Round 1.
             const makeIsoStore = (isoStorage, { identityVerified = true, omitHostId = false } = {}) => {
               const isoRpc = (method, params = {}) => {
                 if (method === 'host.storage.get') {
@@ -1149,23 +1159,32 @@ jobs:
                   return { ok: true };
                 }
                 if (method === 'host.notebooks.list') {
+                  const extraNbs = Array.isArray(isoStorage.__extraNotebooks) ? isoStorage.__extraNotebooks : [];
                   return {
-                    notebooks: [{
-                      ...(omitHostId ? {} : { id: isoStorage.__nbId || 'nb-iso-new' }),
-                      path: isoStorage.__nbPath || '/iso/nbA',
-                      name: 'nbA',
-                      active: true,
-                      identity_verified: Boolean(identityVerified),
-                      root_identity: isoStorage.__rootId || '11:22',
-                    }],
+                    notebooks: [
+                      {
+                        ...(omitHostId ? {} : { id: isoStorage.__nbId || 'nb-iso-new' }),
+                        path: isoStorage.__nbPath || '/iso/nbA',
+                        name: 'nbA',
+                        active: true,
+                        previous_paths: Array.isArray(isoStorage.__prevPaths) ? isoStorage.__prevPaths : [],
+                        identity_verified: Boolean(identityVerified),
+                        root_identity: isoStorage.__rootId || '11:22',
+                      },
+                      ...extraNbs,
+                    ],
                   };
                 }
                 if (method === 'host.notebooks.data_dir') {
+                  const reqPath = String(params.path || isoStorage.__nbPath || '/iso/nbA');
+                  const extra = (Array.isArray(isoStorage.__extraNotebooks) ? isoStorage.__extraNotebooks : []).find((n) => n && n.path === reqPath);
+                  if (extra) return { ...extra };
                   return {
                     ...(omitHostId ? {} : { id: isoStorage.__nbId || 'nb-iso-new' }),
                     path: isoStorage.__nbPath || '/iso/nbA',
                     name: 'nbA',
                     active: true,
+                    previous_paths: Array.isArray(isoStorage.__prevPaths) ? isoStorage.__prevPaths : [],
                     identity_verified: Boolean(identityVerified),
                     root_identity: isoStorage.__rootId || '11:22',
                   };
@@ -1184,10 +1203,11 @@ jobs:
               config: { mirror_dir: '/iso/M', selected_notebooks: ['/iso/nbA'] },
               notebook_configs: { '/iso/nbA': { mirror_dir: '/iso/M', selected_notebooks: ['/iso/nbA'] } },
               sync_meta: {
+                [configMod.LEGACY_PATH_MIGRATED_KEY]: true,
                 'nb:/iso/nbA|local_mirror:/iso/M': { 'kept.md': 'h-kept' },
                 'nb:/iso/other|local_mirror:/iso/M': { 'stale.md': 'h-stale' },
                 'local_mirror:/iso/M': { 'unns.md': 'h-unns' },
-                [configMod.INITIALIZED_META_KEY]: { 'nb:/iso/nbA|local_mirror:/iso/M': true, 'local_mirror:/iso/M': true },
+                [configMod.INITIALIZED_META_KEY]: { 'nb:/iso/nbA|local_mirror:/iso/M': true, 'nb:/iso/other|local_mirror:/iso/M': true, 'local_mirror:/iso/M': true },
               },
               notebook_results: {},
             };
@@ -1195,26 +1215,66 @@ jobs:
             requireCond(
               startupStore.state.syncMeta['nb:nb-iso-new|local_mirror:/iso/M'] &&
                 startupStore.state.syncMeta['nb:nb-iso-new|local_mirror:/iso/M']['kept.md'] === 'h-kept',
-              'Item 2: first startup must migrate verified current path key nb:<path>|... to ID key'
+              'Item 2: verified notebook must claim its matching legacy path key per key'
             );
             requireCond(
               startupStore.state.syncMeta['nb:/iso/nbA|local_mirror:/iso/M'] === undefined,
-              'Item 2: migrated old path key nb:<path>|... must be deleted'
+              'Item 2: claimed legacy path key nb:<path>|... must be deleted'
             );
             requireCond(
-              startupStore.state.syncMeta[configMod.LEGACY_PATH_MIGRATED_KEY] === true,
-              'Item 2: startup migration must record __legacy_path_migrated__'
+              startupStore.state.syncMeta['nb:/iso/other|local_mirror:/iso/M'] &&
+                startupStore.state.syncMeta['nb:/iso/other|local_mirror:/iso/M']['stale.md'] === 'h-stale',
+              'Item 2: unclaimed foreign/offline path key must be preserved for future claiming'
             );
             requireCond(
-              startupStore.state.syncMeta[configMod.ROOT_IDENTITIES_META_KEY]['nb:nb-iso-new|local_mirror:/iso/M'] === '11:22',
-              'Item 2: migrated baseline must pin root_identity'
+              !Object.prototype.hasOwnProperty.call(startupStore.state.syncMeta, configMod.LEGACY_PATH_MIGRATED_KEY),
+              'Item 2: must not set or honor global __legacy_path_migrated__ lock'
+            );
+            requireCond(
+              !startupStore.state.syncMeta[configMod.ROOT_IDENTITIES_META_KEY]?.['nb:nb-iso-new|local_mirror:/iso/M'] &&
+                !startupStore.state.syncMeta[configMod.BASELINE_FINGERPRINTS_META_KEY]?.['nb:nb-iso-new|local_mirror:/iso/M'],
+              'Item 1: claimed legacy baseline must not carry a fingerprint or pinned identity before Round 1 merges'
+            );
+            const item1Eval = configMod.evaluateBaselineState(startupStore, {
+              protocol: 'local_mirror',
+              nbRoot: '/iso/nbA',
+              metaKey: 'nb:nb-iso-new|local_mirror:/iso/M',
+              nbKeyVal: 'nb-iso-new',
+              currentTargetIdentity: '99:88',
+            });
+            requireCond(
+              item1Eval.mergeOnly === true && item1Eval.mergeOnlyRule === true && item1Eval.forceFullSync === true && Object.keys(item1Eval.baseMap).length === 0,
+              'Item 1: Round 1 on claimed baseline without fingerprint must force full merge-only so mismatched replacement never deletes remote'
+            );
+            const item1Plan = localMirror.computeThreeWaySyncPlan({
+              callHost: sdk.callHost,
+              configStore: startupStore,
+              localAdapter: hostLocalAdapter,
+              protocol: 'local_mirror',
+              cfg: { sync_scope: 'all', conflict_policy: 'keep_both' },
+              nbRoot: '/iso/nbA',
+              nbKeyVal: 'nb-iso-new',
+              nbLabelVal: 'nbA',
+              targetDisplay: '/iso/M',
+              targetDir: '/iso/M',
+              metaKey: 'nb:nb-iso-new|local_mirror:/iso/M',
+              localNotes: {},
+              remoteNotes: { 'kept.md': 'Remote content from true notebook' },
+              remoteInspected: true,
+              remoteError: null,
+              currentTargetIdentity: '99:88',
+              locale,
+            });
+            requireCond(
+              item1Plan.merge_only_rule === true && item1Plan.is_first_sync === true && item1Plan.to_delete_remote.length === 0 && item1Plan.to_pull_new.includes('kept.md'),
+              'Item 1: same-path replacement upgraded before fingerprint must pull instead of deleting remote'
             );
             requireCond(
               startupStore.notebookKey('/iso/nbA') === 'nb-iso-new',
               'Item 2: notebookKey must resolve to notebook ID'
             );
 
-            // Unverified startup must NOT migrate path baseline, and after __legacy_path_migrated__=true later restarts must NOT migrate it either.
+            // Unverified startup preserves unclaimed path key; once verified (or external drive mounted / renamed via previous_paths), later startups or refresh claim it cleanly.
             const unverifiedStorage = {
               __nbId: 'nb-unv',
               __nbPath: '/iso/nbU',
@@ -1223,20 +1283,51 @@ jobs:
               notebook_configs: {},
               sync_meta: {
                 'nb:/iso/nbU|local_mirror:/iso/M': { 'old.md': 'h-old' },
-                [configMod.INITIALIZED_META_KEY]: { 'nb:/iso/nbU|local_mirror:/iso/M': true },
+                'nb:/iso/ext-old|local_mirror:/iso/M': { 'ext.md': 'h-ext' },
+                [configMod.INITIALIZED_META_KEY]: {
+                  'nb:/iso/nbU|local_mirror:/iso/M': true,
+                  'nb:/iso/ext-old|local_mirror:/iso/M': true,
+                },
               },
               notebook_results: {},
             };
             const unvStore1 = makeIsoStore(unverifiedStorage, { identityVerified: false });
             requireCond(
               unvStore1.state.syncMeta['nb:nb-unv|local_mirror:/iso/M'] === undefined &&
-                unvStore1.state.syncMeta[configMod.LEGACY_PATH_MIGRATED_KEY] === true,
-              'Item 2: unverified notebook must not inherit path baseline on first startup'
+                unvStore1.state.syncMeta['nb:/iso/nbU|local_mirror:/iso/M']?.['old.md'] === 'h-old' &&
+                !Object.prototype.hasOwnProperty.call(unvStore1.state.syncMeta, configMod.LEGACY_PATH_MIGRATED_KEY),
+              'Item 2: unverified notebook must leave path baseline preserved without setting a permanent skip flag'
             );
+            const lateEval = configMod.evaluateBaselineState(unvStore1, {
+              protocol: 'local_mirror',
+              nbRoot: '/iso/nbU',
+              metaKey: 'nb:nb-unv|local_mirror:/iso/M',
+              nbKeyVal: 'nb-unv',
+              currentTargetIdentity: '99:88',
+            });
+            requireCond(
+              Object.keys(lateEval.baseMap).length === 0 && !lateEval.hasExistingMeta,
+              'Item 2: unclaimed legacy path keys must not participate in sync until claimed'
+            );
+            unverifiedStorage.__extraNotebooks = [{
+              id: 'nb-ext',
+              path: '/iso/ext-new',
+              name: 'ext',
+              active: false,
+              previous_paths: ['/iso/ext-old'],
+              identity_verified: true,
+              root_identity: '77:99',
+            }];
             const unvStore2 = makeIsoStore(unverifiedStorage, { identityVerified: true });
             requireCond(
-              unvStore2.state.syncMeta['nb:nb-unv|local_mirror:/iso/M'] === undefined,
-              'Item 2: once __legacy_path_migrated__ is set, subsequent startups must never migrate old path keys'
+              unvStore2.state.syncMeta['nb:nb-unv|local_mirror:/iso/M']?.['old.md'] === 'h-old' &&
+                unvStore2.state.syncMeta['nb:/iso/nbU|local_mirror:/iso/M'] === undefined,
+              'Item 2: once verified, notebook must retroactively claim its preserved legacy path baseline'
+            );
+            requireCond(
+              unvStore2.state.syncMeta['nb:nb-ext|local_mirror:/iso/M']?.['ext.md'] === 'h-ext' &&
+                unvStore2.state.syncMeta['nb:/iso/ext-old|local_mirror:/iso/M'] === undefined,
+              'Item 2: notebook with matching previous_paths and identity_verified must claim old path baseline'
             );
 
             // Rename keeps ID-keyed baseline without migrating path keys and supports downgrade reverse lookup via notebook_id_map.
@@ -1470,6 +1561,66 @@ jobs:
             const remoteCount = spawnSync('git', ['--git-dir', gitBareRemote, 'rev-list', '--count', 'main'], { encoding: 'utf8' });
             requireCond(remoteCount.stdout.trim() === '3', 'Item 1: remote main must have 3 sequential commits (seed, delete, restore) pushed without rewriting history');
 
+            // Item 3: Crash after local commit C4 (before saving baseline) mismatches baseline HEAD oid and forces full merge-only instead of trashing restored note.
+            const gitMk = gitStore.metaKey('git', repoCloneDir + ':main', 'nb-git-check');
+            const c3Head = spawnSync('git', ['-C', repoCloneDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+            requireCond(
+              gitStore.state.syncMeta[configMod.BASELINE_FINGERPRINTS_META_KEY]?.[gitMk]?.target_identity === c3Head,
+              'Item 3: completed Git sync must record HEAD oid in baseline fingerprint'
+            );
+            spawnSync('git', ['-C', repoCloneDir, 'rm', '-f', 'restore-me.md'], { encoding: 'utf8' });
+            spawnSync('git', ['-C', repoCloneDir, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-m', 'simulated crash commit'], { encoding: 'utf8' });
+            spawnSync('git', ['-C', repoCloneDir, 'push', 'origin', 'main'], { encoding: 'utf8' });
+            const c4Head = spawnSync('git', ['-C', repoCloneDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+            requireCond(c4Head && c4Head !== c3Head, 'Item 3: HEAD oid must advance beyond stale baseline');
+            const crashPlan = gitEngine.computeSyncPlan({ cfg: gitCfg, inspectRemote: true, nbRoot: gitNbDir });
+            requireCond(
+              crashPlan.merge_only_rule === true && crashPlan.is_first_sync === true && crashPlan.to_delete_local.length === 0 && crashPlan.to_push_new.includes('restore-me.md'),
+              'Item 3: mismatched baseline commit oid must force full merge-only and keep local restored note'
+            );
+            const crashRes = gitEngine.syncGit({ cfg: gitCfg, notebooks: [gitNbDir], confirmed: true });
+            requireCond(
+              crashRes.outcome === 'synced' && gitNotes['restore-me.md'] === 'Restored offline note' && crashRes.merge_only_rule === true,
+              'Item 3: merge-only crash recovery must re-commit restored note and report merge_only_rule'
+            );
+            const c5Head = spawnSync('git', ['-C', repoCloneDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+            requireCond(
+              gitStore.state.syncMeta[configMod.BASELINE_FINGERPRINTS_META_KEY]?.[gitMk]?.target_identity === c5Head,
+              'Item 3: completed recovery sync must refresh baseline fingerprint to new HEAD oid'
+            );
+
+            // Item 4: Single-note sync with unpushed local commits (origin/main..HEAD non-empty) must upgrade to full sync before committing and pushing.
+            gitNotes['b-note.md'] = 'Note B v1';
+            fs.writeFileSync(path.join(gitNbDir, 'b-note.md'), 'Note B v1', 'utf8');
+            const seedB = gitEngine.syncGit({ cfg: gitCfg, notebooks: [gitNbDir], confirmed: true });
+            requireCond(seedB.outcome === 'synced', 'Item 4: seeding Note B failed');
+            delete gitNotes['restore-me.md'];
+            fs.rmSync(path.join(gitNbDir, 'restore-me.md'), { force: true });
+            failGitPush = true;
+            let unpushedErr = false;
+            try {
+              gitEngine.syncGit({ cfg: gitCfg, notebooks: [gitNbDir], confirmed: true });
+            } catch (_e) {
+              unpushedErr = true;
+            }
+            requireCond(unpushedErr, 'Item 4: offline deletion commit must leave unpushed commit ahead of origin/main');
+            gitNotes['restore-me.md'] = 'Recovered A via partial upgrade';
+            fs.writeFileSync(path.join(gitNbDir, 'restore-me.md'), 'Recovered A via partial upgrade', 'utf8');
+            gitNotes['b-note.md'] = 'Note B v2';
+            fs.writeFileSync(path.join(gitNbDir, 'b-note.md'), 'Note B v2', 'utf8');
+            failGitPush = false;
+            const partUpPlan = gitEngine.computeSyncPlan({ cfg: gitCfg, onlyPath: 'b-note.md', inspectRemote: true, nbRoot: gitNbDir });
+            requireCond(
+              partUpPlan.is_partial_sync === false && partUpPlan.to_push_new.includes('restore-me.md') && partUpPlan.to_push_overwrite.includes('b-note.md'),
+              'Item 4: non-empty origin/<branch>..HEAD must upgrade single-note Git sync to full sync'
+            );
+            const partUpRes = gitEngine.syncGit({ cfg: gitCfg, onlyPath: 'b-note.md', notebooks: [gitNbDir], confirmed: true });
+            const afterItem4Remote = spawnSync('git', ['--git-dir', gitBareRemote, 'show', 'main:restore-me.md'], { encoding: 'utf8' });
+            requireCond(
+              partUpRes.outcome === 'synced' && afterItem4Remote.stdout === 'Recovered A via partial upgrade',
+              'Item 4: upgraded single-note Git sync must re-add restored A and push all commits cleanly'
+            );
+
             // Item 3 & Item 4: Mirror root identity re-check before local deletion + -32008 downgrade without ReferenceError.
             const m3Tmp = path.join(tempRoot, 'mirror-root-recheck');
             const m3DirA = path.join(m3Tmp, 'mirror-active');
@@ -1533,16 +1684,18 @@ jobs:
               }
               return statRpc(method, params);
             };
-            const m3Store = configMod.createConfigStore({ callHost: m3Rpc, supportsSystem: true, supportsMultiNotebook: true, notebookRoot: notebook, downloadsDir: tempRoot, homeDir: tempRoot });
+            const m3Store = configMod.createConfigStore({ callHost: m3Rpc, locale, supportsSystem: true, supportsMultiNotebook: true, notebookRoot: notebook, downloadsDir: tempRoot, homeDir: tempRoot });
             m3Store.loadState();
             const m3Mk = m3Store.metaKey('local_mirror', m3DirA, sdk.state.notebookId);
+            const m3DirASt = fs.lstatSync(m3DirA);
+            const m3DirAId = m3DirASt.dev + ':' + m3DirASt.ino;
             m3Store.commitNotebookBaseline(
               m3Mk,
               {
                 'keep-m3.md': crypto.createHash('sha256').update('Keep M3', 'utf8').digest('hex'),
                 'mirror-del-guard.md': crypto.createHash('sha256').update('Must survive swapped mirror', 'utf8').digest('hex'),
               },
-              { rootIdentity: liveRootId, verified: true, nbKeyVal: sdk.state.notebookId, nbRoot: notebook }
+              { rootIdentity: liveRootId, verified: true, nbKeyVal: sdk.state.notebookId, nbRoot: notebook, targetIdentity: m3DirAId }
             );
             const m3ScanEngine = localMirror.createLocalMirrorSyncEngine({
               callHost: statRpc,
@@ -1564,6 +1717,47 @@ jobs:
                 notes['mirror-del-guard.md'] === 'Must survive swapped mirror' &&
                 m3Res.status === '已跳过',
               'Item 3: changed mirror root identity before local delete must skip all local deletions cleanly'
+            );
+
+            // Item 5: Mirror root swapped BETWEEN rounds -> force merge-only without deletions, then update fingerprint.
+            const m5DirA = path.join(m3Tmp, 'mirror5-active');
+            const m5DirB = path.join(m3Tmp, 'mirror5-swap');
+            const m5Spare = path.join(m3Tmp, 'mirror5-old');
+            fs.mkdirSync(m5DirA, { recursive: true });
+            fs.mkdirSync(m5DirB, { recursive: true });
+            fs.writeFileSync(path.join(m5DirA, 'keep-m3.md'), 'Keep M3', 'utf8');
+            const m5DirASt = fs.lstatSync(m5DirA);
+            const m5DirAId = m5DirASt.dev + ':' + m5DirASt.ino;
+            const m5Mk = m3Store.metaKey('local_mirror', m5DirA, sdk.state.notebookId);
+            m3Store.commitNotebookBaseline(
+              m5Mk,
+              {
+                'keep-m3.md': crypto.createHash('sha256').update('Keep M3', 'utf8').digest('hex'),
+                'mirror-del-guard.md': crypto.createHash('sha256').update('Must survive swapped mirror', 'utf8').digest('hex'),
+              },
+              { rootIdentity: liveRootId, verified: true, nbKeyVal: sdk.state.notebookId, nbRoot: notebook, targetIdentity: m5DirAId }
+            );
+            fs.renameSync(m5DirA, m5Spare);
+            fs.renameSync(m5DirB, m5DirA);
+            const betweenRoundsPlan = m3ScanEngine.computeSyncPlan({ cfg: { protocol: 'local_mirror', mirror_dir: m5DirA, sync_scope: 'all', delete_guard: false }, nbRoot: notebook });
+            const m5DirNowSt = fs.lstatSync(m5DirA);
+            const m5DirNowId = m5DirNowSt.dev + ':' + m5DirNowSt.ino;
+            requireCond(
+              m5DirNowId !== m5DirAId &&
+                betweenRoundsPlan.merge_only_rule === true &&
+                betweenRoundsPlan.is_first_sync === true &&
+                betweenRoundsPlan.to_delete_local.length === 0 &&
+                betweenRoundsPlan.to_delete_remote.length === 0,
+              'Item 5: between-rounds swapped mirror must force full merge-only without deleting local or mirror notes'
+            );
+            const betweenRes = m3ScanEngine.executeBatchPlan({ protocol: 'local_mirror', target_display: m5DirA, plans: [betweenRoundsPlan], fingerprint: betweenRoundsPlan.fingerprint }, { reportProgress: false });
+            const expectMergeNote = locale.startsWith('en') ? 'Merge-only this round (no deletions)' : '本轮仅合并未删文件';
+            requireCond(
+              betweenRes.status === '成功' &&
+                betweenRes.merge_only_rule === true &&
+                betweenRes.summary.includes(expectMergeNote) &&
+                m3Store.state.syncMeta[configMod.BASELINE_FINGERPRINTS_META_KEY]?.[m5Mk]?.target_identity === m5DirNowId,
+              'Item 5: completed between-rounds merge-only must show bilingual completion note and refresh target fingerprint'
             );
 
             // Item 4: -32008 error caught during plan application must return initialized syncedRepoPaths without ReferenceError.
@@ -1614,6 +1808,106 @@ jobs:
             delete notes['mirror-del-guard.md'];
             fs.rmSync(path.join(notebook, 'keep-m3.md'), { force: true });
             fs.rmSync(path.join(notebook, 'mirror-del-guard.md'), { force: true });
+
+            // Item 6: Multi-protocol sync with -32008 preserves skipped warning + hint instead of failing; merge-only shows completion note cleanly.
+            const mpGitRemote = path.join(tempRoot, 'mp-remote.git');
+            fs.mkdirSync(mpGitRemote, { recursive: true });
+            spawnSync('git', ['init', '--bare', '-b', 'main', mpGitRemote], { encoding: 'utf8' });
+            const origStorageBackup = JSON.parse(JSON.stringify(sdk.state.storage));
+            sdk.state.hostOverride = (method, params = {}) => {
+              if (method === 'host.exec.run') {
+                const prog = String(params.program || '');
+                const args = Array.isArray(params.args) ? params.args.map(String) : [];
+                const proc = spawnSync(prog, args, {
+                  cwd: params.cwd || dataDir,
+                  env: { ...process.env, ...(params.env || {}), GIT_TERMINAL_PROMPT: '0' },
+                  input: params.stdin !== undefined ? String(params.stdin) : undefined,
+                  encoding: 'utf8',
+                });
+                return {
+                  exit_code: typeof proc.status === 'number' ? proc.status : 1,
+                  stdout: proc.stdout || '',
+                  stderr: proc.stderr || (proc.error ? proc.error.message : ''),
+                  stdout_truncated: false,
+                  stderr_truncated: false,
+                  timed_out: false,
+                };
+              }
+              if (method === 'host.fs.list_grants') {
+                return {
+                  grants: [{ path: mirror, writable: true }, { path: dataDir, writable: true }],
+                  notebooks: [{ path: notebook, writable: true }],
+                  data_dir: dataDir,
+                };
+              }
+              if (method === 'host.notes.write' && params.expected_root_identity) {
+                // Skip triggering on git writes; inject -32008 only on local_mirror remote writes when armed.
+              }
+              if (method === 'host.fs.write' && params.expected_root_identity && sdk.state.__forceMirror32008) {
+                throw Object.assign(new Error('Mirror root mismatch (-32008)'), { code: -32008 });
+              }
+              return undefined;
+            };
+            try {
+              const mpValues = {
+                protocol: 'local_mirror',
+                local_mirror_enabled: true,
+                git_enabled: true,
+                mirror_dir: mirror,
+                git_remote: pathToFileURL(mpGitRemote).href,
+                git_branch: 'main',
+                git_auth_type: 'none',
+                selected_notebooks: [notebook],
+              };
+              const mpInitRes = rpc('plugin.action', { action_id: 'sync_now', values: mpValues });
+              requireCond(mpInitRes.ok === true, 'Item 6: initial multi-protocol setup failed');
+              checkText(mpInitRes, locale, 'Item 6 initial multi-protocol', true);
+
+              // Simulate next round after removing mirror fingerprint -> merge-only normal completion note in multi-protocol!
+              const sm = sdk.state.storage.sync_meta || {};
+              const fpObj = sm[configMod.BASELINE_FINGERPRINTS_META_KEY] || {};
+              for (const k of Object.keys(fpObj)) {
+                if (k.includes('|local_mirror:')) delete fpObj[k];
+              }
+              const mpMergeRes = rpc('plugin.action', { action_id: 'sync_now', values: mpValues });
+              checkText(mpMergeRes, locale, 'Item 6 merge-only multi-protocol', true);
+              requireCond(
+                mpMergeRes.ok === true &&
+                  mpMergeRes.tone === 'success' &&
+                  String(mpMergeRes.status || '').includes(expectMergeNote),
+                'Item 6: merge-only rule must render normal success with bilingual note'
+              );
+
+              // Trigger -32008 during multi-protocol sync when a new note triggers local_mirror write.
+              notes['mp-32008.md'] = 'Trigger skip';
+              fs.writeFileSync(path.join(notebook, 'mp-32008.md'), 'Trigger skip', 'utf8');
+              sdk.state.__forceMirror32008 = true;
+              const mpSkipRes = rpc('plugin.action', { action_id: 'sync_now', values: mpValues });
+              checkText(mpSkipRes, locale, 'Item 6 skipped multi-protocol', true);
+              const skipWord = locale.startsWith('en') ? 'skipped' : '已跳过';
+              requireCond(
+                mpSkipRes.ok === true &&
+                  mpSkipRes.tone === 'warning' &&
+                  String(mpSkipRes.status || '').toLowerCase().includes(skipWord) &&
+                  !String(mpSkipRes.status || '').includes('失败') &&
+                  !String(mpSkipRes.status || '').toLowerCase().includes('failed'),
+                'Item 6: multi-protocol -32008 must report skipped warning + hint instead of failed: ' + JSON.stringify(mpSkipRes)
+              );
+            } finally {
+              sdk.state.__forceMirror32008 = false;
+              sdk.state.hostOverride = null;
+              delete notes['mp-32008.md'];
+              fs.rmSync(path.join(notebook, 'mp-32008.md'), { force: true });
+              fs.rmSync(path.join(mirror, 'mp-32008.md'), { force: true });
+              sdk.state.storage = origStorageBackup;
+              rpc('plugin.initialize', {
+                locale,
+                data_dir: dataDir,
+                downloads_dir: downloads,
+                notebook_root: notebook,
+                ui_capabilities: { action_progress: true, segmented_status: true },
+              });
+            }
 
             console.log(locale + ': safety invariants passed');
           }

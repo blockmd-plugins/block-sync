@@ -20,6 +20,7 @@ import {
   formatSkippedCount,
   formatSyncFailureLabel,
   formatSkippedDetails,
+  mergeOnlyRoundNote,
 } from './i18n.js';
 import {
   nowHms,
@@ -33,6 +34,7 @@ import {
   sha256Text,
   classifySyncError,
   isDeterministicErrorClass,
+  isNotebookRootMismatchError,
 } from './utils.js';
 import {
   VALID_PROTOCOLS,
@@ -200,6 +202,7 @@ function createSyncController() {
 
   let lastStatus = '';
   let lastSyncOutcome = 'skipped';
+  let lastSyncMergeOnly = false;
   let lastSyncedNotebooks = [];
   let logProtocol = '';
   let hostLogScope = ['', ''];
@@ -1049,6 +1052,7 @@ function createSyncController() {
       skippedItems = [],
       noticeKey = '',
       isBackground = false,
+      mergeOnlyRule = false,
     } = {}
   ) => {
     const nbKey = configStore.resultKey();
@@ -1123,6 +1127,9 @@ function createSyncController() {
         skipped_items: skippedItems.slice(0, 8),
         summary: summaryStr,
       };
+      if (mergeOnlyRule) {
+        successSnap.merge_only_rule = true;
+      }
       lastSuccess = { ...successSnap };
       protoLastSuccess = { ...successSnap };
       failClass = '';
@@ -1277,6 +1284,9 @@ function createSyncController() {
     }
     if (isEnglishLocale(loc)) {
       protoEntry.locale = 'en';
+    }
+    if (mergeOnlyRule) {
+      protoEntry.merge_only_rule = true;
     }
     if (protoLastSuccess) {
       protoEntry.last_success = protoLastSuccess;
@@ -1577,6 +1587,7 @@ function createSyncController() {
     isBackground = false,
   } = {}) => {
     lastSyncOutcome = 'skipped';
+    lastSyncMergeOnly = false;
     lastSyncedNotebooks = [];
     configStore.refreshKnownNotebooks();
     let proto =
@@ -1665,6 +1676,34 @@ function createSyncController() {
         res = engines.localMirror.syncLocalMirror(opts);
       }
     } catch (exc) {
+      if (isNotebookRootMismatchError(exc)) {
+        const skipMsg =
+          localizeError(getLocale(), errorDetail(getLocale(), exc)) ||
+          t('根目录身份已变化，已跳过本轮同步', 'Root identity changed; skipped this round');
+        if (reportProgress) {
+          emitProgress({
+            channel: proto,
+            progress: 1.0,
+            label: t('已跳过', 'Skipped'),
+            tone: 'warning',
+            running: false,
+          });
+        }
+        appendLog(skipMsg, '已跳过', {
+          tone: 'warning',
+          tooltip: skipMsg,
+        });
+        recordResult('已跳过', skipMsg, {
+          protocol: proto,
+          target: targetDisplay(protoCfg, uiContext()),
+          isBackground,
+        });
+        saveRuntime({ onlyPath, notebookRoot: onlyNbRoot, protocol: proto });
+        lastSyncOutcome = 'skipped';
+        lastSyncMergeOnly = false;
+        lastStatus = skipMsg;
+        return skipMsg;
+      }
       const pLabel = protocolLabel(getLocale(), proto);
       let det = errorDetail(getLocale(), exc);
       if (proto === 'local_mirror' && /outside authorized filesystem scope/i.test(det)) {
@@ -1681,6 +1720,34 @@ function createSyncController() {
     }
 
     if (res.outcome === 'error') {
+      if (isNotebookRootMismatchError(res)) {
+        const skipMsg =
+          localizeError(getLocale(), String(res.error || '')) ||
+          t('根目录身份已变化，已跳过本轮同步', 'Root identity changed; skipped this round');
+        if (reportProgress) {
+          emitProgress({
+            channel: proto,
+            progress: 1.0,
+            label: t('已跳过', 'Skipped'),
+            tone: 'warning',
+            running: false,
+          });
+        }
+        appendLog(skipMsg, '已跳过', {
+          tone: 'warning',
+          tooltip: skipMsg,
+        });
+        recordResult('已跳过', skipMsg, {
+          protocol: proto,
+          target: targetDisplay(protoCfg, uiContext()),
+          isBackground,
+        });
+        saveRuntime({ onlyPath, notebookRoot: onlyNbRoot, protocol: proto });
+        lastSyncOutcome = 'skipped';
+        lastSyncMergeOnly = false;
+        lastStatus = skipMsg;
+        return skipMsg;
+      }
       handleSyncFailure(res.error || t('同步失败', 'Sync failed'));
     }
 
@@ -1768,6 +1835,7 @@ function createSyncController() {
       notifyOversizedSkips(skippedItems);
     }
 
+    const mergeOnlyRule = Boolean(res.merge_only_rule);
     if (totalNotes === 0 && assets === 0 && deleted === 0) {
       if (res.did_push) {
         const pLabel = protocolLabel(getLocale(), proto);
@@ -1775,7 +1843,7 @@ function createSyncController() {
           tone: 'success',
           tooltip: summary,
         });
-        recordResult('成功', summary, { protocol: proto, target, skippedItems });
+        recordResult('成功', summary, { protocol: proto, target, skippedItems, mergeOnlyRule });
       } else if (res.status === '已跳过') {
         appendLog(summary, '已跳过', {
           tone: 'warning',
@@ -1786,7 +1854,7 @@ function createSyncController() {
         if (onlyPath === null && skippedItems.length === 0) {
           recordNoopLog(proto, summary);
         }
-        recordResult('无变更', summary, { protocol: proto, target, skippedItems });
+        recordResult('无变更', summary, { protocol: proto, target, skippedItems, mergeOnlyRule });
       }
     } else {
       recordResult('成功', summary, {
@@ -1797,10 +1865,12 @@ function createSyncController() {
         conflicts,
         assets,
         skippedItems,
+        mergeOnlyRule,
       });
     }
 
     lastSyncOutcome = res.status === '已跳过' ? 'skipped' : 'synced';
+    lastSyncMergeOnly = res.status === '已跳过' ? false : mergeOnlyRule;
     lastSyncedNotebooks = (batch.plans || []).map((p) => p.nb_root).filter(Boolean);
     if (!isBackground && onlyPath === null) {
       clearPendingDirty(onlyNbRoot ? configStore.notebookKey(onlyNbRoot) : null, proto);
@@ -1814,7 +1884,7 @@ function createSyncController() {
 
     if (reportProgress) {
       const protoRes = getProtocolResult(configStore, proto);
-      const doneLbl = formatShortSyncMetric(getLocale(), protoRes);
+      const doneLbl = res.status === '已跳过' ? t('已跳过', 'Skipped') : formatShortSyncMetric(getLocale(), protoRes);
       emitProgress({
         channel: proto,
         progress: 1.0,
@@ -1859,6 +1929,9 @@ function createSyncController() {
 
     const succeeded = [];
     const pending = [];
+    const skipped = [];
+    const skippedDetails = [];
+    const mergeOnly = [];
     const failed = [];
     const syncedNotebooks = [];
     const seenNbs = new Set();
@@ -1900,10 +1973,11 @@ function createSyncController() {
       if (lastSyncOutcome === 'pending_confirm') {
         pending.push(proto);
       } else if (lastSyncOutcome === 'skipped') {
-        failed.push(proto);
-        lastErr = lastStatus;
+        skipped.push(proto);
+        if (lastStatus) skippedDetails.push(`${pLabel}: ${lastStatus}`);
       } else {
         succeeded.push(proto);
+        if (lastSyncMergeOnly) mergeOnly.push(proto);
         for (const nb of lastSyncedNotebooks) {
           if (!seenNbs.has(nb)) {
             seenNbs.add(nb);
@@ -1915,23 +1989,26 @@ function createSyncController() {
 
     lastSyncedNotebooks = syncedNotebooks;
     const sep = t('、', ', ');
-    if (failed.length > 0 && succeeded.length === 0 && pending.length === 0) {
+    if (failed.length > 0 && succeeded.length === 0 && pending.length === 0 && skipped.length === 0) {
       const msg = lastErr || t('全部同步目标均未完成', 'All sync targets failed');
       lastStatus = msg;
       return [false, 'danger', msg];
     }
     if (failed.length > 0) {
       const failNames = failed.map((p) => protocolLabel(getLocale(), p)).join(sep);
-      const msg = t(
-        `已完成 ${succeeded.length}/${totalTargets} 个目标，${failNames} 失败`,
-        `${succeeded.length}/${totalTargets} targets synced; ${failNames} failed`
-      );
+      const parts = [t(`已完成 ${succeeded.length}/${totalTargets} 个目标`, `${succeeded.length}/${totalTargets} targets synced`)];
+      parts.push(t(`${failNames} 失败`, `${failNames} failed`));
+      if (skipped.length > 0) {
+        const skipNames = skipped.map((p) => protocolLabel(getLocale(), p)).join(sep);
+        parts.push(t(`${skipNames} 已跳过`, `${skipNames} skipped`));
+      }
+      const msg = parts.join(t('，', '; '));
       lastStatus = msg;
       return [false, 'danger', msg];
     }
     if (pending.length > 0) {
       const pendNames = pending.map((p) => protocolLabel(getLocale(), p)).join(sep);
-      const msg = succeeded.length > 0
+      let msg = succeeded.length > 0
         ? t(
             `已完成 ${succeeded.length}/${totalTargets} 个目标，${pendNames} 待确认`,
             `${succeeded.length}/${totalTargets} targets synced; ${pendNames} needs confirmation`
@@ -1940,14 +2017,38 @@ function createSyncController() {
             `${pendNames} 检测到危险变更，请先确认`,
             `${pendNames} detected risky changes; confirmation required`
           );
+      if (skipped.length > 0) {
+        const skipNames = skipped.map((p) => protocolLabel(getLocale(), p)).join(sep);
+        msg += t(`，${skipNames} 已跳过`, `; ${skipNames} skipped`);
+      }
+      lastStatus = msg;
+      return [true, 'warning', msg];
+    }
+    if (skipped.length > 0) {
+      const skipNames = skipped.map((p) => protocolLabel(getLocale(), p)).join(sep);
+      const hint =
+        skippedDetails[0] ||
+        t('根目录身份已变化，已跳过本轮同步', 'Root identity changed; skipped this round');
+      let msg = succeeded.length > 0
+        ? t(
+            `已完成 ${succeeded.length}/${totalTargets} 个目标，${skipNames} 已跳过（${hint}）`,
+            `${succeeded.length}/${totalTargets} targets synced; ${skipNames} skipped (${hint})`
+          )
+        : t(`${skipNames} 已跳过（${hint}）`, `${skipNames} skipped (${hint})`);
+      if (mergeOnly.length > 0) {
+        msg += ` · ${mergeOnlyRoundNote(getLocale())}`;
+      }
       lastStatus = msg;
       return [true, 'warning', msg];
     }
     const names = succeeded.map((p) => protocolLabel(getLocale(), p)).join(sep);
-    const msg = t(
+    let msg = t(
       `已同步 ${succeeded.length} 个目标（${names}）`,
       `Synced ${succeeded.length} targets (${names})`
     );
+    if (mergeOnly.length > 0) {
+      msg += ` · ${mergeOnlyRoundNote(getLocale())}`;
+    }
     lastStatus = msg;
     return [true, 'success', msg];
   };
@@ -2892,7 +2993,7 @@ function createSyncController() {
             tone = 'warning';
           } else {
             status = runSync({ reportProgress: true, protocol: onlyProto });
-            if (configStore.getPendingConfirm(onlyProto)) {
+            if (configStore.getPendingConfirm(onlyProto) || lastSyncOutcome === 'skipped') {
               ok = true;
               tone = 'warning';
             } else {
@@ -3061,7 +3162,7 @@ function createSyncController() {
               protocol,
             });
             ok = true;
-            tone = 'success';
+            tone = lastSyncOutcome === 'skipped' ? 'warning' : 'success';
           }
         }
       }

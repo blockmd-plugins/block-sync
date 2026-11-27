@@ -36,6 +36,10 @@ export function tr(locale, zh, en) {
   return isEnglishLocale(locale) ? en : zh;
 }
 
+export function mergeOnlyRoundNote(locale) {
+  return tr(locale, '本轮仅合并未删文件', 'Merge-only this round (no deletions)');
+}
+
 export function sanitizeUrlCredentialsInText(text) {
   let msg = String(text ?? '').trim().replace(/[\r\n]+/g, ' ');
   msg = msg.replace(/((?:https?|ssh):\/\/)([^/\s@]+)@/gi, '$1***@');
@@ -396,6 +400,13 @@ export function renderStructuredLog(locale, key, args) {
       return [
         tr(locale, `${pfx}未验证笔记本身份，已降级为仅合并`, `${pfx}Notebook identity unverified; downgraded to merge-only`),
         tr(locale, '当前仅合并不删文件', 'Merged without deleting files'),
+      ];
+    }
+    case 'merge_only_refresh': {
+      const pfx = String(a.prefix || '');
+      return [
+        tr(locale, `${pfx}本轮仅合并未删文件`, `${pfx}Merge-only this round (no deletions)`),
+        tr(locale, '已更新基线状态指纹，下轮恢复正常同步', 'Baseline fingerprint updated; normal sync resumes next round'),
       ];
     }
     case 'deletions_aborted': {

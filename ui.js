@@ -18,6 +18,7 @@ import {
   localizeResultSummary,
   formatSkippedDetails,
   normalizeLog,
+  mergeOnlyRoundNote,
 } from './i18n.js';
 import {
   formatHm,
@@ -953,6 +954,19 @@ function buildProgressItem(ctx, protocol, cfg) {
         '同步失败，请查看同步记录',
         'Sync failed. Check recent sync activity.'
       );
+    } else if (st === '已跳过') {
+      const hm = formatHm(res.time || '');
+      status = hm
+        ? tr(locale, `${hm} · 已跳过`, `${hm} · Skipped`)
+        : tr(locale, '本轮已跳过', 'Skipped this round');
+      progress = 1.0;
+      tone = 'warning';
+      tooltip = localizeResultSummary(
+        locale,
+        res,
+        '已跳过本轮同步以保护数据',
+        'Skipped this round to protect data'
+      );
     } else if (st === '已取消') {
       const hm = formatHm(res.time || '');
       status = hm
@@ -964,10 +978,12 @@ function buildProgressItem(ctx, protocol, cfg) {
     } else if (okRec && okRec.time) {
       const hm = formatHm(okRec.time || '');
       const metric = formatShortSyncMetric(locale, okRec);
-      status = hm ? `${hm} · ${metric}` : metric;
+      const note = okRec.merge_only_rule ? mergeOnlyRoundNote(locale) : '';
+      const metricText = note ? `${metric} · ${note}` : metric;
+      status = hm ? `${hm} · ${metricText}` : metricText;
       progress = 1.0;
       tone = 'success';
-      tooltip = formatSkippedDetails(okRec.skipped_items) || targetTip;
+      tooltip = formatSkippedDetails(okRec.skipped_items) || note || targetTip;
     } else {
       status = tr(locale, '已启用 · 等待同步', 'Enabled · Ready to sync');
       progress = 0.0;
@@ -1082,6 +1098,20 @@ function buildStatusRowItem(ctx, protocol, cfg) {
       progress = 1.0;
       tone = offline ? 'warning' : 'danger';
       tooltip = detail;
+    } else if (st === '已跳过') {
+      const hm = formatHm(res.time || '');
+      headline = hm
+        ? tr(locale, `${hm} 已跳过`, `${hm} Skipped`)
+        : tr(locale, '本轮已跳过', 'Skipped this round');
+      detail = localizeResultSummary(
+        locale,
+        res,
+        '已跳过本轮同步以保护数据',
+        'Skipped this round to protect data'
+      );
+      progress = 1.0;
+      tone = 'warning';
+      tooltip = detail;
     } else if (st === '已取消') {
       const hm = formatHm(res.time || '');
       headline = hm
@@ -1096,17 +1126,23 @@ function buildStatusRowItem(ctx, protocol, cfg) {
     } else if (okRec && okRec.time) {
       const hm = formatHm(okRec.time || '');
       const metric = formatShortSyncMetric(locale, okRec);
+      const note = okRec.merge_only_rule ? mergeOnlyRoundNote(locale) : '';
+      const metricText = note ? `${metric} · ${note}` : metric;
       headline = hm
         ? tr(locale, `${hm} 已同步`, `${hm} Synced`)
         : tr(locale, '已同步', 'Synced');
       detail = connOk
         ? protocol === 'git'
-          ? connDetail
-          : `${connDetail} · ${metric}`
-        : metric;
+          ? note ? `${connDetail} · ${note}` : connDetail
+          : `${connDetail} · ${metricText}`
+        : metricText;
       progress = 1.0;
       tone = 'success';
-      tooltip = formatSkippedDetails(okRec.skipped_items) || localizeConnMessage(locale, connState) || targetTip;
+      tooltip =
+        formatSkippedDetails(okRec.skipped_items) ||
+        note ||
+        localizeConnMessage(locale, connState) ||
+        targetTip;
     } else if (connOk) {
       headline = tr(locale, '已连通 · 等待同步', 'Connected · Ready to sync');
       detail = connDetail;

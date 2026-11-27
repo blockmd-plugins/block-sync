@@ -11,6 +11,7 @@ import {
   protocolLabel,
   formatReasonItem,
   formatSkippedCount,
+  mergeOnlyRoundNote,
 } from './i18n.js';
 import {
   resolveCallHost,
@@ -64,6 +65,8 @@ import {
   MAX_LOG_ENTRIES,
   INITIALIZED_META_KEY,
   LAYOUTS_META_KEY,
+  BASELINE_FINGERPRINTS_META_KEY,
+  evaluateBaselineState,
   queryLiveNotebookIdentity,
   resolveMirrorDir,
   computeNotebookSubdirMap,
@@ -2725,6 +2728,8 @@ export function computeThreeWaySyncPlan({
   trackedRemotePaths = null,
   gitTreePaths = null,
   onlyPath = null,
+  currentTargetIdentity = '',
+  hasUnpushedCommits = false,
   locale = 'zh',
   skips = createSyncSkips(cfg, locale),
 } = {}) {
@@ -2732,51 +2737,27 @@ export function computeThreeWaySyncPlan({
   const scope = cfg.sync_scope || 'all';
   const policy = cfg.conflict_policy || 'keep_both';
   const candidateLegacyKeys = [legacyKey, ...(legacyAliases || [])].filter(Boolean);
-  const allowLegacy =
-    candidateLegacyKeys.length > 0 &&
-    !(
-      configStore &&
-      configStore.state &&
-      (configStore.state.hostSupportsNotebookIds ||
-        (configStore.state.notebookIdMap &&
-          configStore.state.notebookIdMap.by_id &&
-          Object.hasOwn(configStore.state.notebookIdMap.by_id, nbKeyVal)))
-    );
-  const effectiveLegacyKeys = allowLegacy ? candidateLegacyKeys : [];
-  const originalBaseMap = configStore ? configStore.getBaseMap(metaKey, ...aliases, ...effectiveLegacyKeys) : {};
-  const initializedMap = configStore ? configStore.state.syncMeta[INITIALIZED_META_KEY] : null;
-  const hasExistingMeta = Boolean(
-    (initializedMap &&
-      typeof initializedMap === 'object' &&
-      ([metaKey, ...aliases].some((k) => Boolean(initializedMap[k])) ||
-        effectiveLegacyKeys.some((k) => Boolean(initializedMap[k])))) ||
-      Object.keys(originalBaseMap).length > 0
-  );
   const homeDir = configStore ? configStore.state.homeDir : '';
-  const idCheck =
-    configStore && typeof configStore.verifyNotebookIdentity === 'function'
-      ? configStore.verifyNotebookIdentity(nbRoot, {
-          metaKey,
-          aliases,
-          legacyKeys: effectiveLegacyKeys,
-          nbKeyVal,
-          hasExistingBaseline: hasExistingMeta,
-        })
-      : (() => {
-          const live = queryLiveNotebookIdentity(rpc, nbRoot, homeDir);
-          return {
-            identity_ok: Boolean(live.verified && live.rootIdentity),
-            verified: Boolean(live.verified),
-            root_identity: live.rootIdentity || '',
-            recorded_root_identity: '',
-            live_id: live.id || '',
-            reason: live.verified ? '' : 'host_unverified',
-          };
-        })();
-  const identityVerified = Boolean(idCheck && idCheck.identity_ok === true);
-  const identityDegraded = Boolean(hasExistingMeta && !identityVerified);
-  const baseMap = identityVerified ? { ...originalBaseMap } : {};
-  const isFirstSync = !identityVerified || !hasExistingMeta;
+  const evalState = evaluateBaselineState(configStore, {
+    protocol,
+    nbRoot,
+    metaKey,
+    aliases,
+    legacyKeys: candidateLegacyKeys,
+    nbKeyVal,
+    currentTargetIdentity,
+    hasUnpushedCommits,
+    callHost: rpc,
+    homeDir,
+  });
+  const effectiveLegacyKeys = evalState.effectiveLegacyKeys;
+  const originalBaseMap = evalState.originalBaseMap;
+  const hasExistingMeta = evalState.hasExistingMeta;
+  const idCheck = evalState.idCheck;
+  const identityVerified = evalState.identityVerified;
+  const identityDegraded = evalState.identityDegraded;
+  const baseMap = evalState.baseMap;
+  const isFirstSync = evalState.isFirstSync;
 
   let inspected = remoteInspected;
   let errText = remoteError;
@@ -3313,6 +3294,13 @@ export function computeThreeWaySyncPlan({
     skipped_items: skips.items,
     skips,
     is_first_sync: isFirstSync,
+    has_existing_baseline: hasExistingMeta,
+    merge_only: evalState.mergeOnly,
+    merge_only_rule: evalState.mergeOnlyRule,
+    merge_only_reason: evalState.reason,
+    fingerprint_matched: evalState.fingerprintMatch,
+    baseline_target_identity: evalState.storedFingerprint ? String(evalState.storedFingerprint.target_identity || '').trim() : '',
+    meta_aliases: [...aliases, ...effectiveLegacyKeys].filter(Boolean),
     is_partial_sync: Boolean((onlyPath !== null && onlyPath !== undefined && onlyPath !== '') || (scope && scope !== 'all')),
     identity_verified: identityVerified,
     live_identity_verified: Boolean(idCheck && idCheck.verified === true),
@@ -3397,7 +3385,7 @@ export function assessDangerousChanges(callHost, plan, cfg, nbLabelVal = '') {
   const policy = plan.policy || cfg.conflict_policy || 'keep_both';
   const m = planRiskMetrics(callHost, plan);
 
-  if (plan.is_first_sync) {
+  if (plan.is_first_sync && !plan.has_existing_baseline) {
     if (m.pull_new > 0 || m.pull_conflict > 0 || m.push_conflict > 0 || m.conflicts > 0) {
       items.push({
         kind: 'first_sync',
@@ -3609,26 +3597,33 @@ export function commitPlanBaseline(
   configStore,
   plan,
   { baseMap = {}, partialBaseMap = null, deletedKeys = [] } = {},
-  { markInitialized = true, completedFullSync = true } = {}
+  { markInitialized = true, completedFullSync = true, targetIdentity = undefined } = {}
 ) {
   if (!configStore || !plan || !plan.meta_key || plan._deletions_aborted) return false;
-  const canCommit =
-    plan.identity_verified === true ||
-    (plan.live_identity_verified === true && plan.identity_reason === 'missing_baseline_identity');
+  const canCommit = plan.identity_verified === true || plan.live_identity_verified === true;
   if (!canCommit) return false;
+
+  const commitRoot = String(plan.live_root_identity || plan.root_identity || '').trim();
+  const resolvedTargetId =
+    targetIdentity !== undefined
+      ? String(targetIdentity || '').trim()
+      : String(plan.committed_target_identity || (plan.protocol === 'local_mirror' ? plan.target_root_identity : '') || '').trim();
 
   // Merge entry-by-entry without writing root_identity unless an entire full sync completed.
   if (plan.is_partial_sync || !completedFullSync) {
     const patch = partialBaseMap && typeof partialBaseMap === 'object' ? partialBaseMap : baseMap;
     if (typeof configStore.commitNotebookBaseline === 'function') {
       return configStore.commitNotebookBaseline(plan.meta_key, patch, {
-        rootIdentity: '',
+        rootIdentity: commitRoot,
         verified: true,
         nbKeyVal: plan.nb_key,
         nbRoot: plan.nb_root,
         markInitialized: false,
         partial: true,
         deletedKeys,
+        targetIdentity: resolvedTargetId,
+        updateTargetIdentity: Boolean(completedFullSync && plan.fingerprint_matched === true && resolvedTargetId),
+        protocol: plan.protocol || '',
       });
     }
     const existing =
@@ -3647,7 +3642,6 @@ export function commitPlanBaseline(
     return true;
   }
 
-  const commitRoot = String(plan.live_root_identity || plan.root_identity || '').trim();
   if (!commitRoot) return false;
   if (typeof configStore.commitNotebookBaseline === 'function') {
     return configStore.commitNotebookBaseline(plan.meta_key, baseMap, {
@@ -3657,6 +3651,9 @@ export function commitPlanBaseline(
       nbRoot: plan.nb_root,
       markInitialized: Boolean(markInitialized),
       partial: false,
+      targetIdentity: resolvedTargetId,
+      protocol: plan.protocol || '',
+      staleKeys: Array.isArray(plan.meta_aliases) ? plan.meta_aliases : [],
     });
   }
   configStore.state.syncMeta[plan.meta_key] = baseMap;
@@ -3665,6 +3662,16 @@ export function commitPlanBaseline(
     initMap[plan.meta_key] = true;
     configStore.state.syncMeta[INITIALIZED_META_KEY] = initMap;
   }
+  const fpAll =
+    configStore.state.syncMeta[BASELINE_FINGERPRINTS_META_KEY] &&
+    typeof configStore.state.syncMeta[BASELINE_FINGERPRINTS_META_KEY] === 'object' &&
+    !Array.isArray(configStore.state.syncMeta[BASELINE_FINGERPRINTS_META_KEY])
+      ? { ...configStore.state.syncMeta[BASELINE_FINGERPRINTS_META_KEY] }
+      : {};
+  const fpEntry = { nb_root_identity: commitRoot };
+  if (resolvedTargetId) fpEntry.target_identity = resolvedTargetId;
+  fpAll[plan.meta_key] = fpEntry;
+  configStore.state.syncMeta[BASELINE_FINGERPRINTS_META_KEY] = fpAll;
   return true;
 }
 
@@ -3902,6 +3909,10 @@ export function applyMirrorOrGitNotebookPlan(
     if (expId && curId !== expId) {
       return false;
     }
+    const baselineTargetId = String(plan.baseline_target_identity || '').trim();
+    if (protocol === 'local_mirror' && baselineTargetId && (!curId || curId !== baselineTargetId)) {
+      return false;
+    }
     return true;
   };
 
@@ -4003,12 +4014,27 @@ export function applyMirrorOrGitNotebookPlan(
         throw exc;
       }
     };
-    const unverifiedAtStart = Boolean(
-      plan.identity_degraded ||
-        (plan.identity_verified !== true && plan.identity_reason !== 'missing_baseline_identity') ||
-        (plan.identity_verified === true && (!startIdCheck || startIdCheck.identity_ok !== true))
+    const mergeOnlyRuleStart = Boolean(
+      plan.merge_only_rule === true &&
+        startIdCheck &&
+        startIdCheck.verified === true &&
+        (!plan.live_root_identity || startIdCheck.root_identity === plan.live_root_identity)
     );
-    if (unverifiedAtStart) {
+    const unverifiedAtStart =
+      !mergeOnlyRuleStart &&
+      Boolean(
+        plan.identity_degraded ||
+          (plan.identity_verified !== true && plan.identity_reason !== 'missing_baseline_identity') ||
+          (plan.identity_verified === true && (!startIdCheck || startIdCheck.identity_ok !== true))
+      );
+    if (mergeOnlyRuleStart) {
+      const note = mergeOnlyRoundNote(locale);
+      appendLog(tr(locale, `${prefix}${note}`, `${prefix}${note}`), '成功', {
+        tone: 'success',
+        logKey: 'merge_only_refresh',
+        logArgs: { prefix, reason: plan.merge_only_reason || '' },
+      });
+    } else if (unverifiedAtStart) {
       appendLog(
         tr(locale, `${prefix}未验证笔记本身份，已降级为仅合并`, `${prefix}Notebook identity unverified; downgraded to merge-only`),
         '已跳过',
@@ -4298,10 +4324,12 @@ export function applyMirrorOrGitNotebookPlan(
     const baseKeyAliases = plan.base_key_aliases || {};
 
     const preDeleteIdCheck = verifyPlanLiveIdentity(rpc, configStore, plan);
+    const allowLiveRefresh =
+      plan.merge_only_rule === true || plan.identity_reason === 'missing_baseline_identity';
     const liveMissingPinOk =
       plan.identity_verified !== true &&
       plan.live_identity_verified === true &&
-      plan.identity_reason === 'missing_baseline_identity' &&
+      allowLiveRefresh &&
       Boolean(preDeleteIdCheck && preDeleteIdCheck.verified === true) &&
       (!plan.live_root_identity || preDeleteIdCheck.root_identity === plan.live_root_identity);
     const preDeleteIdentityOk =
@@ -4310,7 +4338,7 @@ export function applyMirrorOrGitNotebookPlan(
     const midSyncIdentityLost =
       rootMismatchAborted ||
       (plan.identity_verified === true && !preDeleteIdentityOk) ||
-      (plan.live_identity_verified === true && plan.identity_reason === 'missing_baseline_identity' && !liveMissingPinOk);
+      (plan.live_identity_verified === true && allowLiveRefresh && !liveMissingPinOk);
     if (forceSkipDeletions || !preDeleteIdentityOk || rootMismatchAborted) {
       if (midSyncIdentityLost || (deletions.length > 0 && !preDeleteIdentityOk)) {
         plan._deletions_aborted = true;
@@ -4566,6 +4594,17 @@ export function applyMirrorOrGitNotebookPlan(
     }
   }
 
+  if (protocol === 'local_mirror' && !plan.target_root_identity && targetDir) {
+    try {
+      const endTargetSt = fsStat(rpc, targetDir, { lstat: true });
+      if (endTargetSt.exists && !endTargetSt.is_symlink && endTargetSt.is_dir && endTargetSt.root_identity) {
+        plan.target_root_identity = String(endTargetSt.root_identity).trim();
+      }
+    } catch (_err) {
+      // Leave unresolved if stat fails.
+    }
+  }
+
   return {
     pushed,
     pulled,
@@ -4670,18 +4709,29 @@ export function createLocalMirrorSyncEngine({
       : `nb:${nbKeyVal}|local_mirror:${metaTarget}`;
     const legacyKey = !subdir ? `local_mirror:${baseDir}` : null;
 
-    const hasVerifiedBase =
-      !configStore ||
-      typeof configStore.hasVerifiedBaseline !== 'function' ||
-      configStore.hasVerifiedBaseline(effectiveNbRoot, {
-        metaKey,
-        legacyKeys: legacyKey ? [legacyKey] : [],
-        nbKeyVal,
-        protocol: 'local_mirror',
-      });
+    let scannedTargetRootId = '';
+    try {
+      const preTargetSt = fsStat(rpc, targetDir, { lstat: true });
+      if (preTargetSt.exists && !preTargetSt.is_symlink && preTargetSt.is_dir) {
+        scannedTargetRootId = String(preTargetSt.root_identity || '').trim();
+      }
+    } catch (_err) {
+      // Defer scan/scope errors to the remote inspection step below.
+    }
+    const preEval = configStore
+      ? evaluateBaselineState(configStore, {
+          protocol: 'local_mirror',
+          nbRoot: effectiveNbRoot,
+          metaKey,
+          legacyKeys: legacyKey ? [legacyKey] : [],
+          nbKeyVal,
+          currentTargetIdentity: scannedTargetRootId,
+          callHost: rpc,
+        })
+      : null;
     let effectiveOnlyPath = onlyPath;
     let effectiveScope = cfg.sync_scope || 'all';
-    if (!hasVerifiedBase && (effectiveOnlyPath !== null || effectiveScope !== 'all')) {
+    if (preEval && preEval.forceFullSync && (effectiveOnlyPath !== null || effectiveScope !== 'all')) {
       effectiveOnlyPath = null;
       effectiveScope = 'all';
     }
@@ -4785,6 +4835,7 @@ export function createLocalMirrorSyncEngine({
       }
     }
 
+    const resolvedTargetRootId = targetRootIdentity || scannedTargetRootId;
     const builtPlan = computeThreeWaySyncPlan({
       callHost: rpc,
       configStore,
@@ -4811,11 +4862,12 @@ export function createLocalMirrorSyncEngine({
       remoteInspected,
       remoteError,
       onlyPath: effectiveOnlyPath,
+      currentTargetIdentity: resolvedTargetRootId,
       locale: loc,
       skips,
     });
-    if (targetRootIdentity) {
-      builtPlan.target_root_identity = targetRootIdentity;
+    if (resolvedTargetRootId) {
+      builtPlan.target_root_identity = resolvedTargetRootId;
     }
     return builtPlan;
   };
@@ -5014,6 +5066,7 @@ export function createLocalMirrorSyncEngine({
 
     const skippedItems = collectSkippedItems(batch.plans);
     const skippedSummary = skippedItems.length ? formatSkippedCount(loc, skippedItems.length) : '';
+    const mergeOnlyRule = batch.plans.some((p) => p.merge_only_rule === true);
     const totalNotes = totalPushed + totalPulled + totalConflicts;
     if (totalNotes === 0 && totalAssets === 0 && totalDeleted === 0) {
       if (batch.plans.some((p) => p._deletions_aborted)) {
@@ -5028,9 +5081,14 @@ export function createLocalMirrorSyncEngine({
           deleted: 0,
         };
       }
+      let noopSummary = skippedSummary || tr(loc, '已是最新', 'Up to date');
+      if (mergeOnlyRule) {
+        noopSummary += ` · ${mergeOnlyRoundNote(loc)}`;
+      }
       return {
         status: '无变更',
-        summary: skippedSummary || tr(loc, '已是最新', 'Up to date'),
+        summary: noopSummary,
+        merge_only_rule: mergeOnlyRule,
         skipped_items: skippedItems,
         pushed: 0,
         pulled: 0,
@@ -5052,9 +5110,11 @@ export function createLocalMirrorSyncEngine({
       summary += tr(loc, ` · 删除 ${totalDeleted} 项`, ` · Deleted: ${totalDeleted}`);
     }
     if (skippedSummary) summary += ` · ${skippedSummary}`;
+    if (mergeOnlyRule) summary += ` · ${mergeOnlyRoundNote(loc)}`;
     return {
       status: '成功',
       summary,
+      merge_only_rule: mergeOnlyRule,
       skipped_items: skippedItems,
       pushed: totalPushed,
       pulled: totalPulled,

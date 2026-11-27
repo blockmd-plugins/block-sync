@@ -10,6 +10,7 @@ import {
   errorDetail,
   protocolLabel,
   formatSkippedCount,
+  mergeOnlyRoundNote,
 } from './i18n.js';
 import {
   resolveCallHost,
@@ -44,6 +45,7 @@ import {
 } from './utils.js';
 import {
   LAYOUTS_META_KEY,
+  evaluateBaselineState,
   resolveCredentials,
   computeNotebookSubdirMap,
   notebookKey,
@@ -776,6 +778,51 @@ function wasGitBranchSynced(callHost, repoDir, branch, { remoteName = 'origin', 
   if (getGitSyncedBranchOid(callHost, repoDir, branch, { remoteName, cfg, locale })) return true;
   if (hasGitPendingInitial(callHost, repoDir, branch, { remoteName, cfg, locale })) return false;
   return gitBranchHasUpstreamConfig(callHost, repoDir, branch, { remoteName, cfg, locale });
+}
+
+function gitBranchHeadOid(callHost, repoDir, branch, { cfg = null, locale = 'zh' } = {}) {
+  if (!repoDir || !branch || !hasGitMarker(callHost, repoDir)) return '';
+  const proc = runGit(callHost, ['rev-parse', '--verify', `refs/heads/${branch}`], {
+    cwd: repoDir,
+    cfg,
+    locale,
+  });
+  return proc.returncode === 0 ? proc.stdout.trim() : '';
+}
+
+function gitIsAncestor(callHost, repoDir, ancestorOid, descendantOid, { cfg = null, locale = 'zh' } = {}) {
+  if (!repoDir || !ancestorOid || !descendantOid) return false;
+  if (ancestorOid === descendantOid) return true;
+  const proc = runGit(callHost, ['merge-base', '--is-ancestor', ancestorOid, descendantOid], {
+    cwd: repoDir,
+    cfg,
+    locale,
+  });
+  return proc.returncode === 0;
+}
+
+function hasUnpushedGitCommits(callHost, repoDir, branch, { cfg = null, locale = 'zh' } = {}) {
+  if (!repoDir || !branch || !hasGitMarker(callHost, repoDir)) return false;
+  const headOid = gitBranchHeadOid(callHost, repoDir, branch, { cfg, locale });
+  if (!headOid) return false;
+  const remoteProc = runGit(callHost, ['remote'], { cwd: repoDir, cfg, locale });
+  if (remoteProc.returncode !== 0) return false;
+  const remotes = remoteProc.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  if (remotes.length === 0) return false;
+  const remoteName = remotes.includes('origin') ? 'origin' : remotes[0];
+  const refProc = runGit(callHost, ['rev-parse', '--verify', `refs/remotes/${remoteName}/${branch}`], {
+    cwd: repoDir,
+    cfg,
+    locale,
+  });
+  if (refProc.returncode !== 0) return true;
+  const aheadProc = runGit(callHost, ['rev-list', '--count', `refs/remotes/${remoteName}/${branch}..${headOid}`], {
+    cwd: repoDir,
+    cfg,
+    locale,
+  });
+  const aheadN = aheadProc.returncode === 0 ? Number.parseInt(aheadProc.stdout.trim() || '0', 10) || 0 : 1;
+  return aheadN > 0;
 }
 
 /** Query remote branch heads using git ls-remote --heads. */
@@ -2637,6 +2684,8 @@ export function createGitSyncEngine({
     nbRoot = null,
     subdir = '',
     preparedRepoDir = null,
+    prePullRepoDir = '',
+    prePullHeadOid = '',
     targetBases = [],
     excludedSubdirs = new Set(),
     deadlineMs = 0,
@@ -2670,41 +2719,17 @@ export function createGitSyncEngine({
     });
     const legacyAliases = !subdir ? (targetBases || []).map((base) => `git:${base}`) : [];
 
-    const hasVerifiedBase =
-      !configStore ||
-      typeof configStore.hasVerifiedBaseline !== 'function' ||
-      configStore.hasVerifiedBaseline(effectiveNbRoot, {
-        metaKey,
-        aliases,
-        legacyKeys: [legacyKey, ...legacyAliases].filter(Boolean),
-        nbKeyVal,
-        protocol: 'git',
-      });
-    let onlyPath = rawOnlyPath;
-    let scope = (rawCfg && rawCfg.sync_scope) || 'all';
-    if (!hasVerifiedBase && (onlyPath !== null || scope !== 'all')) {
-      onlyPath = null;
-      scope = 'all';
-    }
-    const cfg = scope !== ((rawCfg && rawCfg.sync_scope) || 'all') ? { ...rawCfg, sync_scope: scope } : rawCfg;
-
-    const canLazyLocal = onlyPath === null && typeof local.readNote === 'function';
-    let localNotes = {};
-    let remoteNotes = {};
-    let localSnapshot = null;
-    let remoteSnapshot = null;
-    let localNoteEntries = null;
-    let remoteNoteEntries = null;
-    let readLocalNote = null;
-    let readRemoteNote = null;
     let remoteInspected = true;
     let remoteError = null;
-    const scanOptions = { onlyPath, scope, excludedSubdirs, locale: loc, cfg, skips };
+    const effPrePullDir = prePullRepoDir || (!preparedRepoDir ? repoDir : '');
+    const effPrePullHeadOid = prePullRepoDir
+      ? prePullHeadOid
+      : (!preparedRepoDir && inspectRemote ? gitBranchHeadOid(rpc, effPrePullDir, branch, { cfg: rawCfg, locale: loc }) : '');
 
     if (preparedRepoDir) {
       // Prepared by caller (computeBatchPlan).
     } else if (inspectRemote) {
-      const [ok, res] = prepareGitRepo(rpc, cfg, {
+      const [ok, res] = prepareGitRepo(rpc, rawCfg, {
         allowInitOrClone: true,
         allowPull: true,
         repoDir,
@@ -2726,6 +2751,57 @@ export function createGitSyncEngine({
     } else if (!hasGitMarker(rpc, repoDir)) {
       remoteInspected = false;
     }
+
+    const postPullHeadOid = repoRoot ? gitBranchHeadOid(rpc, repoRoot, branch, { cfg: rawCfg, locale: loc }) : '';
+    const sameRepoDir = Boolean(
+      effPrePullDir &&
+        repoRoot &&
+        normAbsPath(effPrePullDir, homeDir) === normAbsPath(repoRoot, homeDir)
+    );
+    const didFastForward = Boolean(
+      inspectRemote &&
+        remoteInspected &&
+        sameRepoDir &&
+        effPrePullHeadOid &&
+        postPullHeadOid &&
+        gitIsAncestor(rpc, repoRoot, effPrePullHeadOid, postPullHeadOid, { cfg: rawCfg, locale: loc })
+    );
+    const effectiveTargetOid = didFastForward ? effPrePullHeadOid : postPullHeadOid;
+    const hasUnpushedCommits = repoRoot ? hasUnpushedGitCommits(rpc, repoRoot, branch, { cfg: rawCfg, locale: loc }) : false;
+
+    const evalState = configStore
+      ? evaluateBaselineState(configStore, {
+          protocol: 'git',
+          nbRoot: effectiveNbRoot,
+          metaKey,
+          aliases,
+          legacyKeys: [legacyKey, ...legacyAliases].filter(Boolean),
+          nbKeyVal,
+          currentTargetIdentity: effectiveTargetOid,
+          hasUnpushedCommits,
+          callHost: rpc,
+          homeDir,
+        })
+      : null;
+
+    let onlyPath = rawOnlyPath;
+    let scope = (rawCfg && rawCfg.sync_scope) || 'all';
+    if (evalState && evalState.forceFullSync && (onlyPath !== null || scope !== 'all')) {
+      onlyPath = null;
+      scope = 'all';
+    }
+    const cfg = scope !== ((rawCfg && rawCfg.sync_scope) || 'all') ? { ...rawCfg, sync_scope: scope } : rawCfg;
+
+    const canLazyLocal = onlyPath === null && typeof local.readNote === 'function';
+    let localNotes = {};
+    let remoteNotes = {};
+    let localSnapshot = null;
+    let remoteSnapshot = null;
+    let localNoteEntries = null;
+    let remoteNoteEntries = null;
+    let readLocalNote = null;
+    let readRemoteNote = null;
+    const scanOptions = { onlyPath, scope, excludedSubdirs, locale: loc, cfg, skips };
 
     if (remoteInspected && !remoteError) {
       if (onlyPath === null) {
@@ -2890,6 +2966,8 @@ export function createGitSyncEngine({
       trackedRemotePaths,
       gitTreePaths,
       onlyPath,
+      currentTargetIdentity: effectiveTargetOid,
+      hasUnpushedCommits,
       locale: loc,
       skips,
     });
@@ -2966,6 +3044,10 @@ export function createGitSyncEngine({
         `${resolveLocalGitDir(rpc, c, { dataDir: dDir, nbRoot: getNbRoot(), homeDir, locale: loc })}:${gitBranch(c)}`,
     });
 
+    const prePullRepoDir = repoDir;
+    const prePullHeadOid = inspectRemote
+      ? gitBranchHeadOid(rpc, prePullRepoDir, gitBranch(cfg), { cfg, locale: loc })
+      : '';
     let preparedRepoDir = '';
     if (inspectRemote) {
       const [ok, res] = prepareGitRepo(rpc, cfg, {
@@ -3048,6 +3130,8 @@ export function createGitSyncEngine({
         nbRoot: nb,
         subdir: sub,
         preparedRepoDir,
+        prePullRepoDir,
+        prePullHeadOid,
         targetBases,
         excludedSubdirs: sub ? new Set() : reservedSubdirs,
         deadlineMs,
@@ -3293,13 +3377,15 @@ export function createGitSyncEngine({
     const flushBaselines = () => {
       if (baselinesCommitted || !configStore) return;
       baselinesCommitted = true;
+      const liveBranch = gitBranch(batch.cfg);
+      const liveHeadOid = repo ? gitBranchHeadOid(rpc, repo, liveBranch, { cfg: batch.cfg, locale: loc }) : '';
       for (const [plan, res] of pendingBaseMaps) {
         const origBase = plan.identity_verified === true ? (plan.original_base_map || plan.base_map || {}) : (plan.base_map || {});
         if (plan.skips) {
           restoreSkippedBase(res.baseMap, origBase, plan.skips);
           pruneSkippedPatchEntries(res.partialBaseMap, res.deletedKeys, plan.skips);
         }
-        commitPlanBaseline(configStore, plan, res, { markInitialized: true });
+        commitPlanBaseline(configStore, plan, res, { markInitialized: true, targetIdentity: liveHeadOid });
       }
     };
 
@@ -3365,13 +3451,17 @@ export function createGitSyncEngine({
 
     const skippedItems = collectSkippedItems(batch.plans);
     const skippedSummary = skippedItems.length ? formatSkippedCount(loc, skippedItems.length) : '';
+    const mergeOnlyRule = batch.plans.some((p) => p.merge_only_rule === true);
     const totalNotes = totalPushed + totalPulled + totalConflicts;
     if (totalNotes === 0 && totalAssets === 0 && totalDeleted === 0) {
       if (didPush) {
-        const summary = tr(loc, '已推送本地提交', 'Pushed local commits');
+        let summary = tr(loc, '已推送本地提交', 'Pushed local commits');
+        if (skippedSummary) summary += ` · ${skippedSummary}`;
+        if (mergeOnlyRule) summary += ` · ${mergeOnlyRoundNote(loc)}`;
         return {
           status: '成功',
-          summary: skippedSummary ? `${summary} · ${skippedSummary}` : summary,
+          summary,
+          merge_only_rule: mergeOnlyRule,
           skipped_items: skippedItems,
           pushed: 0,
           pulled: 0,
@@ -3394,9 +3484,14 @@ export function createGitSyncEngine({
           did_push: false,
         };
       }
+      let noopSummary = skippedSummary || tr(loc, '已是最新', 'Up to date');
+      if (mergeOnlyRule) {
+        noopSummary += ` · ${mergeOnlyRoundNote(loc)}`;
+      }
       return {
         status: '无变更',
-        summary: skippedSummary || tr(loc, '已是最新', 'Up to date'),
+        summary: noopSummary,
+        merge_only_rule: mergeOnlyRule,
         skipped_items: skippedItems,
         pushed: 0,
         pulled: 0,
@@ -3420,9 +3515,11 @@ export function createGitSyncEngine({
     }
 
     if (skippedSummary) summary += ` · ${skippedSummary}`;
+    if (mergeOnlyRule) summary += ` · ${mergeOnlyRoundNote(loc)}`;
     return {
       status: '成功',
       summary,
+      merge_only_rule: mergeOnlyRule,
       skipped_items: skippedItems,
       pushed: totalPushed,
       pulled: totalPulled,
