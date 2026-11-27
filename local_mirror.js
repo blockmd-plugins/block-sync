@@ -336,8 +336,8 @@ export function isCloudPlaceholder(callHost, rootDir, relPath) {
 export function isConfirmedAbsentOnRoot(callHost, rootDir, relPath) {
   if (!rootDir || !relPath) return false;
   const cleanRoot = trimTrailingSlash(rootDir);
-  const norm = normalizeRelPath(relPath);
-  if (!norm) return false;
+  const norm = String(relPath).replace(/\\/g, '/');
+  if (!isSafeRelPath(norm)) return false;
   try {
     const rootSt = fsStat(callHost, cleanRoot);
     if (!rootSt.exists || !rootSt.is_dir) return false;
@@ -1133,6 +1133,23 @@ function isVerifiedRegularStashFile(callHost, filePath, name) {
   }
 }
 
+function verifiedLegacyRegularFile(callHost, filePath) {
+  try {
+    const st = fsStat(callHost, filePath, { lstat: true });
+    if (!st || !st.exists || st.is_dir || st.is_symlink) return null;
+    const regular = st.is_regular === true || (st.is_regular === undefined && st.is_file === true);
+    return regular ? st : null;
+  } catch (_err) {
+    return null;
+  }
+}
+
+function legacyStashName(callHost, name, tsMs) {
+  const safe = (String(name).replace(/[^A-Za-z0-9._-]+/g, '_') || 'file').slice(0, 48);
+  const ts = String(Math.max(0, Math.floor(tsMs))).padStart(15, '0').slice(-15);
+  return `${ts}-${sha256Text(name, callHost).slice(0, 8)}-${safe}`;
+}
+
 function pruneStashDir(callHost, stashDir, keepName, nowMs) {
   try {
     const expireBeforeMs = nowMs - RECOVERY_RETENTION_MS;
@@ -1380,9 +1397,15 @@ export function migrateLegacyRecoveryDirs(
       for (const entry of entries) {
         if (!entry || entry.is_dir || entry.is_symlink || entry.is_regular === false || entry.is_file === false) continue;
         const name = String(entry.name ?? '') || posixBasename(entry.path || '');
-        if (!name || !isRecognizedStashFileName(name)) continue;
+        if (!name) continue;
         const srcPath = entry.path ? String(entry.path) : posixJoin(legacyDir, name);
-        if (!isVerifiedRegularStashFile(rpc, srcPath, name)) continue;
+        // Plugin-owned legacy dirs: move any verified regular file (never delete). Unrecognized
+        // names are re-tagged into the stash format so the 7-day retention applies later.
+        const legacySt = verifiedLegacyRegularFile(rpc, srcPath);
+        if (!legacySt) continue;
+        const destName = isRecognizedStashFileName(name)
+          ? name
+          : legacyStashName(rpc, name, Number(legacySt.mtime_ms) || nowMs);
         try {
           if (!ensuredRecoveryDir) {
             const recSt = fsStat(rpc, recoveryDir, { lstat: true });
@@ -1390,7 +1413,7 @@ export function migrateLegacyRecoveryDirs(
             fsMkdir(rpc, recoveryDir, true);
             ensuredRecoveryDir = true;
           }
-          moveFileIntoRecovery(rpc, srcPath, recoveryDir, name, nowMs);
+          moveFileIntoRecovery(rpc, srcPath, recoveryDir, destName, nowMs);
         } catch (_moveErr) {
           // Best-effort per entry; never block sync.
         }
