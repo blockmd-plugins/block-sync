@@ -11,15 +11,11 @@
   "author": "Block Community",
   "repo": "blockmd-plugins/block-sync",
   "summary": {
-    "zh": "支持本地目录镜像、WebDAV 与 Git 仓库的多端增量同步",
-    "en": "Incremental notebook sync via local mirror, WebDAV, and Git"
+    "zh": "把笔记自动同步到自有云盘、WebDAV 网盘或 Git 仓库，无需买会员",
+    "en": "Auto-sync notes to your own cloud folder, WebDAV, or Git repo with no extra subscription"
   },
   "entry": {
-    "command": [
-      "python3",
-      "-u",
-      "main.py"
-    ]
+    "js": "main.js"
   },
   "permissions": [
     "storage",
@@ -29,40 +25,53 @@
     "events:note_saved",
     "system:notify",
     "system:secrets",
-    "events:system"
+    "events:system",
+    "system:fs",
+    "system:exec"
+  ],
+  "exec_allowlist": [
+    "git"
   ],
   "permission_reasons": {
     "storage": {
-      "zh": "保存各笔记本的同步配置、同步状态元信息与近期同步日志",
-      "en": "Save per-notebook sync settings, sync state metadata, and recent logs"
+      "zh": "保存各笔记本的同步设置、同步进度和近期同步记录",
+      "en": "Save sync settings, progress state, and recent sync history per notebook"
     },
     "notes:read": {
-      "zh": "读取待同步笔记与附件内容，用于增量比对与上传",
-      "en": "Read notes and attachments for incremental comparison and upload"
+      "zh": "读取笔记和附件，用来对比改动并上传同步",
+      "en": "Read notes and attachments to check for changes and upload updates"
     },
     "notes:write": {
-      "zh": "将远端拉取的新增或更新笔记、冲突副本写入本地工作区，并把远端已删除的未改动文件移入回收站",
-      "en": "Write remote note updates and conflict copies locally, and move files deleted remotely and unchanged locally to the Trash"
+      "zh": "把远端更新和冲突副本写入本地，并将远端已删笔记移入回收站",
+      "en": "Save remote updates and conflict copies locally, and move remotely deleted notes to Trash"
     },
     "network": {
-      "zh": "连接 WebDAV 服务器或远程 Git 仓库执行双向同步",
-      "en": "Connect to WebDAV servers or remote Git repositories for sync"
+      "zh": "连接你的 WebDAV 网盘或远程 Git 仓库完成多端同步",
+      "en": "Connect to your WebDAV server or remote Git repository to sync notes"
     },
     "events:note_saved": {
-      "zh": "在笔记保存后自动触发增量同步",
-      "en": "Automatically trigger incremental sync when a note is saved"
+      "zh": "保存笔记后自动同步改动，无需手动操作",
+      "en": "Automatically sync changes right after you save a note"
     },
     "system:notify": {
-      "zh": "同步失败、发生冲突或需要确认时发出通知",
-      "en": "Notify you when sync fails, encounters conflicts, or needs confirmation"
+      "zh": "同步出错、出现冲突或需要你确认批量删除时发出提醒",
+      "en": "Alert you when sync fails, finds a conflict, or needs confirmation"
     },
     "system:secrets": {
-      "zh": "将 Git 令牌和 WebDAV 密码保存在系统凭据库中",
-      "en": "Store Git tokens and WebDAV passwords in the system credential store"
+      "zh": "把网盘密码和 Git 访问令牌安全存进系统钥匙串",
+      "en": "Store WebDAV passwords and Git tokens securely in your system keychain"
     },
     "events:system": {
-      "zh": "系统唤醒或恢复联网后按现有规则补做自动同步",
-      "en": "Resume automatic sync after waking or reconnecting, using the existing sync rules"
+      "zh": "电脑唤醒或重新连上网后，自动补做一次同步",
+      "en": "Catch up on missed syncs automatically after your device wakes or reconnects"
+    },
+    "system:fs": {
+      "zh": "读写你选择的同步文件夹、本地镜像备份与插件 Git 缓存目录",
+      "en": "Read and write your chosen sync folder, local mirror, and Git cache"
+    },
+    "system:exec": {
+      "zh": "调用系统 Git 命令完成仓库状态检查、提交与远端推送拉取",
+      "en": "Run git commands to check repository status, commit, pull, and push"
     }
   },
   "surfaces": [
