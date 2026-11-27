@@ -214,6 +214,7 @@ function createSyncController() {
   let backgroundNoticeDeadlineMs = 0;
   let nextSystemNotebook = '';
   const intervalSyncedAt = new Map();
+  const oversizedNotified = new Set();
   const protocolNextAllowedMs = new Map();
   const lastSyncAttemptMs = new Map();
   const pendingDirty = new Map();
@@ -858,6 +859,32 @@ function createSyncController() {
       callHost('host.ui.toast', toastParams);
     } catch (_err) {
       // Non-fatal UI toast failure.
+    }
+  };
+
+  const notifyOversizedSkips = (items) => {
+    const fresh = items
+      .filter((it) => it && it.code === 'file_limit' && !oversizedNotified.has(it.path))
+      .map((it) => it.path);
+    if (fresh.length === 0) return;
+    for (const p of fresh) {
+      if (oversizedNotified.size >= 500) oversizedNotified.delete(oversizedNotified.values().next().value);
+      oversizedNotified.add(p);
+    }
+    const limit = configStore ? configStore.state.config.max_file_size_mb : '';
+    const sample = fresh.slice(0, 2).map((p) => p.split('/').pop()).join(', ') + (fresh.length > 2 ? '...' : '');
+    const params = {
+      title: t(`${fresh.length} 个文件超过大小上限，未同步`, `${fresh.length} files exceed the size limit and were not synced`),
+      body: t(
+        `${sample}（上限 ${limit} MB）。可在同步设置调整上限或加入忽略规则。`,
+        `${sample} (limit ${limit} MB). Adjust the limit or add an ignore rule in Sync settings.`
+      ),
+      tone: 'warning',
+      dedup_key: `oversized:${fresh.join('|')}`.slice(0, 200),
+    };
+    sendInAppToast(params);
+    if (supportsSystem && configStore && configStore.state.config.system_notifications) {
+      deliverResultNotice(params);
     }
   };
 
@@ -1737,6 +1764,7 @@ function createSyncController() {
       if (res.did_push) {
         const pLabel = protocolLabel(getLocale(), proto);
         appendLog(t(`推送 ${pLabel} 提交`, `Push commits to ${pLabel}`), '成功', {
+      notifyOversizedSkips(skippedItems);
           tone: 'success',
           tooltip: summary,
         });
