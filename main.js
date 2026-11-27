@@ -47,7 +47,9 @@ import {
   protocolHasInput,
   protocolEnabled,
   configMatchesSaved,
+  connConfigSignature,
   changedProtocols,
+  resolveMirrorDir,
   credentialTarget,
   resolveCredentials,
   createConfigStore,
@@ -159,6 +161,8 @@ function createSyncController() {
   let supportsActionProgress = false;
   let supportsProgressBar = false;
   let supportsSegmentedStatus = false;
+  let supportsFormAutosave = false;
+  let supportsButtonLink = false;
   let supportsSystem = false;
   let supportsToastBanner = false;
   let supportsOpenSettings = false;
@@ -232,6 +236,8 @@ function createSyncController() {
     supportsLogTimeline,
     supportsProgressBar,
     supportsSegmentedStatus,
+    supportsFormAutosave,
+    supportsButtonLink,
     supportsSystem,
     lastStatus,
   });
@@ -832,6 +838,16 @@ function createSyncController() {
       notifiedKey = '';
       outageSinceMs = 0;
       protocolNextAllowedMs.delete(backoffKey);
+      const prevConn = configStore.getConnState(proto);
+      if (prevConn && prevConn.ok === false) {
+        configStore.setConnState(proto, {
+          ok: true,
+          message: '',
+          target_sig: connConfigSignature(configStore.state.config, proto, downloadsDir, homeDir),
+          time: nowStr,
+          locale: getLocale(),
+        });
+      }
       resultNotice = conflictCount > 0
         ? [
             statusStr,
@@ -1091,20 +1107,38 @@ function createSyncController() {
     resultNotified ? new SyncReportedError(message) : new Error(message);
 
   const runTestConn = (cfg = null) => {
-    let c = cfg || configStore.state.config;
-    const err = targetError(c, { ...uiContext(), requireNotebooks: false });
+    const rawCfg = cfg || configStore.state.config;
+    const protocol = rawCfg.protocol || 'local_mirror';
+    const sig = connConfigSignature(rawCfg, protocol, downloadsDir, homeDir);
+    const err = targetError(rawCfg, { ...uiContext(), requireNotebooks: false });
     if (err) {
+      if (protocolHasInput(rawCfg, protocol, downloadsDir, homeDir)) {
+        configStore.setConnState(protocol, {
+          ok: false,
+          message: err,
+          target_sig: sig,
+          time: nowHms(),
+          locale: getLocale(),
+        });
+      }
       lastStatus = err;
       return [false, err];
     }
+    let c;
     try {
-      c = resolveCredentials(callHost, c, getLocale());
+      c = resolveCredentials(callHost, rawCfg, getLocale());
     } catch (exc) {
       lastStatus = errorDetail(getLocale(), exc);
+      configStore.setConnState(protocol, {
+        ok: false,
+        message: lastStatus,
+        target_sig: sig,
+        time: nowHms(),
+        locale: getLocale(),
+      });
       return [false, lastStatus];
     }
 
-    const protocol = c.protocol || 'local_mirror';
     let ok;
     let msg;
     if (protocol === 'webdav') {
@@ -1115,6 +1149,13 @@ function createSyncController() {
       [ok, msg] = engines.localMirror.testConnection(c);
     }
 
+    configStore.setConnState(protocol, {
+      ok: Boolean(ok),
+      message: msg,
+      target_sig: sig,
+      time: nowHms(),
+      locale: getLocale(),
+    });
     const pLabel = protocolLabel(getLocale(), protocol);
     logProtocol = protocol;
     appendLog(t(`测试连接 (${pLabel})`, `Test connection (${pLabel})`), ok ? '通过' : '未连通', {
@@ -1822,6 +1863,8 @@ function createSyncController() {
     supportsActionProgress = caps.has('action_progress');
     supportsProgressBar = caps.has('progress_bar');
     supportsSegmentedStatus = caps.has('segmented_status');
+    supportsFormAutosave = caps.has('form_autosave');
+    supportsButtonLink = caps.has('button_link');
     supportsSystem = caps.has('system_integration');
     supportsToastBanner = caps.has('toast_banner');
     supportsOpenSettings = caps.has('open_settings');
@@ -1899,47 +1942,49 @@ function createSyncController() {
         nextStatus = '';
       }
 
-      for (const [proto, enabledKey] of Object.entries(PROTOCOL_ENABLED_KEYS)) {
-        if (Object.hasOwn(values, enabledKey) && cfg[enabledKey] !== configStore.state.config[enabledKey]) {
-          nextConfig[enabledKey] = cfg[enabledKey];
-          schedulerNeedsSync = true;
-          const pLabel = protocolLabel(getLocale(), proto);
-          if (!cfg[enabledKey]) {
-            clearProtocols.add(proto);
-            nextStatus = t(`已停用${pLabel}`, `${pLabel} disabled`);
-          } else if (!protocolError(nextConfig, proto, { ...uiContext(), requireNotebooks: false })) {
-            nextStatus = t(`已启用${pLabel}`, `${pLabel} enabled`);
-          } else {
-            nextStatus = '';
+      if (!supportsFormAutosave) {
+        for (const [proto, enabledKey] of Object.entries(PROTOCOL_ENABLED_KEYS)) {
+          if (Object.hasOwn(values, enabledKey) && cfg[enabledKey] !== configStore.state.config[enabledKey]) {
+            nextConfig[enabledKey] = cfg[enabledKey];
+            schedulerNeedsSync = true;
+            const pLabel = protocolLabel(getLocale(), proto);
+            if (!cfg[enabledKey]) {
+              clearProtocols.add(proto);
+              nextStatus = t(`已停用${pLabel}`, `${pLabel} disabled`);
+            } else if (!protocolError(nextConfig, proto, { ...uiContext(), requireNotebooks: false })) {
+              nextStatus = t(`已启用${pLabel}`, `${pLabel} enabled`);
+            } else {
+              nextStatus = '';
+            }
           }
         }
-      }
 
-      if (Object.hasOwn(values, 'mirror_dir')) {
-        if (!cfg.mirror_dir) {
-          if (configStore.state.config.mirror_dir || configStore.state.config.local_mirror_enabled) {
-            nextConfig.mirror_dir = '';
-            nextConfig.local_mirror_enabled = false;
-            clearProtocols.add('local_mirror');
-            schedulerNeedsSync = true;
-            nextStatus = t('已停用目录镜像', 'Local mirror disabled');
-          }
-        } else {
-          const mirrorErr = protocolError(cfg, 'local_mirror', {
-            ...uiContext(),
-            requireNotebooks: false,
-          });
-          if (!mirrorErr) {
-            if (configStore.state.config.mirror_dir !== cfg.mirror_dir) {
-              nextConfig.mirror_dir = cfg.mirror_dir;
-              nextConfig.local_mirror_enabled = true;
-              cfg.local_mirror_enabled = true;
+        if (Object.hasOwn(values, 'mirror_dir')) {
+          if (!cfg.mirror_dir) {
+            if (configStore.state.config.mirror_dir || configStore.state.config.local_mirror_enabled) {
+              nextConfig.mirror_dir = '';
+              nextConfig.local_mirror_enabled = false;
               clearProtocols.add('local_mirror');
               schedulerNeedsSync = true;
-              nextStatus = t('已启用本地镜像目录', 'Local mirror folder enabled');
+              nextStatus = t('已停用目录镜像', 'Local mirror disabled');
             }
           } else {
-            renderStatus = mirrorErr;
+            const mirrorErr = protocolError(cfg, 'local_mirror', {
+              ...uiContext(),
+              requireNotebooks: false,
+            });
+            if (!mirrorErr) {
+              if (configStore.state.config.mirror_dir !== cfg.mirror_dir) {
+                nextConfig.mirror_dir = cfg.mirror_dir;
+                nextConfig.local_mirror_enabled = true;
+                cfg.local_mirror_enabled = true;
+                clearProtocols.add('local_mirror');
+                schedulerNeedsSync = true;
+                nextStatus = t('已启用本地镜像目录', 'Local mirror folder enabled');
+              }
+            } else {
+              renderStatus = mirrorErr;
+            }
           }
         }
       }
@@ -1960,10 +2005,9 @@ function createSyncController() {
         'system_notifications',
         'conflict_policy',
         'protocol',
-        'mirror_dir',
-        'local_mirror_enabled',
-        'webdav_enabled',
-        'git_enabled',
+        ...(supportsFormAutosave
+          ? []
+          : ['mirror_dir', 'local_mirror_enabled', 'webdav_enabled', 'git_enabled']),
       ];
       for (const key of acceptedKeys) {
         if (
@@ -1974,6 +2018,7 @@ function createSyncController() {
         }
       }
       if (
+        !supportsFormAutosave &&
         Object.hasOwn(values, 'mirror_dir') &&
         configStore.state.config.local_mirror_enabled !== values.local_mirror_enabled
       ) {
@@ -2008,8 +2053,41 @@ function createSyncController() {
     return out;
   };
 
+  const isTargetDraftIncomplete = (cfg, proto) => {
+    if (proto === 'local_mirror') {
+      return !resolveMirrorDir(cfg, downloadsDir, homeDir);
+    }
+    if (proto === 'webdav') {
+      return !String(cfg.webdav_url || '').trim();
+    }
+    if (proto === 'git') {
+      return !String(cfg.git_remote || '').trim();
+    }
+    return false;
+  };
+
+  const hasConnectionFieldChanged = (prevCfg, nextCfg, proto) => {
+    if (
+      connConfigSignature(prevCfg, proto, downloadsDir, homeDir) !==
+      connConfigSignature(nextCfg, proto, downloadsDir, homeDir)
+    ) {
+      return true;
+    }
+    if (!protocolEnabled(prevCfg, proto) && protocolEnabled(nextCfg, proto)) {
+      return true;
+    }
+    if (proto === 'webdav' && nextCfg.webdav_pass && nextCfg.webdav_pass !== prevCfg.webdav_pass) {
+      return true;
+    }
+    if (proto === 'git' && nextCfg.git_token && nextCfg.git_token !== prevCfg.git_token) {
+      return true;
+    }
+    return false;
+  };
+
   const handleAction = (params) => {
     const actionId = String(params.action_id || '');
+    const isAutosave = String(params.trigger || '') === 'autosave';
     if (actionId === 'open_sync_settings') {
       if (supportsOpenSettings) {
         try {
@@ -2028,9 +2106,69 @@ function createSyncController() {
     let status = '';
 
     if (actionId === 'save_config') {
+      const prevCfg = configStore.state.config;
       const nextCfg = configStore.normalizeConfig(values);
       const proto = nextCfg.protocol;
       const enabledKey = PROTOCOL_ENABLED_KEYS[proto];
+      const explicitDisable =
+        Object.hasOwn(values, enabledKey) &&
+        values[enabledKey] === false &&
+        Boolean(prevCfg[enabledKey]);
+
+      if (isAutosave && explicitDisable) {
+        nextCfg[enabledKey] = false;
+        const changed = changedProtocols(prevCfg, nextCfg);
+        saveConfig(nextCfg, { clearPending: changed.size > 0 ? changed : false });
+        configStore.clearConnState(proto);
+        saveRuntime();
+        syncAutoSyncScheduler();
+        const pLabel = protocolLabel(getLocale(), proto);
+        lastStatus = t(`已停用${pLabel}`, `${pLabel} disabled`);
+        return {
+          ok: true,
+          tone: 'success',
+          values: configValues(configStore.state.config),
+          page: buildSettingsPage(uiContext(), configStore.state.config),
+          status: '',
+        };
+      }
+
+      if (
+        isAutosave &&
+        !protocolEnabled(nextCfg, proto) &&
+        !protocolHasInput(nextCfg, proto, downloadsDir, homeDir)
+      ) {
+        const optionKeys = [
+          'selected_notebooks',
+          'conflict_policy',
+          'auto_sync',
+          'sync_interval',
+          'max_file_size_mb',
+          'ignore_patterns',
+          'system_notifications',
+        ];
+        const optionsChanged = optionKeys.some(
+          (k) => JSON.stringify(prevCfg[k]) !== JSON.stringify(nextCfg[k])
+        );
+        if (optionsChanged) {
+          const mergedOptionsCfg = { ...prevCfg, protocol: proto };
+          for (const k of optionKeys) {
+            mergedOptionsCfg[k] = nextCfg[k];
+          }
+          const changed = changedProtocols(prevCfg, mergedOptionsCfg);
+          saveConfig(mergedOptionsCfg, { clearPending: changed.size > 0 ? changed : false });
+          syncAutoSyncScheduler();
+          return {
+            ok: true,
+            tone: 'success',
+            values: configValues(configStore.state.config),
+            page: buildSettingsPage(uiContext(), configStore.state.config),
+            status: '',
+          };
+        }
+        return { ok: true, tone: 'info', status: '' };
+      }
+
       const hasOtherConfigured = VALID_PROTOCOLS.some(
         (p) =>
           p !== proto &&
@@ -2039,14 +2177,38 @@ function createSyncController() {
       );
       const clearingConfigured =
         hasOtherConfigured &&
-        ((proto === 'webdav' && !nextCfg.webdav_url && Boolean(configStore.state.config.webdav_url)) ||
-          (proto === 'git' && !nextCfg.git_remote && Boolean(configStore.state.config.git_remote)) ||
-          (proto === 'local_mirror' && !nextCfg.mirror_dir && Boolean(configStore.state.config.mirror_dir)));
+        ((proto === 'webdav' && !nextCfg.webdav_url && Boolean(prevCfg.webdav_url)) ||
+          (proto === 'git' && !nextCfg.git_remote && Boolean(prevCfg.git_remote)) ||
+          (proto === 'local_mirror' && !nextCfg.mirror_dir && Boolean(prevCfg.mirror_dir)));
 
       const pErr = clearingConfigured
         ? ''
         : protocolError(nextCfg, proto, { ...uiContext(), requireNotebooks: false });
       if (pErr) {
+        if (isAutosave) {
+          const optionKeys = [
+            'max_file_size_mb',
+            'ignore_patterns',
+            'conflict_policy',
+            'auto_sync',
+            'sync_interval',
+            'system_notifications',
+          ];
+          const optionsChanged = optionKeys.some(
+            (k) => JSON.stringify(prevCfg[k]) !== JSON.stringify(nextCfg[k])
+          );
+          if (optionsChanged) {
+            const mergedOptionsCfg = { ...prevCfg };
+            for (const k of optionKeys) mergedOptionsCfg[k] = nextCfg[k];
+            const changed = changedProtocols(prevCfg, mergedOptionsCfg);
+            saveConfig(mergedOptionsCfg, { clearPending: changed.size > 0 ? changed : false });
+            syncAutoSyncScheduler();
+          }
+          if (!protocolEnabled(nextCfg, proto) || isTargetDraftIncomplete(nextCfg, proto)) {
+            return { ok: true, tone: 'info', status: '' };
+          }
+          return { ok: false, tone: 'danger', status: pErr };
+        }
         lastStatus = pErr;
         return {
           ok: false,
@@ -2062,12 +2224,37 @@ function createSyncController() {
       } else if (
         !protocolEnabled(nextCfg, proto) &&
         (!Object.hasOwn(values, enabledKey) ||
-          !protocolHasInput(configStore.state.config, proto, downloadsDir, homeDir))
+          !protocolHasInput(prevCfg, proto, downloadsDir, homeDir))
       ) {
         nextCfg[enabledKey] = true;
       }
-      const changed = changedProtocols(configStore.state.config, nextCfg);
+      const connChanged = hasConnectionFieldChanged(prevCfg, nextCfg, proto);
+      const changed = changedProtocols(prevCfg, nextCfg);
       saveConfig(nextCfg, { clearPending: changed.size > 0 ? changed : false });
+      syncAutoSyncScheduler();
+
+      if (isAutosave) {
+        if (clearingConfigured) {
+          configStore.clearConnState(proto);
+          saveRuntime();
+        } else if (connChanged && protocolEnabled(configStore.state.config, proto)) {
+          emitProgress({
+            channel: proto,
+            label: t('已保存 · 正在检测连接…', 'Saved · Checking connection…'),
+            tone: 'accent',
+            running: true,
+          });
+          runTestConn(configStore.state.config);
+          saveRuntime();
+        }
+        return {
+          ok: true,
+          tone: 'success',
+          values: configValues(configStore.state.config),
+          page: buildSettingsPage(uiContext(), configStore.state.config),
+          status: '',
+        };
+      }
 
       const pLabel = protocolLabel(getLocale(), proto);
       status = clearingConfigured
@@ -2087,6 +2274,8 @@ function createSyncController() {
         credentialTarget(draft, field) === credentialTarget(cur, field)
       ) {
         saveConfig(null, { forget: field, clearPending: new Set([proto]) });
+        configStore.clearConnState(proto);
+        saveRuntime();
         status = configStore.state.credentialCleanup.size > 0
           ? t(
               '已取消使用此目标的凭据，系统凭据库中的删除将重试',
