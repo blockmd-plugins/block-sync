@@ -84,6 +84,7 @@ const SYNC_INTERVAL_EVENT = 'scheduler.tick';
 const LEGACY_SYNC_INTERVAL_EVENT = 'plugin.sync_interval';
 const BG_ERROR_KEY = 'sync_state';
 const AUTO_SYNC_JOB_ID = 'auto-sync';
+const LEGACY_IGNORED_DIRS = ['.block-sync-replaced', '.block-sync-recovery'];
 
 class SyncStateError extends Error {
   constructor(message, notified = false) {
@@ -113,7 +114,11 @@ function isMethodUnsupportedError(err) {
   if (!err) return false;
   if (typeof err === 'object' && err.code === -32601) return true;
   const msg = String(err && err.message ? err.message : err).toLowerCase();
-  return msg.includes('unknown host method') || msg.includes('-32601');
+  return (
+    msg.includes('unknown host method') ||
+    msg.includes('method not found') ||
+    msg.includes('-32601')
+  );
 }
 
 function splitItemKey(itemKey) {
@@ -1895,6 +1900,14 @@ function createSyncController() {
     rebuildEngines();
     runInitialMaintenance();
     syncAutoSyncScheduler();
+    try {
+      callHost('host.sidebar.set_ignored_dirs', { dirs: LEGACY_IGNORED_DIRS });
+    } catch (err) {
+      // Silently ignore on older hosts that do not implement sidebar ignored_dirs.
+      if (!isMethodUnsupportedError(err)) {
+        // Non-fatal: sidebar directory hiding should never block plugin initialization.
+      }
+    }
     return { ready: true };
   };
 
