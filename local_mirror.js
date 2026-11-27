@@ -226,7 +226,7 @@ export function fsReadText(callHost, path) {
 }
 
 /** Write raw bytes via host.fs.write. */
-export function fsWriteBytes(callHost, path, data, { atomic = false, mkdirParents = false, expectedRootIdentity = '' } = {}) {
+export function fsWriteBytes(callHost, path, data, { atomic = false, mkdirParents = false, expectedRoot = '', expectedRootIdentity = '' } = {}) {
   const rpc = resolveCallHost(callHost);
   const view = data instanceof Uint8Array ? data : new Uint8Array(data || 0);
   const params = {
@@ -235,12 +235,15 @@ export function fsWriteBytes(callHost, path, data, { atomic = false, mkdirParent
     atomic: Boolean(atomic),
     mkdir_parents: Boolean(mkdirParents),
   };
-  if (expectedRootIdentity) params.expected_root_identity = String(expectedRootIdentity);
+  if (expectedRootIdentity) {
+    params.expected_root_identity = String(expectedRootIdentity);
+    if (expectedRoot) params.expected_root = String(expectedRoot);
+  }
   return rpc('host.fs.write', params);
 }
 
 /** Write UTF-8 text via host.fs.write. */
-export function fsWriteText(callHost, path, content, { atomic = false, mkdirParents = false, expectedRootIdentity = '' } = {}) {
+export function fsWriteText(callHost, path, content, { atomic = false, mkdirParents = false, expectedRoot = '', expectedRootIdentity = '' } = {}) {
   const rpc = resolveCallHost(callHost);
   const params = {
     path: String(path ?? ''),
@@ -248,7 +251,10 @@ export function fsWriteText(callHost, path, content, { atomic = false, mkdirPare
     atomic: Boolean(atomic),
     mkdir_parents: Boolean(mkdirParents),
   };
-  if (expectedRootIdentity) params.expected_root_identity = String(expectedRootIdentity);
+  if (expectedRootIdentity) {
+    params.expected_root_identity = String(expectedRootIdentity);
+    if (expectedRoot) params.expected_root = String(expectedRoot);
+  }
   return rpc('host.fs.write', params);
 }
 
@@ -263,13 +269,16 @@ export function fsMkdir(callHost, path, recursive = true) {
 }
 
 /** Delete a file or directory via host.fs.delete. */
-export function fsDelete(callHost, path, recursive = false, { expectedRootIdentity = '' } = {}) {
+export function fsDelete(callHost, path, recursive = false, { expectedRoot = '', expectedRootIdentity = '' } = {}) {
   const rpc = resolveCallHost(callHost);
   const params = {
     path: String(path ?? ''),
     recursive: Boolean(recursive),
   };
-  if (expectedRootIdentity) params.expected_root_identity = String(expectedRootIdentity);
+  if (expectedRootIdentity) {
+    params.expected_root_identity = String(expectedRootIdentity);
+    if (expectedRoot) params.expected_root = String(expectedRoot);
+  }
   return rpc('host.fs.delete', params);
 }
 
@@ -404,7 +413,7 @@ export function deleteDataPath(callHost, targetPath, { recursive = false, baseDi
 }
 
 /** Rename/move a path via host.fs.rename. */
-export function fsRename(callHost, from, to, { overwrite = false, mkdirParents = false, expectedRootIdentity = '' } = {}) {
+export function fsRename(callHost, from, to, { overwrite = false, mkdirParents = false, expectedRoot = '', expectedRootIdentity = '' } = {}) {
   const rpc = resolveCallHost(callHost);
   const params = {
     from: String(from ?? ''),
@@ -412,12 +421,15 @@ export function fsRename(callHost, from, to, { overwrite = false, mkdirParents =
     overwrite: Boolean(overwrite),
     mkdir_parents: Boolean(mkdirParents),
   };
-  if (expectedRootIdentity) params.expected_root_identity = String(expectedRootIdentity);
+  if (expectedRootIdentity) {
+    params.expected_root_identity = String(expectedRootIdentity);
+    if (expectedRoot) params.expected_root = String(expectedRoot);
+  }
   return rpc('host.fs.rename', params);
 }
 
 /** Stream-copy a regular file on the host via host.fs.copy (avoids Wasm memory). */
-export function fsCopy(callHost, from, to, { overwrite = false, mkdirParents = false, expectedRootIdentity = '' } = {}) {
+export function fsCopy(callHost, from, to, { overwrite = false, mkdirParents = false, expectedRoot = '', expectedRootIdentity = '' } = {}) {
   const rpc = resolveCallHost(callHost);
   const params = {
     from: String(from ?? ''),
@@ -425,7 +437,10 @@ export function fsCopy(callHost, from, to, { overwrite = false, mkdirParents = f
     overwrite: Boolean(overwrite),
     mkdir_parents: Boolean(mkdirParents),
   };
-  if (expectedRootIdentity) params.expected_root_identity = String(expectedRootIdentity);
+  if (expectedRootIdentity) {
+    params.expected_root_identity = String(expectedRootIdentity);
+    if (expectedRoot) params.expected_root = String(expectedRoot);
+  }
   return rpc('host.fs.copy', params);
 }
 
@@ -442,13 +457,16 @@ function isHostMethodUnsupported(exc) {
 }
 
 /** Atomically swap two files in the same directory via host.fs.atomic_swap. */
-export function fsAtomicSwap(callHost, pathA, pathB, { expectedRootIdentity = '' } = {}) {
+export function fsAtomicSwap(callHost, pathA, pathB, { expectedRoot = '', expectedRootIdentity = '' } = {}) {
   const rpc = resolveCallHost(callHost);
   const params = {
     path_a: String(pathA ?? ''),
     path_b: String(pathB ?? ''),
   };
-  if (expectedRootIdentity) params.expected_root_identity = String(expectedRootIdentity);
+  if (expectedRootIdentity) {
+    params.expected_root_identity = String(expectedRootIdentity);
+    if (expectedRoot) params.expected_root = String(expectedRoot);
+  }
   return rpc('host.fs.atomic_swap', params);
 }
 
@@ -785,8 +803,9 @@ export function scanDirSnapshot(
 ) {
   if (!rootDir) return null;
   const cleanRoot = trimTrailingSlash(rootDir);
-  const rootSt = fsStat(callHost, cleanRoot);
-  if (!rootSt.exists || !rootSt.is_dir) return null;
+  const rootSt = fsStat(callHost, cleanRoot, { lstat: true });
+  if (!rootSt.exists || rootSt.is_symlink || !rootSt.is_dir) return null;
+  const rootIdentity = String(rootSt.root_identity || '').trim();
 
   const entries = listEntriesSkippingDotDirs(callHost, cleanRoot, excludedSubdirs, locale);
   const noteEntries = new Map();
@@ -831,6 +850,7 @@ export function scanDirSnapshot(
 
   return {
     cleanRoot,
+    rootIdentity,
     noteEntries,
     assetEntries,
     icloudPaths,
@@ -1351,83 +1371,134 @@ function pruneStashDir(callHost, stashDir, keepName, nowMs, { dataDir = '' } = {
   }
 }
 
-function moveFileIntoRecovery(callHost, srcPath, stashDir, baseName, nowMs, { dataDir = '' } = {}) {
+function moveFileIntoRecovery(
+  callHost,
+  srcPath,
+  stashDir,
+  baseName,
+  nowMs,
+  { dataDir = '', expectedRoot = '', expectedRootIdentity = '' } = {}
+) {
   const pluginDataDir = resolvePluginDataDir(callHost, dataDir);
   if (!isSafeStashDir(callHost, stashDir, pluginDataDir)) {
     throw new Error(`Unsafe recovery directory: ${stashDir}`);
   }
+  const expRootClean = expectedRootIdentity ? trimTrailingSlash(normAbsPath(expectedRoot || '') || expectedRoot || '') : '';
+  const stashClean = trimTrailingSlash(normAbsPath(stashDir) || stashDir);
+  const stashInsideExpRoot = Boolean(
+    expRootClean && (stashClean === expRootClean || stashClean.startsWith(`${expRootClean}/`))
+  );
+  const rootIdOpt = expectedRootIdentity ? { expectedRoot: expRootClean || expectedRoot, expectedRootIdentity } : {};
+  const stashRootOpt = stashInsideExpRoot ? rootIdOpt : {};
+
   const baseDest = posixJoin(stashDir, baseName);
   for (let idx = 0; idx < 50; idx += 1) {
     const cand = idx === 0 ? baseDest : `${baseDest}-${idx}`;
-    try {
-      fsRename(callHost, srcPath, cand, { overwrite: false });
-      pruneStashDir(callHost, stashDir, posixBasename(cand), nowMs, { dataDir: pluginDataDir });
-      return cand;
-    } catch (exc) {
-      if (isAlreadyExistsError(exc)) continue;
-
-      // Cross-device (e.g. EXDEV) or non-collision rename failure: copy -> verify -> delete.
-      const bytes = fsReadBytes(callHost, srcPath);
-      if (bytes === null) {
-        throw new Error(`Source file missing during recovery move: ${srcPath}`);
-      }
-      let tmpPath = '';
-      for (let tIdx = 0; tIdx < 100; tIdx += 1) {
-        const tCand = posixJoin(stashDir, `.block-sync-stash-${nowMs}-${tIdx}.tmp`);
-        const tSt = fsStat(callHost, tCand, { lstat: true });
-        if (!tSt.exists) {
-          tmpPath = tCand;
-          break;
-        }
-      }
-      if (!tmpPath) {
-        throw new Error('Cannot allocate recovery temporary file');
-      }
-
-      let tmpAlive = true;
+    if (!expectedRootIdentity || stashInsideExpRoot) {
       try {
-        fsWriteBytes(callHost, tmpPath, bytes, { atomic: false, mkdirParents: false });
-        for (let cIdx = idx; cIdx < 50; cIdx += 1) {
-          const copyCand = cIdx === 0 ? baseDest : `${baseDest}-${cIdx}`;
+        fsRename(callHost, srcPath, cand, { overwrite: false, ...stashRootOpt });
+        pruneStashDir(callHost, stashDir, posixBasename(cand), nowMs, { dataDir: pluginDataDir });
+        return cand;
+      } catch (exc) {
+        if (isNotebookRootMismatchError(exc)) throw exc;
+        if (isAlreadyExistsError(exc)) continue;
+      }
+    }
+
+    // Cross-root move or EXDEV fallback: copy to recovery stash -> verify size -> verified delete from root.
+    let expectedSize = -1;
+    let bytes = null;
+    let tmpPath = '';
+    for (let tIdx = 0; tIdx < 100; tIdx += 1) {
+      const tCand = posixJoin(stashDir, `.block-sync-stash-${nowMs}-${tIdx}.tmp`);
+      const tSt = fsStat(callHost, tCand, { lstat: true });
+      if (!tSt.exists) {
+        tmpPath = tCand;
+        break;
+      }
+    }
+    if (!tmpPath) {
+      throw new Error('Cannot allocate recovery temporary file');
+    }
+
+    let tmpAlive = false;
+    try {
+      let copiedViaHost = false;
+      try {
+        const srcSt = fsStat(callHost, srcPath, { lstat: true });
+        if (!srcSt.exists || srcSt.is_symlink || srcSt.is_dir || srcSt.is_regular === false) {
+          throw new Error(`Source file unavailable during recovery move: ${srcPath}`);
+        }
+        expectedSize = Number(srcSt.size);
+        const copyRes = fsCopy(callHost, srcPath, tmpPath, { overwrite: false, mkdirParents: false, ...stashRootOpt });
+        if (copyRes && copyRes.size !== undefined && copyRes.size !== null) {
+          expectedSize = Number(copyRes.size);
+        }
+        copiedViaHost = true;
+        tmpAlive = true;
+      } catch (copyHostErr) {
+        if (isNotebookRootMismatchError(copyHostErr)) throw copyHostErr;
+        if (!isHostMethodUnsupported(copyHostErr)) throw copyHostErr;
+      }
+      if (!copiedViaHost) {
+        bytes = fsReadBytes(callHost, srcPath);
+        if (bytes === null) {
+          throw new Error(`Source file missing during recovery move: ${srcPath}`);
+        }
+        expectedSize = bytes.byteLength;
+        fsWriteBytes(callHost, tmpPath, bytes, { atomic: false, mkdirParents: false, ...stashRootOpt });
+        tmpAlive = true;
+      }
+
+      for (let cIdx = idx; cIdx < 50; cIdx += 1) {
+        const copyCand = cIdx === 0 ? baseDest : `${baseDest}-${cIdx}`;
+        try {
+          fsRename(callHost, tmpPath, copyCand, { overwrite: false, ...stashRootOpt });
+        } catch (copyExc) {
+          if (isNotebookRootMismatchError(copyExc)) throw copyExc;
+          if (isAlreadyExistsError(copyExc)) continue;
+          throw copyExc;
+        }
+        tmpAlive = false;
+        const dstSt = fsStat(callHost, copyCand, { lstat: true });
+        if (
+          !dstSt.exists ||
+          dstSt.is_dir ||
+          dstSt.is_symlink ||
+          dstSt.size === undefined ||
+          dstSt.size === null ||
+          Number(dstSt.size) !== expectedSize
+        ) {
           try {
-            fsRename(callHost, tmpPath, copyCand, { overwrite: false });
-          } catch (copyExc) {
-            if (isAlreadyExistsError(copyExc)) continue;
-            throw copyExc;
+            deleteDataPath(callHost, copyCand, { recursive: false, baseDir: pluginDataDir });
+          } catch (_cleanupErr) {
+            // Best-effort cleanup of unverified destination.
           }
-          tmpAlive = false;
-          const dstSt = fsStat(callHost, copyCand, { lstat: true });
-          if (
-            !dstSt.exists ||
-            dstSt.is_dir ||
-            dstSt.is_symlink ||
-            dstSt.size === undefined ||
-            dstSt.size === null ||
-            Number(dstSt.size) !== bytes.byteLength
-          ) {
+          throw new Error(`Recovery copy verification failed: ${copyCand}`);
+        }
+        try {
+          fsDelete(callHost, srcPath, false, rootIdOpt);
+        } catch (delSrcErr) {
+          if (isNotebookRootMismatchError(delSrcErr)) {
             try {
               deleteDataPath(callHost, copyCand, { recursive: false, baseDir: pluginDataDir });
             } catch (_cleanupErr) {
-              // Best-effort cleanup of unverified destination.
+              // Best-effort cleanup on aborted mismatch delete.
             }
-            throw new Error(`Recovery copy verification failed: ${copyCand}`);
+            throw delSrcErr;
           }
-          try {
-            fsDelete(callHost, srcPath);
-          } catch (delSrcErr) {
-            if (!isNotFoundError(delSrcErr)) throw delSrcErr;
-          }
-          pruneStashDir(callHost, stashDir, posixBasename(copyCand), nowMs, { dataDir: pluginDataDir });
-          return copyCand;
+          if (!isNotFoundError(delSrcErr)) throw delSrcErr;
         }
-        throw new Error('Exhausted recovery destination candidates');
-      } finally {
-        if (tmpAlive) {
-          try {
-            deleteDataPath(callHost, tmpPath, { recursive: false, baseDir: pluginDataDir });
-          } catch (_delErr) {
-            // Ignore temp cleanup errors.
-          }
+        pruneStashDir(callHost, stashDir, posixBasename(copyCand), nowMs, { dataDir: pluginDataDir });
+        return copyCand;
+      }
+      throw new Error('Exhausted recovery destination candidates');
+    } finally {
+      if (tmpAlive) {
+        try {
+          deleteDataPath(callHost, tmpPath, { recursive: false, baseDir: pluginDataDir });
+        } catch (_delErr) {
+          // Ignore temp cleanup errors.
         }
       }
     }
@@ -1435,7 +1506,15 @@ function moveFileIntoRecovery(callHost, srcPath, stashDir, baseName, nowMs, { da
   return '';
 }
 
-function moveToRecoveryStash(callHost, srcPath, rootDir, relPath, nowMsFn = () => Date.now(), dataDir = '') {
+function moveToRecoveryStash(
+  callHost,
+  srcPath,
+  rootDir,
+  relPath,
+  nowMsFn = () => Date.now(),
+  dataDir = '',
+  { expectedRoot = '', expectedRootIdentity = '' } = {}
+) {
   const { nowMs, tag, gitDir, candidates } = stashCandidatesForRoot(callHost, rootDir, relPath, nowMsFn, dataDir);
   const pluginDataDir = resolvePluginDataDir(callHost, dataDir);
   for (const [stashDir, needsExclude, exclPattern] of candidates) {
@@ -1454,9 +1533,14 @@ function moveToRecoveryStash(callHost, srcPath, rootDir, relPath, nowMsFn = () =
       if (needsExclude && gitDir && exclPattern) {
         ensureGitInfoExclude(callHost, gitDir, exclPattern);
       }
-      const moved = moveFileIntoRecovery(callHost, srcPath, stashDir, tag, nowMs, { dataDir: pluginDataDir });
+      const moved = moveFileIntoRecovery(callHost, srcPath, stashDir, tag, nowMs, {
+        dataDir: pluginDataDir,
+        expectedRoot,
+        expectedRootIdentity,
+      });
       if (moved) return moved;
-    } catch (_err) {
+    } catch (err) {
+      if (isNotebookRootMismatchError(err)) throw err;
       // Try next candidate directory.
     }
   }
@@ -1676,20 +1760,23 @@ function preserveExternalConflictCopy(
   srcPath,
   destPath,
   hashHex,
-  defaultExt = ''
+  defaultExt = '',
+  { expectedRoot = '', expectedRootIdentity = '' } = {}
 ) {
   const parent = posixDirname(destPath);
   const baseName = posixBasename(destPath);
   const [stem, ext] = splitExt(baseName);
   const useExt = ext || defaultExt;
   const tag = String(hashHex || 'ext').slice(0, 8);
+  const rootIdOpt = expectedRootIdentity ? { expectedRoot, expectedRootIdentity } : {};
   for (let idx = 1; idx < 50; idx += 1) {
     const suffix = idx === 1 ? '' : `-${idx}`;
     const cand = posixJoin(parent, `${stem}.conflict-${tag}${suffix}${useExt}`);
     try {
-      fsRename(callHost, srcPath, cand, { overwrite: false });
+      fsRename(callHost, srcPath, cand, { overwrite: false, ...rootIdOpt });
       return cand;
     } catch (exc) {
+      if (isNotebookRootMismatchError(exc)) throw exc;
       if (isAlreadyExistsError(exc)) continue;
       return '';
     }
@@ -1748,6 +1835,7 @@ export function writeMirrorPayload(
     readFallback = null,
     expectedHash = null,
     createOnly = false,
+    expectedRoot = '',
     expectedRootIdentity = '',
     excludedSubdirs = new Set(),
     verifyTarget = null,
@@ -1760,8 +1848,9 @@ export function writeMirrorPayload(
 ) {
   const rpc = resolveCallHost(callHost);
   if (typeof verifyTarget === 'function') verifyTarget();
-  const rootIdOpt = expectedRootIdentity ? { expectedRootIdentity } : {};
   const cleanMirror = trimTrailingSlash(mirrorDir);
+  const effectiveExpectedRoot = expectedRootIdentity ? String(expectedRoot || cleanMirror).trim() : '';
+  const rootIdOpt = expectedRootIdentity ? { expectedRoot: effectiveExpectedRoot, expectedRootIdentity } : {};
   const dest = isText
     ? safeMirrorDest(cleanMirror, relPath, excludedSubdirs, locale)
     : safeAssetDest(cleanMirror, relPath, excludedSubdirs, locale);
@@ -1865,17 +1954,19 @@ export function writeMirrorPayload(
         swappedHash = hashAt(tmpPath);
         if (swappedHash !== expectedHash && swappedHash !== contentHash) throw new Error(errMsg);
       } catch (exc) {
+        if (isNotebookRootMismatchError(exc)) throw exc;
         try {
           fsAtomicSwap(rpc, tmpPath, dest, rootIdOpt);
-          tmpAlive = !preserveExternalConflictCopy(rpc, tmpPath, dest, contentHash, isText ? '.md' : '');
+          tmpAlive = !preserveExternalConflictCopy(rpc, tmpPath, dest, contentHash, isText ? '.md' : '', rootIdOpt);
         } catch (_rollbackErr) {
-          const moved = moveToRecoveryStash(rpc, tmpPath, cleanMirror, relPath, nowMsFn, dataDir);
-          if (!moved) fsRename(rpc, tmpPath, `${tmpPath}.recovery`, { overwrite: false });
+          if (isNotebookRootMismatchError(_rollbackErr)) throw _rollbackErr;
+          const moved = moveToRecoveryStash(rpc, tmpPath, cleanMirror, relPath, nowMsFn, dataDir, rootIdOpt);
+          if (!moved) fsRename(rpc, tmpPath, `${tmpPath}.recovery`, { overwrite: false, ...rootIdOpt });
         }
         throw exc;
       }
 
-      const stashed = moveToRecoveryStash(rpc, tmpPath, cleanMirror, relPath, nowMsFn, dataDir);
+      const stashed = moveToRecoveryStash(rpc, tmpPath, cleanMirror, relPath, nowMsFn, dataDir, rootIdOpt);
       if (stashed) {
         tmpAlive = false;
       } else {
@@ -1896,17 +1987,22 @@ export function writeMirrorPayload(
         if (recoveryDir && recSafe) {
           try {
             fsMkdir(rpc, recoveryDir, true);
-            const moved = moveFileIntoRecovery(rpc, tmpPath, recoveryDir, keepName, nowMsFn(), { dataDir: pluginDataDir });
+            const moved = moveFileIntoRecovery(rpc, tmpPath, recoveryDir, keepName, nowMsFn(), {
+              dataDir: pluginDataDir,
+              ...rootIdOpt,
+            });
             if (moved) tmpAlive = false;
-          } catch (_fbErr) {
+          } catch (fbErr) {
+            if (isNotebookRootMismatchError(fbErr)) throw fbErr;
             // Keep workspace clean; finally will clean up tmpPath if move failed.
           }
         } else {
           const fallback = posixJoin(parentDir || cleanMirror, keepName);
           try {
-            fsRename(rpc, tmpPath, fallback, { overwrite: false });
+            fsRename(rpc, tmpPath, fallback, { overwrite: false, ...rootIdOpt });
             tmpAlive = false;
-          } catch (_fbErr) {
+          } catch (fbErr) {
+            if (isNotebookRootMismatchError(fbErr)) throw fbErr;
             // Will be cleaned up in finally if move failed.
           }
         }
@@ -1970,6 +2066,8 @@ export function deleteMirrorEntry(
     dataDir = '',
     nowMsFn = () => Date.now(),
     expectedAssetHash = null,
+    expectedRoot = '',
+    expectedRootIdentity = '',
     cfg = null,
   } = {}
 ) {
@@ -1993,7 +2091,11 @@ export function deleteMirrorEntry(
     if (!matchesFn(raw)) return 'changed';
   }
 
-  const stashed = moveToRecoveryStash(rpc, full, cleanTarget, relPath, nowMsFn, dataDir);
+  const effectiveExpectedRoot = expectedRootIdentity ? String(expectedRoot || cleanTarget).trim() : '';
+  const stashed = moveToRecoveryStash(rpc, full, cleanTarget, relPath, nowMsFn, dataDir, {
+    expectedRoot: effectiveExpectedRoot,
+    expectedRootIdentity,
+  });
   if (!stashed) {
     throw new Error(tr(locale, `无法移入恢复区：${relPath}`, `Could not move into the recovery folder: ${relPath}`));
   }
@@ -2054,13 +2156,26 @@ export function validatePhysicalTargets(
       }
     }
 
-    const st = fsStat(callHost, tdir);
+    const st = fsStat(callHost, tdir, { lstat: true });
     const exists = Boolean(st.exists);
+    const curRootId = exists && !st.is_symlink && st.is_dir ? String(st.root_identity || '').trim() : '';
+    if (exists && st.is_symlink) {
+      return {
+        identities: {},
+        rootMismatch: Boolean(expectedIdentities && Object.hasOwn(expectedIdentities, nb)),
+        error: tr(
+          locale,
+          `笔记本「${lbl}」的同步目标目录是符号链接，已中止同步`,
+          `Sync target folder for ${lbl} is a symlink; sync aborted`
+        ),
+      };
+    }
     if (expectedIdentities && Object.hasOwn(expectedIdentities, nb)) {
       const exp = expectedIdentities[nb];
       if (exp.path && st.path && st.path !== exp.path) {
         return {
           identities: {},
+          rootMismatch: true,
           error: tr(
             locale,
             `笔记本「${lbl}」的同步目标目录在执行期间已变更，已中止同步`,
@@ -2071,6 +2186,7 @@ export function validatePhysicalTargets(
       if (exp.exists && !exists) {
         return {
           identities: {},
+          rootMismatch: true,
           error: tr(
             locale,
             `笔记本「${lbl}」的同步目标目录已被移除，已中止同步`,
@@ -2081,10 +2197,22 @@ export function validatePhysicalTargets(
       if (exp.exists && exists && exp.is_dir !== st.is_dir) {
         return {
           identities: {},
+          rootMismatch: true,
           error: tr(
             locale,
             `笔记本「${lbl}」的同步目标实体目录已被替换，已中止同步`,
             `Physical sync target directory for ${lbl} was replaced during execution; sync aborted`
+          ),
+        };
+      }
+      if (exp.exists && exists && exp.root_identity && curRootId !== exp.root_identity) {
+        return {
+          identities: {},
+          rootMismatch: true,
+          error: tr(
+            locale,
+            `笔记本「${lbl}」的镜像根身份（dev:ino）已变更，已中止同步`,
+            `Mirror root identity (dev:ino) for ${lbl} changed during execution; sync aborted`
           ),
         };
       }
@@ -2096,6 +2224,7 @@ export function validatePhysicalTargets(
       exists,
       is_dir: Boolean(st.is_dir),
       path: st.path || tdir,
+      root_identity: curRootId,
     };
     resolvedTargets.push([nb, sub, tdir]);
   }
@@ -3692,15 +3821,25 @@ export function applyMirrorOrGitNotebookPlan(
     if (state.logs.length > MAX_LOG_ENTRIES) state.logs.length = MAX_LOG_ENTRIES;
   };
 
+  const getTargetRootIdentity = () =>
+    String(
+      (targetIdentities[nbRoot] && targetIdentities[nbRoot].root_identity) ||
+        plan.target_root_identity ||
+        ''
+    ).trim();
+
   const verifyTarget = () => {
-    if (!batchBaseRoot) return;
-    if (Object.keys(batchBindings).length > 0) {
-      const { identities, error } = validatePhysicalTargets(rpc, protocol, batchBindings, batchBaseRoot, {
+    if (Object.keys(batchBindings).length > 0 && batchBaseRoot) {
+      const { identities, error, rootMismatch } = validatePhysicalTargets(rpc, protocol, batchBindings, batchBaseRoot, {
         expectedIdentities: targetIdentities,
         locale,
         homeDir: configStore ? configStore.state.homeDir : '',
       });
-      if (error) throw new Error(error);
+      if (error) {
+        const err = new Error(error);
+        if (rootMismatch) err.code = -32008;
+        throw err;
+      }
       for (const [kNb, info] of Object.entries(identities)) {
         if (Object.hasOwn(targetIdentities, kNb)) {
           const cur = { ...targetIdentities[kNb] };
@@ -3708,9 +3847,37 @@ export function applyMirrorOrGitNotebookPlan(
             cur.exists = info.exists;
             cur.is_dir = info.is_dir;
             cur.path = info.path;
+            cur.root_identity = info.root_identity;
+          } else if (!cur.root_identity && info.root_identity) {
+            cur.root_identity = info.root_identity;
           }
           targetIdentities[kNb] = cur;
         }
+      }
+      if (!plan.target_root_identity && targetIdentities[nbRoot] && targetIdentities[nbRoot].root_identity) {
+        plan.target_root_identity = targetIdentities[nbRoot].root_identity;
+      }
+      return;
+    }
+    const expTargetId = String(plan.target_root_identity || '').trim();
+    if (targetDir && expTargetId) {
+      const st = fsStat(rpc, targetDir, { lstat: true });
+      const curId = st.exists && !st.is_symlink && st.is_dir ? String(st.root_identity || '').trim() : '';
+      if (!st.exists || st.is_symlink || !st.is_dir || curId !== expTargetId) {
+        const err = new Error(
+          tr(
+            locale,
+            `镜像根身份（dev:ino）已变更，已中止同步：${targetDir}`,
+            `Mirror root identity (dev:ino) changed; sync aborted: ${targetDir}`
+          )
+        );
+        err.code = -32008;
+        throw err;
+      }
+    } else if (targetDir && !expTargetId) {
+      const st = fsStat(rpc, targetDir, { lstat: true });
+      if (st.exists && !st.is_symlink && st.is_dir && st.root_identity) {
+        plan.target_root_identity = String(st.root_identity).trim();
       }
     }
   };
@@ -3724,9 +3891,12 @@ export function applyMirrorOrGitNotebookPlan(
 
   const writeRemoteNote = (rel, text, { expectedHash = null, createOnly = false } = {}) => {
     const targetRel = remotePathMap[rel] || rel;
+    const targetRootId = getTargetRootIdentity();
     writeMirrorFile(rpc, targetDir, targetRel, text, {
       expectedHash,
       createOnly,
+      expectedRoot: targetRootId ? targetDir : '',
+      expectedRootIdentity: targetRootId,
       excludedSubdirs,
       verifyTarget,
       locale,
@@ -3744,9 +3914,12 @@ export function applyMirrorOrGitNotebookPlan(
     { expectedHash = null, createOnly = false, copyFromPath = '', readFallback = null } = {}
   ) => {
     const targetRel = remoteAssetPathMap[rel] || rel;
+    const targetRootId = getTargetRootIdentity();
     writeMirrorBytes(rpc, targetDir, targetRel, data, {
       expectedHash,
       createOnly,
+      expectedRoot: targetRootId ? targetDir : '',
+      expectedRootIdentity: targetRootId,
       copyFromPath,
       sourceHash: hash,
       readFallback,
@@ -4162,6 +4335,7 @@ export function applyMirrorOrGitNotebookPlan(
             const matchesFn = isAsset
               ? (raw) => sha256Bytes(raw, rpc) === expect
               : (raw) => sha256Text(decodeNoteBytes(raw, rel), rpc) === expect;
+            const targetRootId = getTargetRootIdentity();
             outcome = deleteMirrorEntry(rpc, targetDir, targetRel, matchesFn, {
               excludedSubdirs,
               locale,
@@ -4169,6 +4343,8 @@ export function applyMirrorOrGitNotebookPlan(
               nowMsFn,
               cfg,
               expectedAssetHash: isAsset ? expect : null,
+              expectedRoot: targetRootId ? targetDir : '',
+              expectedRootIdentity: targetRootId,
             });
             if (outcome === 'deleted' && protocol === 'git') {
               const subTrim = subdir.replace(/^\/+|\/+$/g, '');
@@ -4275,6 +4451,34 @@ export function applyMirrorOrGitNotebookPlan(
       withTargetLock(rpc, lockDir, runInsideLock, { dataDir, pid, nowMsFn, sleepFn });
     }
   } catch (exc) {
+    if (isNotebookRootMismatchError(exc)) {
+      plan._deletions_aborted = true;
+      plan._deleted_count = 0;
+      plan._deleted_git_paths = [];
+      restoreBase();
+      appendLog(
+        tr(locale, `${prefix}检测到根目录身份变化，已中止本轮并降级为仅合并`, `${prefix}Root identity changed; aborted round and downgraded to merge-only`),
+        '已跳过',
+        {
+          tone: 'warning',
+          tooltip: tr(locale, '已中止本轮剩余操作以保护数据', 'Aborted remaining operations to protect data'),
+          logKey: 'deletions_aborted',
+          logArgs: { prefix, reason: 'root_mismatch' },
+        }
+      );
+      return {
+        pushed,
+        pulled,
+        conflictCount,
+        assetCount,
+        baseMap,
+        partialBaseMap,
+        deletedKeys: [...deletedKeys],
+        writtenRemotePaths,
+        syncedRepoPaths,
+        plannedGitBlobs,
+      };
+    }
     restoreBase();
     if (protocol !== 'git') {
       commitPlanBaseline(
@@ -4432,7 +4636,6 @@ export function createLocalMirrorSyncEngine({
     const nbLabelVal = configStore
       ? configStore.notebookLabel(effectiveNbRoot)
       : notebookLabel(effectiveNbRoot, loc, '', homeDir);
-    const scope = cfg.sync_scope || 'all';
     const skips = createSyncSkips(cfg, loc, skipRound);
 
     const baseDir = resolveMirrorDir(cfg, getDownloadsDir(), homeDir);
@@ -4443,7 +4646,25 @@ export function createLocalMirrorSyncEngine({
       : `nb:${nbKeyVal}|local_mirror:${metaTarget}`;
     const legacyKey = !subdir ? `local_mirror:${baseDir}` : null;
 
-    const canLazyLocal = onlyPath === null && typeof local.readNote === 'function';
+    const hasVerifiedBase =
+      !configStore ||
+      typeof configStore.hasVerifiedBaseline !== 'function' ||
+      configStore.hasVerifiedBaseline(effectiveNbRoot, {
+        metaKey,
+        legacyKeys: legacyKey ? [legacyKey] : [],
+        nbKeyVal,
+        protocol: 'local_mirror',
+      });
+    let effectiveOnlyPath = onlyPath;
+    let effectiveScope = cfg.sync_scope || 'all';
+    if (!hasVerifiedBase && (effectiveOnlyPath !== null || effectiveScope !== 'all')) {
+      effectiveOnlyPath = null;
+      effectiveScope = 'all';
+    }
+    const planCfg = effectiveScope !== (cfg.sync_scope || 'all') ? { ...cfg, sync_scope: effectiveScope } : cfg;
+    const scope = effectiveScope;
+
+    const canLazyLocal = effectiveOnlyPath === null && typeof local.readNote === 'function';
     let localNotes = {};
     let remoteNotes = {};
     let localSnapshot = null;
@@ -4454,13 +4675,15 @@ export function createLocalMirrorSyncEngine({
     let readRemoteNote = null;
     let remoteInspected = true;
     let remoteError = null;
+    let targetRootIdentity = '';
 
-    if (onlyPath === null) {
+    if (effectiveOnlyPath === null) {
       // Scan remote mirror directory first so out-of-scope errors fail fast before scanning the notebook.
       try {
         remoteSnapshot = scanDirSnapshot(rpc, targetDir, { excludedSubdirs, locale: loc });
         remoteNoteEntries = new Map();
         if (remoteSnapshot) {
+          targetRootIdentity = remoteSnapshot.rootIdentity || '';
           const mirrorCi = scope && scope !== 'all' ? dirIsCaseInsensitive(rpc, remoteSnapshot.cleanRoot) : false;
           const mirrorNorm = scope && scope !== 'all' ? dirIsNormalizationInsensitive(rpc, remoteSnapshot.cleanRoot) : false;
           for (const [rel, entry] of remoteSnapshot.noteEntries.entries()) {
@@ -4476,12 +4699,19 @@ export function createLocalMirrorSyncEngine({
       }
     } else {
       try {
+        const targetSt = fsStat(rpc, targetDir, { lstat: true });
+        if (targetSt.exists && targetSt.is_symlink) {
+          throw new Error(tr(loc, `镜像目录是符号链接，已中止同步：${targetDir}`, `Mirror folder is a symlink; sync aborted: ${targetDir}`));
+        }
+        if (targetSt.exists && targetSt.is_dir) {
+          targetRootIdentity = String(targetSt.root_identity || '').trim();
+        }
         remoteNotes = scanMirrorFiles(rpc, targetDir, {
-          onlyPath,
+          onlyPath: effectiveOnlyPath,
           scope,
           excludedSubdirs,
           locale: loc,
-          cfg,
+          cfg: planCfg,
           skips,
         });
       } catch (exc) {
@@ -4514,9 +4744,9 @@ export function createLocalMirrorSyncEngine({
             localNoteEntries.set(relPath, entry);
           }
         }
-        readLocalNote = (relPath, entry = null) => local.readNote(relPath, { nbRoot: effectiveNbRoot, cfg, locale: loc, skips, entry });
+        readLocalNote = (relPath, entry = null) => local.readNote(relPath, { nbRoot: effectiveNbRoot, cfg: planCfg, locale: loc, skips, entry });
       } else {
-        localNotes = local.readNotes({ onlyPath, scope, nbRoot: effectiveNbRoot, cfg, locale: loc, skips });
+        localNotes = local.readNotes({ onlyPath: effectiveOnlyPath, scope, nbRoot: effectiveNbRoot, cfg: planCfg, locale: loc, skips });
         for (const relPath of Object.keys(localNotes)) {
           if (inSyncSubdir(relPath, excludedSubdirs)) {
             throw new Error(
@@ -4531,12 +4761,12 @@ export function createLocalMirrorSyncEngine({
       }
     }
 
-    return computeThreeWaySyncPlan({
+    const builtPlan = computeThreeWaySyncPlan({
       callHost: rpc,
       configStore,
       localAdapter: local,
       protocol: 'local_mirror',
-      cfg,
+      cfg: planCfg,
       nbRoot: effectiveNbRoot,
       nbKeyVal,
       nbLabelVal,
@@ -4556,10 +4786,14 @@ export function createLocalMirrorSyncEngine({
       readRemoteNote,
       remoteInspected,
       remoteError,
-      onlyPath,
+      onlyPath: effectiveOnlyPath,
       locale: loc,
       skips,
     });
+    if (targetRootIdentity) {
+      builtPlan.target_root_identity = targetRootIdentity;
+    }
+    return builtPlan;
   };
 
   const computeBatchPlan = ({ cfg, notebooks = [], onlyPath = null } = {}) => {
@@ -4758,6 +4992,18 @@ export function createLocalMirrorSyncEngine({
     const skippedSummary = skippedItems.length ? formatSkippedCount(loc, skippedItems.length) : '';
     const totalNotes = totalPushed + totalPulled + totalConflicts;
     if (totalNotes === 0 && totalAssets === 0 && totalDeleted === 0) {
+      if (batch.plans.some((p) => p._deletions_aborted)) {
+        return {
+          status: '已跳过',
+          summary: skippedSummary || tr(loc, '根目录身份已变化，已中止本轮并降级为仅合并', 'Root identity changed; round aborted and downgraded to merge-only'),
+          skipped_items: skippedItems,
+          pushed: 0,
+          pulled: 0,
+          conflicts: 0,
+          assets: 0,
+          deleted: 0,
+        };
+      }
       return {
         status: '无变更',
         summary: skippedSummary || tr(loc, '已是最新', 'Up to date'),
@@ -4860,10 +5106,11 @@ export function createLocalMirrorSyncEngine({
     if (!confirmed) {
       const reasonItems = assessBatchDangerousChanges(rpc, batch, effectiveCfg);
       if (reasonItems.length > 0) {
+        const confirmOnlyPath = batch.plans.every((p) => !p.is_partial_sync) ? null : onlyPath;
         const pending = buildPendingConfirm(rpc, batch, reasonItems, {
           configStore,
           locale: loc,
-          onlyPath,
+          onlyPath: confirmOnlyPath,
           onlyNbRoot: onlyNbRoot || (configStore ? configStore.state.notebookRoot : null),
         });
         if (configStore) {

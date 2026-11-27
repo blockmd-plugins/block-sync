@@ -707,6 +707,7 @@ export function createSyncSkips(cfg, locale = 'zh', round = { consecutive: 0 }) 
     items.push({ path, code, reason });
   };
   const recordError = (path, exc, related = []) => {
+    if (isNotebookRootMismatchError(exc)) throw exc;
     const code = classifySyncError(exc);
     if (!['file_limit', 'fs_error'].includes(code)) {
       const err = new Error(`${sanitizeErrorText(exc)} (${path})`);

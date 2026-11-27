@@ -1785,7 +1785,10 @@ export function createHostLocalAdapter({
           overwrite: !createOnly,
           mkdir_parents: true,
         };
-        if (expectedRootIdentity) copyParams.expected_root_identity = String(expectedRootIdentity);
+        if (expectedRootIdentity) {
+          copyParams.expected_root_identity = String(expectedRootIdentity);
+          if (cleanRoot) copyParams.expected_root = cleanRoot;
+        }
         const copyRes = rpc('host.fs.copy', copyParams);
         if (sourceHash) {
           const postHash = hashSyncFile(fullPath, rpc, () => null);
@@ -1820,7 +1823,10 @@ export function createHostLocalAdapter({
       atomic: true,
       mkdir_parents: true,
     };
-    if (expectedRootIdentity) writeParams.expected_root_identity = String(expectedRootIdentity);
+    if (expectedRootIdentity) {
+      writeParams.expected_root_identity = String(expectedRootIdentity);
+      if (cleanRoot) writeParams.expected_root = cleanRoot;
+    }
     return rpc('host.fs.write', writeParams);
   };
 
@@ -2379,8 +2385,8 @@ export function createWebDAVSyncEngine({
   };
 
   const computeSyncPlan = ({
-    cfg,
-    onlyPath = null,
+    cfg: rawCfg,
+    onlyPath: rawOnlyPath = null,
     inspectRemote = true,
     forceRefresh = false,
     nbRoot = null,
@@ -2395,7 +2401,28 @@ export function createWebDAVSyncEngine({
     const effectiveNbRoot = nbRoot || (configStore ? configStore.state.notebookRoot : '');
     const nbKeyVal = configStore ? configStore.notebookKey(effectiveNbRoot) : notebookKey(effectiveNbRoot, '', homeDir);
     const nbLabelVal = configStore ? configStore.notebookLabel(effectiveNbRoot) : notebookLabel(effectiveNbRoot, loc, '', homeDir);
-    const scope = cfg.sync_scope || 'all';
+    const rootBaseUrl = webdavBaseUrl(rawCfg);
+    const baseUrl = webdavBaseUrl(rawCfg, subdir);
+    const metaTarget = rootBaseUrl && subdir ? `${rootBaseUrl}::${subdir}` : rootBaseUrl || 'unconfigured';
+    const metaKey = configStore ? configStore.metaKey('webdav', metaTarget, nbKeyVal) : `nb:${nbKeyVal}|webdav:${metaTarget}`;
+    const legacyKey = rootBaseUrl && !subdir ? `webdav:${rootBaseUrl}` : null;
+
+    const hasVerifiedBase =
+      !configStore ||
+      typeof configStore.hasVerifiedBaseline !== 'function' ||
+      configStore.hasVerifiedBaseline(effectiveNbRoot, {
+        metaKey,
+        legacyKeys: legacyKey ? [legacyKey] : [],
+        nbKeyVal,
+        protocol: 'webdav',
+      });
+    let onlyPath = rawOnlyPath;
+    let scope = (rawCfg && rawCfg.sync_scope) || 'all';
+    if (!hasVerifiedBase && (onlyPath !== null || scope !== 'all')) {
+      onlyPath = null;
+      scope = 'all';
+    }
+    const cfg = scope !== ((rawCfg && rawCfg.sync_scope) || 'all') ? { ...rawCfg, sync_scope: scope } : rawCfg;
     const policy = cfg.conflict_policy || 'keep_both';
 
     const skips = createSyncSkips(cfg, loc, skipRound);
@@ -2427,12 +2454,6 @@ export function createWebDAVSyncEngine({
         );
       }
     }
-
-    const rootBaseUrl = webdavBaseUrl(cfg);
-    const baseUrl = webdavBaseUrl(cfg, subdir);
-    const metaTarget = rootBaseUrl && subdir ? `${rootBaseUrl}::${subdir}` : rootBaseUrl || 'unconfigured';
-    const metaKey = configStore ? configStore.metaKey('webdav', metaTarget, nbKeyVal) : `nb:${nbKeyVal}|webdav:${metaTarget}`;
-    const legacyKey = rootBaseUrl && !subdir ? `webdav:${rootBaseUrl}` : null;
 
     let remoteNotes = {};
     let remoteEtags = {};
@@ -3079,7 +3100,9 @@ export function createWebDAVSyncEngine({
       }
     );
     const writeLocalAsset = (rel, asset, options) => {
-      const optsWithRoot = expectedRootId ? { ...options, expectedRootIdentity: expectedRootId } : options;
+      const optsWithRoot = expectedRootId
+        ? { ...options, expectedRoot: nbRoot, expectedRootIdentity: expectedRootId }
+        : options;
       if (!asset.filePath) return local.writeAsset(nbRoot, rel, asset.bytes, optsWithRoot);
       return writeMirrorBytes(rpc, nbRoot, rel, null, {
         ...optsWithRoot, locale: loc, dataDir, nowMsFn, sourcePath: asset.filePath, sourceHash: asset.hash,
@@ -3562,6 +3585,23 @@ export function createWebDAVSyncEngine({
         plan._deleted_count = deletedCount;
       }
     } catch (exc) {
+      if (isNotebookRootMismatchError(exc)) {
+        plan._deletions_aborted = true;
+        plan._deleted_count = 0;
+        restoreBase();
+        appendLog(
+          state,
+          tr(loc, `${prefix}检测到根目录身份变化，已中止本轮并降级为仅合并`, `${prefix}Root identity changed; aborted round and downgraded to merge-only`),
+          '已跳过',
+          {
+            tone: 'warning',
+            tooltip: tr(loc, '已中止本轮剩余操作以保护数据', 'Aborted remaining operations to protect data'),
+            logKey: 'deletions_aborted',
+            logArgs: { prefix, reason: 'root_mismatch' },
+          }
+        );
+        return { pushed, pulled, conflictCount, assetCount, baseMap, partialBaseMap, deletedKeys: [...deletedKeys] };
+      }
       restoreBase();
       commitPlanBaseline(
         configStore,
@@ -3728,6 +3768,18 @@ export function createWebDAVSyncEngine({
     const skippedSummary = skippedItems.length ? formatSkippedCount(loc, skippedItems.length) : '';
     const totalNotes = totalPushed + totalPulled + totalConflicts;
     if (totalNotes === 0 && totalAssets === 0 && totalDeleted === 0) {
+      if (batch.plans.some((p) => p._deletions_aborted)) {
+        return {
+          status: '已跳过',
+          summary: skippedSummary || tr(loc, '根目录身份已变化，已中止本轮并降级为仅合并', 'Root identity changed; round aborted and downgraded to merge-only'),
+          skipped_items: skippedItems,
+          pushed: 0,
+          pulled: 0,
+          conflicts: 0,
+          assets: 0,
+          deleted: 0,
+        };
+      }
       return {
         status: '无变更',
         summary: skippedSummary || tr(loc, '已是最新', 'Up to date'),
@@ -3828,8 +3880,9 @@ export function createWebDAVSyncEngine({
     if (!confirmed) {
       const reasonItems = assessBatchDangerousChanges(batch, effectiveCfg);
       if (reasonItems.length > 0) {
+        const confirmOnlyPath = batch.plans.every((p) => !p.is_partial_sync) ? null : onlyPath;
         const pending = buildPendingConfirm(batch, reasonItems, {
-          onlyPath,
+          onlyPath: confirmOnlyPath,
           onlyNbRoot: onlyNbRoot || (configStore ? configStore.state.notebookRoot : null),
         });
         if (configStore) {

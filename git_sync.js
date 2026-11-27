@@ -747,6 +747,21 @@ function hasGitPendingInitial(callHost, repoDir, branch, { remoteName = 'origin'
   return Boolean(data[`pending_initial:${remoteName}:${branch}`]) && !Boolean(data[`${remoteName}:${branch}`]);
 }
 
+function clearGitPendingInitial(callHost, repoDir, branch, { remoteName = 'origin', cfg = null, locale = 'zh' } = {}) {
+  if (!repoDir || !branch || !hasGitMarker(callHost, repoDir)) return;
+  const p = gitPath(callHost, repoDir, 'block-sync-pushed-refs.json', cfg, locale);
+  if (!p) return;
+  try {
+    const data = loadGitPushedRefs(callHost, repoDir, cfg, locale);
+    const key = `pending_initial:${remoteName}:${branch}`;
+    if (!Object.hasOwn(data, key)) return;
+    delete data[key];
+    fsWriteText(callHost, p, JSON.stringify(data), { atomic: true, mkdirParents: true });
+  } catch (_err) {
+    // Non-fatal metadata cleanup.
+  }
+}
+
 function getGitSyncedBranchOid(callHost, repoDir, branch, { remoteName = 'origin', cfg = null, locale = 'zh' } = {}) {
   if (!repoDir || !branch || !hasGitMarker(callHost, repoDir)) return '';
   const refProc = runGit(callHost, ['rev-parse', '--verify', `refs/remotes/${remoteName}/${branch}`], {
@@ -1111,34 +1126,35 @@ function buildGitNotebookTargets({
   return targets;
 }
 
-function pruneUnverifiedGitDeletionsBeforePush(
+function verifyGitCommitDeletionsBeforePush(
   rpc,
   activeRepoDir,
-  branch,
-  localOid,
   expOid,
+  headOid,
+  authorizedDeleted = null,
   { cfg = null, locale = 'zh', configStore = null, notebookTargets = null } = {}
 ) {
-  if (!expOid || !localOid || localOid === expOid) {
-    return { localOid, hasPush: Boolean(localOid && localOid !== expOid) };
+  if (!expOid || !headOid || headOid === expOid) {
+    return { ok: true, reason: '' };
   }
   const diffProc = runGit(
     rpc,
-    ['-c', 'core.quotePath=false', 'diff', '--name-only', '--no-renames', '--diff-filter=D', '-z', expOid, localOid],
+    ['-c', 'core.quotePath=false', 'diff', '--name-only', '--no-renames', '--diff-filter=D', '-z', expOid, headOid],
     { cwd: activeRepoDir, cfg, locale }
   );
   if (diffProc.returncode !== 0 || diffProc.stdout_truncated) {
-    throw new Error(
-      tr(
+    return {
+      ok: false,
+      reason: tr(
         locale,
-        '无法确认上次未推送提交中的删除条目，已中止推送以保护数据',
-        'Could not inspect deleted paths in pending unpushed commits; push aborted to protect data'
-      )
-    );
+        '无法确认本次推送提交中的删除条目，已中止推送以保护数据',
+        'Could not inspect deleted paths in outgoing Git commit; push aborted to protect data'
+      ),
+    };
   }
-  const deletedPaths = diffProc.stdout.split('\u0000').filter(Boolean);
+  const deletedPaths = diffProc.stdout.split('\u0000').filter(Boolean).map(normalizeGitRel).filter(Boolean);
   if (deletedPaths.length === 0) {
-    return { localOid, hasPush: true };
+    return { ok: true, reason: '' };
   }
 
   const sortedTargets = [...(notebookTargets || [])].sort(
@@ -1163,6 +1179,7 @@ function pruneUnverifiedGitDeletionsBeforePush(
       aliases: t.aliases || [],
       legacyKeys: t.legacyKeys || [],
       nbKeyVal: t.nbKeyVal,
+      expectedRootIdentity: t.expectedRootIdentity || '',
       hasExistingBaseline: true,
     });
     return Boolean(
@@ -1175,9 +1192,18 @@ function pruneUnverifiedGitDeletionsBeforePush(
     );
   };
 
-  const withdrawn = [];
   const verifiedCache = new Map();
   for (const repoRel of deletedPaths) {
+    if (authorizedDeleted instanceof Set && !authorizedDeleted.has(repoRel)) {
+      return {
+        ok: false,
+        reason: tr(
+          locale,
+          `推送前核验发现未授权的 Git 删除：${repoRel}，已中止推送`,
+          `Pre-push check rejected unauthorized Git deletion: ${repoRel}; push aborted`
+        ),
+      };
+    }
     let matchedTarget = null;
     let relInNb = '';
     for (const t of sortedTargets) {
@@ -1195,8 +1221,14 @@ function pruneUnverifiedGitDeletionsBeforePush(
       }
     }
     if (!matchedTarget || !relInNb) {
-      withdrawn.push(repoRel);
-      continue;
+      return {
+        ok: false,
+        reason: tr(
+          locale,
+          `推送前无法核验 Git 删除归属：${repoRel}，已中止推送`,
+          `Pre-push check could not verify owner of Git deletion: ${repoRel}; push aborted`
+        ),
+      };
     }
     let idOk = verifiedCache.get(matchedTarget);
     if (idOk === undefined) {
@@ -1204,83 +1236,193 @@ function pruneUnverifiedGitDeletionsBeforePush(
       verifiedCache.set(matchedTarget, idOk);
     }
     if (!idOk || !isConfirmedAbsentOnRoot(rpc, matchedTarget.nbRoot, relInNb) || !checkTargetVerified(matchedTarget)) {
-      withdrawn.push(repoRel);
+      return {
+        ok: false,
+        reason: tr(
+          locale,
+          `推送前核验删除失败（笔记本身份变化或笔记仍存在）：${repoRel}，已中止推送`,
+          `Pre-push deletion check failed (notebook identity changed or note still present): ${repoRel}; push aborted`
+        ),
+      };
     }
   }
+  return { ok: true, reason: '' };
+}
 
-  if (withdrawn.length === 0) {
-    return { localOid, hasPush: true };
+function pruneEmptyGitParents(rpc, rootDir, relPath) {
+  const cleanRoot = trimTrailingSlash(rootDir);
+  let cur = posixDirname(posixJoin(cleanRoot, relPath));
+  while (cur && cur !== cleanRoot && cur.startsWith(`${cleanRoot}/`)) {
+    try {
+      const items = fsList(rpc, cur, false);
+      if (items.length > 0) break;
+      fsDelete(rpc, cur, false);
+      cur = posixDirname(cur);
+    } catch (_err) {
+      break;
+    }
   }
+}
 
-  // Only rewrite unpushed commits created by Block Sync itself.
-  verifyGitPushHistory(rpc, activeRepoDir, branch, localOid, expOid, cfg, locale);
+function resetLocalGitUnpushedSyncCommits(
+  rpc,
+  activeRepoDir,
+  branch,
+  remoteOid,
+  headOid,
+  { cfg = null, locale = 'zh' } = {}
+) {
+  if (!headOid || headOid === remoteOid) return;
+  verifyGitPushHistory(rpc, activeRepoDir, branch, headOid, remoteOid, cfg, locale);
 
-  const expTreeProc = runGit(rpc, ['rev-parse', '--verify', `${expOid}^{tree}`], { cwd: activeRepoDir, cfg, locale });
-  const localTreeProc = runGit(rpc, ['rev-parse', '--verify', `${localOid}^{tree}`], { cwd: activeRepoDir, cfg, locale });
-  if (expTreeProc.returncode !== 0 || localTreeProc.returncode !== 0) {
-    throw new Error(tr(locale, '撤回未确认 Git 删除时读取提交树失败', 'Failed to resolve Git tree while withdrawing deletions'));
-  }
-  const expTree = expTreeProc.stdout.trim();
-  const localTree = localTreeProc.stdout.trim();
-
-  const restoreEntries = [];
-  for (let i = 0; i < withdrawn.length; i += LS_TREE_BATCH_SIZE) {
-    const chunk = withdrawn.slice(i, i + LS_TREE_BATCH_SIZE);
-    const lsProc = runGit(
+  const addedPaths = [];
+  const restorePaths = [];
+  if (remoteOid) {
+    const nsProc = runGit(
       rpc,
-      ['--literal-pathspecs', 'ls-tree', '-r', '-z', expOid, '--', ...chunk],
+      ['-c', 'core.quotePath=false', 'diff', '--name-status', '-z', '--no-renames', remoteOid, headOid],
       { cwd: activeRepoDir, cfg, locale }
     );
-    if (lsProc.returncode !== 0) {
-      throw new Error(tr(locale, '撤回未确认 Git 删除失败，已中止推送', 'Failed to withdraw unverified Git deletions; push aborted'));
+    if (nsProc.returncode !== 0 || nsProc.stdout_truncated) {
+      throw new Error(tr(locale, '读取未推送 Git 变更失败，已中止重置', 'Failed to inspect unpushed Git commits before reset'));
     }
-    assertGitOutputComplete(lsProc, 'git ls-tree', { nulTerminated: true, locale });
-    for (const item of parseLsTreeEntries(lsProc.stdout)) {
-      restoreEntries.push([item.name, item.mode, item.oid]);
+    const tokens = nsProc.stdout.split('\u0000');
+    for (let i = 0; i + 1 < tokens.length; i += 2) {
+      const status = tokens[i];
+      const rel = normalizeGitRel(tokens[i + 1]);
+      if (!status || !rel) continue;
+      if (status.startsWith('A')) addedPaths.push(rel);
+      else restorePaths.push(rel);
     }
-  }
-  if (restoreEntries.length !== withdrawn.length) {
-    throw new Error(tr(locale, '撤回未确认 Git 删除时条目数量不一致，已中止推送', 'Git tree mismatch while withdrawing unverified deletions; push aborted'));
-  }
-
-  const newTree = buildGitTreeFromChanges(rpc, activeRepoDir, localTree, restoreEntries, { cfg, locale });
-  const localRef = `refs/heads/${branch}`;
-  const commitEnv = {
-    GIT_AUTHOR_NAME: 'Block Sync',
-    GIT_AUTHOR_EMAIL: 'sync@blockmd.local',
-    GIT_COMMITTER_NAME: 'Block Sync',
-    GIT_COMMITTER_EMAIL: 'sync@blockmd.local',
-  };
-  if (newTree === expTree) {
-    const urProc = runGit(
+  } else {
+    const lsProc = runGit(
       rpc,
-      ['update-ref', '-m', 'sync: update markdown notes', localRef, expOid, localOid],
-      { cwd: activeRepoDir, cfg, locale, extraEnv: commitEnv }
+      ['-c', 'core.quotePath=false', 'ls-tree', '-r', '--name-only', '-z', headOid],
+      { cwd: activeRepoDir, cfg, locale }
     );
-    if (urProc.returncode !== 0) {
-      throw new Error(tr(locale, '重置待推送 Git 提交失败', 'Failed to reset pending unpushed Git commit'));
+    if (lsProc.returncode !== 0 || lsProc.stdout_truncated) {
+      throw new Error(tr(locale, '读取未推送 Git 初始提交失败，已中止重置', 'Failed to inspect unpushed initial Git commit before reset'));
     }
-    return { localOid: expOid, hasPush: false };
+    for (const raw of lsProc.stdout.split('\u0000')) {
+      const rel = normalizeGitRel(raw);
+      if (rel) addedPaths.push(rel);
+    }
   }
 
-  const ctProc = runGit(
-    rpc,
-    ['commit-tree', newTree, '-p', expOid, '-m', 'sync: update markdown notes'],
-    { cwd: activeRepoDir, cfg, locale, extraEnv: commitEnv }
-  );
-  if (ctProc.returncode !== 0 || !ctProc.stdout.trim()) {
-    throw new Error(tr(locale, '重建待推送 Git 提交失败', 'Failed to rebuild pending Git commit without withdrawn deletions'));
+  const allTouched = [...new Set([...addedPaths, ...restorePaths])];
+  const touchedSet = new Set(allTouched);
+  for (let i = 0; i < allTouched.length; i += LS_TREE_BATCH_SIZE) {
+    const chunk = allTouched.slice(i, i + LS_TREE_BATCH_SIZE);
+    const wtProc = runGit(
+      rpc,
+      ['-c', 'core.quotePath=false', 'diff-index', '--name-only', '-z', headOid, '--', ...chunk],
+      { cwd: activeRepoDir, cfg, locale }
+    );
+    if (wtProc.returncode !== 0 || wtProc.stdout.split('\u0000').some(Boolean)) {
+      throw new Error(
+        tr(
+          locale,
+          '本地 Git 仓库中有未提交的工作区改动覆盖了待重置路径，请先处理后再同步',
+          'Local Git worktree has uncommitted changes on paths pending reset; resolve them before syncing'
+        )
+      );
+    }
   }
-  const rebuiltOid = ctProc.stdout.trim();
-  const urProc = runGit(
-    rpc,
-    ['update-ref', '-m', 'sync: update markdown notes', localRef, rebuiltOid, localOid],
-    { cwd: activeRepoDir, cfg, locale, extraEnv: commitEnv }
-  );
-  if (urProc.returncode !== 0) {
-    throw new Error(tr(locale, '更新重建后的 Git 分支失败', 'Failed to advance rebuilt Git branch'));
+
+  const stagedProc = runGit(rpc, ['-c', 'core.quotePath=false', 'diff', '--cached', '--name-only', '-z'], {
+    cwd: activeRepoDir,
+    cfg,
+    locale,
+  });
+  const hasUnrelatedStaged =
+    stagedProc.returncode !== 0 ||
+    stagedProc.stdout.split('\u0000').some((p) => {
+      const np = normalizeGitRel(p);
+      return Boolean(np && !touchedSet.has(np));
+    });
+
+  if (remoteOid) {
+    const resetMode = hasUnrelatedStaged ? '--soft' : '--mixed';
+    const rProc = runGit(rpc, ['reset', resetMode, remoteOid], { cwd: activeRepoDir, cfg, locale });
+    if (rProc.returncode !== 0) {
+      throw new Error(tr(locale, '重置未推送的本地 Git 提交失败', 'Failed to reset unpushed local Git commits'));
+    }
+    if (hasUnrelatedStaged) {
+      for (let i = 0; i < addedPaths.length; i += LS_TREE_BATCH_SIZE) {
+        const chunk = addedPaths.slice(i, i + LS_TREE_BATCH_SIZE);
+        runGit(rpc, ['--literal-pathspecs', 'rm', '--cached', '-q', '--ignore-unmatch', '--', ...chunk], {
+          cwd: activeRepoDir,
+          cfg,
+          locale,
+        });
+      }
+      for (let i = 0; i < restorePaths.length; i += LS_TREE_BATCH_SIZE) {
+        const chunk = restorePaths.slice(i, i + LS_TREE_BATCH_SIZE);
+        runGit(rpc, ['--literal-pathspecs', 'reset', '-q', remoteOid, '--', ...chunk], {
+          cwd: activeRepoDir,
+          cfg,
+          locale,
+        });
+      }
+    }
+    for (const rel of addedPaths) {
+      const full = posixJoin(trimTrailingSlash(activeRepoDir), rel);
+      try {
+        const st = fsStat(rpc, full, { lstat: true });
+        if (st.exists && !st.is_dir) {
+          fsDelete(rpc, full, false);
+          pruneEmptyGitParents(rpc, activeRepoDir, rel);
+        }
+      } catch (_delErr) {
+        // Ignore already absent entries.
+      }
+    }
+    for (let i = 0; i < restorePaths.length; i += LS_TREE_BATCH_SIZE) {
+      const chunk = restorePaths.slice(i, i + LS_TREE_BATCH_SIZE);
+      const coProc = runGit(rpc, ['--literal-pathspecs', 'checkout', remoteOid, '--', ...chunk], {
+        cwd: activeRepoDir,
+        cfg,
+        locale,
+      });
+      if (coProc.returncode !== 0) {
+        throw new Error(tr(locale, '恢复远端基准路径到工作区失败', 'Failed to restore remote baseline entries into worktree'));
+      }
+    }
+  } else {
+    const localRef = `refs/heads/${branch}`;
+    const urProc = runGit(rpc, ['update-ref', '--no-deref', '-d', localRef, headOid], {
+      cwd: activeRepoDir,
+      cfg,
+      locale,
+    });
+    if (urProc.returncode !== 0) {
+      throw new Error(tr(locale, '重置未推送的初始 Git 提交失败', 'Failed to reset unpushed initial Git commit'));
+    }
+    if (!hasUnrelatedStaged) {
+      runGit(rpc, ['read-tree', '--empty'], { cwd: activeRepoDir, cfg, locale });
+    } else {
+      for (let i = 0; i < addedPaths.length; i += LS_TREE_BATCH_SIZE) {
+        const chunk = addedPaths.slice(i, i + LS_TREE_BATCH_SIZE);
+        runGit(rpc, ['--literal-pathspecs', 'rm', '--cached', '-q', '--ignore-unmatch', '--', ...chunk], {
+          cwd: activeRepoDir,
+          cfg,
+          locale,
+        });
+      }
+    }
+    for (const rel of addedPaths) {
+      const full = posixJoin(trimTrailingSlash(activeRepoDir), rel);
+      try {
+        const st = fsStat(rpc, full, { lstat: true });
+        if (st.exists && !st.is_dir) {
+          fsDelete(rpc, full, false);
+          pruneEmptyGitParents(rpc, activeRepoDir, rel);
+        }
+      } catch (_delErr) {
+        // Ignore already absent entries.
+      }
+    }
   }
-  return { localOid: rebuiltOid, hasPush: true };
 }
 
 export function prepareGitRepo(
@@ -1389,9 +1531,33 @@ export function prepareGitRepo(
           }
           runGit(rpc, ['rebase', '--abort'], { cwd: activeRepoDir, cfg, locale });
           runGit(rpc, ['merge', '--abort'], { cwd: activeRepoDir, cfg, locale });
-          if (!hasGitPendingInitial(rpc, activeRepoDir, branch, { remoteName: 'origin', cfg, locale })) {
-            const headChk = runGit(rpc, ['rev-parse', '--verify', 'HEAD'], { cwd: activeRepoDir, cfg, locale });
-            if (headChk.returncode === 0) {
+          const headChk = runGit(rpc, ['rev-parse', '--verify', 'HEAD'], { cwd: activeRepoDir, cfg, locale });
+          if (headChk.returncode === 0 && headChk.stdout.trim()) {
+            const headOid = headChk.stdout.trim();
+            if (hasGitPendingInitial(rpc, activeRepoDir, branch, { remoteName: 'origin', cfg, locale })) {
+              try {
+                verifyGitPushHistory(rpc, activeRepoDir, branch, headOid, '', cfg, locale);
+              } catch (histErr) {
+                const backupRef = ensurePendingPushBackupRef(rpc, activeRepoDir, branch, headOid, `refs/heads/${branch}`, {
+                  cfg,
+                  locale,
+                });
+                const msg = errorDetail(locale, histErr);
+                return [
+                  false,
+                  backupRef ? `${msg} (${backupRef})` : msg,
+                ];
+              }
+              runGit(rpc, ['update-ref', '--no-deref', '-d', `refs/heads/${branch}`, headOid], {
+                cwd: activeRepoDir,
+                cfg,
+                locale,
+              });
+              runGit(rpc, ['read-tree', '--empty'], { cwd: activeRepoDir, cfg, locale });
+              runGit(rpc, ['symbolic-ref', 'HEAD', `refs/heads/${branch}`], { cwd: activeRepoDir, cfg, locale });
+              runGit(rpc, ['clean', '-fdx'], { cwd: activeRepoDir, cfg, locale });
+              clearGitPendingInitial(rpc, activeRepoDir, branch, { remoteName: 'origin', cfg, locale });
+            } else {
               try {
                 deleteDataPath(rpc, activeRepoDir, { recursive: true, baseDir: dataDir });
               } catch (_err) {
@@ -1404,10 +1570,11 @@ export function prepareGitRepo(
                 runGit(rpc, ['symbolic-ref', 'HEAD', `refs/heads/${branch}`], { cwd: activeRepoDir, cfg, locale });
               }
               runGit(rpc, ['remote', 'add', 'origin', target], { cwd: activeRepoDir, cfg, locale });
-            } else {
-              runGit(rpc, ['symbolic-ref', 'HEAD', `refs/heads/${branch}`], { cwd: activeRepoDir, cfg, locale });
-              runGit(rpc, ['clean', '-fdx'], { cwd: activeRepoDir, cfg, locale });
             }
+          } else {
+            runGit(rpc, ['symbolic-ref', 'HEAD', `refs/heads/${branch}`], { cwd: activeRepoDir, cfg, locale });
+            runGit(rpc, ['clean', '-fdx'], { cwd: activeRepoDir, cfg, locale });
+            clearGitPendingInitial(rpc, activeRepoDir, branch, { remoteName: 'origin', cfg, locale });
           }
         }
       }
@@ -1520,90 +1687,24 @@ export function prepareGitRepo(
               if (behindN === 0) {
                 const expOidP = runGit(rpc, ['rev-parse', '--verify', remoteRef], { cwd: activeRepoDir, cfg, locale });
                 const expOid = expOidP.returncode === 0 ? expOidP.stdout.trim() : '';
-                const pruned = pruneUnverifiedGitDeletionsBeforePush(
-                  rpc,
-                  activeRepoDir,
-                  branch,
-                  localOid,
-                  expOid,
-                  { cfg, locale, configStore, notebookTargets }
-                );
-                if (pruned.hasPush) {
-                  const pushOid = pruned.localOid;
-                  verifyGitPushHistory(rpc, activeRepoDir, branch, pushOid, expOid, cfg, locale);
-                  const leaseArg = `--force-with-lease=refs/heads/${branch}:${expOid}`;
-                  const retryPush = runGitNetwork(
-                    rpc,
-                    ['push', leaseArg, '-u', 'origin', `${pushOid}:refs/heads/${branch}`],
-                    {
-                      cwd: activeRepoDir,
-                      timeoutMs: 60000,
-                      cfg,
-                      retries: 1,
-                      totalBudgetMs: 80000,
-                      locale,
-                      nowMsFn,
-                      sleepFn,
-                      deadlineMs,
-                    }
-                  );
-                  if (retryPush.returncode === 0) {
-                    runGitNetwork(
-                      rpc,
-                      ['fetch', 'origin', `refs/heads/${branch}:refs/remotes/origin/${branch}`],
-                      {
-                        cwd: activeRepoDir,
-                        timeoutMs: 12000,
-                        cfg,
-                        retries: 1,
-                        totalBudgetMs: 15000,
-                        locale,
-                        nowMsFn,
-                        sleepFn,
-                        deadlineMs,
-                      }
-                    );
-                    const oidP2 = runGit(rpc, ['rev-parse', '--verify', remoteRef], { cwd: activeRepoDir, cfg, locale });
-                    const syncedOid = oidP2.returncode === 0 ? oidP2.stdout.trim() : '';
-                    if (syncedOid) {
-                      recordGitSyncedBranch(rpc, activeRepoDir, branch, syncedOid, {
-                        remoteName: 'origin',
-                        cfg,
-                        locale,
-                      });
-                    }
-                    cleanupPendingPushBranches(rpc, activeRepoDir, branch, {
-                      targetRemoteRef: syncedOid || remoteRef,
-                      cfg,
-                      locale,
-                    });
-                  } else {
-                    const backupRef = ensurePendingPushBackupRef(rpc, activeRepoDir, branch, pushOid, localRef, {
-                      targetRemoteRef: remoteRef,
-                      cfg,
-                      locale,
-                    });
-                    const err = gitErrorMessage(
-                      locale,
-                      retryPush.stderr || retryPush.stdout,
-                      tr(locale, 'push 失败', 'Push failed')
-                    );
-                    return [
-                      false,
-                      backupRef
-                        ? tr(
-                            locale,
-                            `上次未推送的 Git 提交重试推送失败（已保留于分支 ${backupRef}）: ${err}`,
-                            `Retry push of pending Git commits failed (preserved on branch ${backupRef}): ${err}`
-                          )
-                        : tr(
-                            locale,
-                            `上次未推送的 Git 提交重试推送失败（未能创建备份分支，请检查本地 Git 状态）: ${err}`,
-                            `Retry push of pending Git commits failed (backup branch could not be created; check local Git state): ${err}`
-                          ),
-                    ];
-                  }
+                try {
+                  verifyGitPushHistory(rpc, activeRepoDir, branch, localOid, expOid, cfg, locale);
+                } catch (histErr) {
+                  const backupRef = ensurePendingPushBackupRef(rpc, activeRepoDir, branch, localOid, localRef, {
+                    targetRemoteRef: remoteRef,
+                    cfg,
+                    locale,
+                  });
+                  const msg = errorDetail(locale, histErr);
+                  return [
+                    false,
+                    backupRef ? `${msg} (${backupRef})` : msg,
+                  ];
                 }
+                // Void unpushed Block Sync commits by resetting back to the last synced remote oid;
+                // checkout/reset below resets the managed clone worktree cleanly before planning.
+                runGit(rpc, ['reset', '--mixed', remoteRef], { cwd: activeRepoDir, cfg, locale });
+                clearGitPendingInitial(rpc, activeRepoDir, branch, { remoteName: 'origin', cfg, locale });
               } else {
                 const backupRef = ensurePendingPushBackupRef(rpc, activeRepoDir, branch, localOid, localRef, {
                   targetRemoteRef: remoteRef,
@@ -1718,18 +1819,33 @@ export function prepareGitRepo(
           ),
         ];
       }
-      if (
-        headsOrErr.length === 0 &&
-        wasGitBranchSynced(rpc, activeRepoDir, branch, { remoteName, cfg, locale })
-      ) {
-        return [
-          false,
-          tr(
+      if (headsOrErr.length === 0) {
+        if (wasGitBranchSynced(rpc, activeRepoDir, branch, { remoteName, cfg, locale })) {
+          return [
+            false,
+            tr(
+              locale,
+              `远端 ${remoteName} 的分支 ${branch} 已不存在（疑似被删除或重置），为避免未经确认重建远端历史已中止同步`,
+              `Remote ${remoteName} branch ${branch} no longer exists (it may have been deleted or reset); sync aborted to avoid silently recreating remote history`
+            ),
+          ];
+        }
+        if (hasGitPendingInitial(rpc, activeRepoDir, branch, { remoteName, cfg, locale })) {
+          const headChk = runGit(rpc, ['rev-parse', '--verify', `refs/heads/${branch}`], {
+            cwd: activeRepoDir,
+            cfg,
             locale,
-            `远端 ${remoteName} 的分支 ${branch} 已不存在（疑似被删除或重置），为避免未经确认重建远端历史已中止同步`,
-            `Remote ${remoteName} branch ${branch} no longer exists (it may have been deleted or reset); sync aborted to avoid silently recreating remote history`
-          ),
-        ];
+          });
+          const head = headChk.returncode === 0 ? headChk.stdout.trim() : '';
+          if (head) {
+            try {
+              resetLocalGitUnpushedSyncCommits(rpc, activeRepoDir, branch, '', head, { cfg, locale });
+              clearGitPendingInitial(rpc, activeRepoDir, branch, { remoteName, cfg, locale });
+            } catch (resetErr) {
+              return [false, errorDetail(locale, resetErr)];
+            }
+          }
+        }
       }
       if (headsOrErr.includes(branch)) {
         const fetchProc = runGitNetwork(
@@ -1760,15 +1876,22 @@ export function prepareGitRepo(
         recordGitSyncedBranch(rpc, activeRepoDir, branch, remoteOid, { remoteName, cfg, locale });
         const headChk = runGit(rpc, ['rev-parse', '--verify', 'HEAD'], { cwd: activeRepoDir, cfg, locale });
         const head = headChk.returncode === 0 ? headChk.stdout.trim() : '';
+        if (head === remoteOid) {
+          return [true, activeRepoDir];
+        }
         if (
-          head === remoteOid ||
-          (head &&
-            runGit(rpc, ['merge-base', '--is-ancestor', remoteOid, head], {
-              cwd: activeRepoDir,
-              cfg,
-              locale,
-            }).returncode === 0)
+          head &&
+          runGit(rpc, ['merge-base', '--is-ancestor', remoteOid, head], {
+            cwd: activeRepoDir,
+            cfg,
+            locale,
+          }).returncode === 0
         ) {
+          try {
+            resetLocalGitUnpushedSyncCommits(rpc, activeRepoDir, branch, remoteOid, head, { cfg, locale });
+          } catch (resetErr) {
+            return [false, errorDetail(locale, resetErr)];
+          }
           return [true, activeRepoDir];
         }
         if (
@@ -2330,6 +2453,8 @@ export function commitAndPushGit(
     deadlineMs = 0,
     locale = 'zh',
     skipStaleTmpScan = false,
+    configStore = null,
+    notebookTargets = null,
   } = {}
 ) {
   const rpc = resolveCallHost(callHost);
@@ -2640,6 +2765,31 @@ export function commitAndPushGit(
           leaseArg = `--force-with-lease=refs/heads/${branch}:`;
         }
 
+        const delCheck = verifyGitCommitDeletionsBeforePush(
+          rpc,
+          repoRoot,
+          expectedRemoteOid,
+          headOid,
+          deleted,
+          { cfg, locale, configStore, notebookTargets }
+        );
+        if (!delCheck.ok) {
+          if (didCommit) {
+            if (oldHead) {
+              runGit(rpc, ['update-ref', branchRef, oldHead, headOid], { cwd: repoRoot, cfg, locale });
+              try {
+                repairGitIndexToHead(rpc, repoRoot, { cfg, locale });
+              } catch (_repErr) {
+                // Best-effort index repair.
+              }
+            } else {
+              runGit(rpc, ['update-ref', '--no-deref', '-d', branchRef, headOid], { cwd: repoRoot, cfg, locale });
+              runGit(rpc, ['read-tree', '--empty'], { cwd: repoRoot, cfg, locale });
+            }
+          }
+          throw new Error(delCheck.reason);
+        }
+
         const pushProc = runGitNetwork(
           rpc,
           ['push', leaseArg, '-u', remoteName, `${headOid}:refs/heads/${branch}`],
@@ -2888,8 +3038,8 @@ export function createGitSyncEngine({
   };
 
   const computeSyncPlan = ({
-    cfg,
-    onlyPath = null,
+    cfg: rawCfg,
+    onlyPath: rawOnlyPath = null,
     inspectRemote = true,
     nbRoot = null,
     subdir = '',
@@ -2910,11 +3060,10 @@ export function createGitSyncEngine({
     const nbLabelVal = configStore
       ? configStore.notebookLabel(effectiveNbRoot)
       : notebookLabel(effectiveNbRoot, loc, '', homeDir);
-    const scope = cfg.sync_scope || 'all';
-    const skips = createSyncSkips(cfg, loc, skipRound);
+    const skips = createSyncSkips(rawCfg, loc, skipRound);
 
-    const branch = gitBranch(cfg);
-    let repoDir = preparedRepoDir || resolveLocalGitDir(rpc, cfg, { dataDir: dDir, nbRoot: effectiveNbRoot, homeDir, locale: loc });
+    const branch = gitBranch(rawCfg);
+    let repoDir = preparedRepoDir || resolveLocalGitDir(rpc, rawCfg, { dataDir: dDir, nbRoot: effectiveNbRoot, homeDir, locale: loc });
     let repoRoot = repoDir;
     let targetDir = subdir ? posixJoin(repoDir, subdir) : repoDir;
     const metaTarget = subdir ? `${repoDir}:${branch}::${subdir}` : `${repoDir}:${branch}`;
@@ -2922,6 +3071,29 @@ export function createGitSyncEngine({
       ? configStore.metaKey('git', metaTarget, nbKeyVal)
       : `nb:${nbKeyVal}|git:${metaTarget}`;
     const legacyKey = !subdir ? `git:${repoDir}:${branch}` : null;
+    const aliases = (targetBases || []).map((base) => {
+      const mt = subdir ? `${base}::${subdir}` : base;
+      return configStore ? configStore.metaKey('git', mt, nbKeyVal) : `nb:${nbKeyVal}|git:${mt}`;
+    });
+    const legacyAliases = !subdir ? (targetBases || []).map((base) => `git:${base}`) : [];
+
+    const hasVerifiedBase =
+      !configStore ||
+      typeof configStore.hasVerifiedBaseline !== 'function' ||
+      configStore.hasVerifiedBaseline(effectiveNbRoot, {
+        metaKey,
+        aliases,
+        legacyKeys: [legacyKey, ...legacyAliases].filter(Boolean),
+        nbKeyVal,
+        protocol: 'git',
+      });
+    let onlyPath = rawOnlyPath;
+    let scope = (rawCfg && rawCfg.sync_scope) || 'all';
+    if (!hasVerifiedBase && (onlyPath !== null || scope !== 'all')) {
+      onlyPath = null;
+      scope = 'all';
+    }
+    const cfg = scope !== ((rawCfg && rawCfg.sync_scope) || 'all') ? { ...rawCfg, sync_scope: scope } : rawCfg;
 
     const canLazyLocal = onlyPath === null && typeof local.readNote === 'function';
     let localNotes = {};
@@ -3105,12 +3277,6 @@ export function createGitSyncEngine({
         }
       }
     }
-
-    const aliases = (targetBases || []).map((base) => {
-      const mt = subdir ? `${base}::${subdir}` : base;
-      return configStore ? configStore.metaKey('git', mt, nbKeyVal) : `nb:${nbKeyVal}|git:${mt}`;
-    });
-    const legacyAliases = !subdir ? (targetBases || []).map((base) => `git:${base}`) : [];
 
     const plan = computeThreeWaySyncPlan({
       callHost: rpc,
@@ -3556,6 +3722,39 @@ export function createGitSyncEngine({
       const skipStaleTmpScan = Boolean(
         batch.plans.length === 1 && !batch.plans[0].subdir && batch.plans[0]._remote_stale_tmp_clear === true
       );
+      const branch = gitBranch(cfg);
+      const pushRepoDirs = gitRepoDirs(rpc, cfg, {
+        dataDir: dDir,
+        nbRoot: (batch.plans[0] && batch.plans[0].nb_root) || getNbRoot(),
+        homeDir: getHomeDir(),
+        locale: loc,
+      });
+      const pushTargetBases = pushRepoDirs.map((p) => `${p}:${branch}`);
+      const pushTargets = batch.plans.map((p) => {
+        const sub = String(p.subdir || '');
+        const legacyKey = !sub ? `git:${repo}:${branch}` : null;
+        const aliases = pushTargetBases.map((base) => {
+          const mt = sub ? `${base}::${sub}` : base;
+          return configStore ? configStore.metaKey('git', mt, p.nb_key) : `nb:${p.nb_key}|git:${mt}`;
+        });
+        const legacyAliases = !sub ? pushTargetBases.map((base) => `git:${base}`) : [];
+        const candLegacy = [legacyKey, ...legacyAliases].filter(Boolean);
+        const allowLegacy =
+          candLegacy.length > 0 &&
+          Boolean(configStore) &&
+          (!(typeof configStore.allowLegacyFallback === 'function') ||
+            configStore.allowLegacyFallback(p.nb_key, 'git', candLegacy));
+        return {
+          nbRoot: p.nb_root,
+          nbKeyVal: p.nb_key,
+          subdir: sub,
+          metaKey: p.meta_key,
+          aliases,
+          legacyKeys: allowLegacy ? candLegacy : [],
+          expectedRootIdentity: p.root_identity || p.live_root_identity || '',
+          excludedSubdirs: p.excluded_subdirs || new Set(),
+        };
+      });
       didPush = withTargetLock(
         rpc,
         repo,
@@ -3579,6 +3778,8 @@ export function createGitSyncEngine({
             deadlineMs,
             locale: loc,
             skipStaleTmpScan,
+            configStore,
+            notebookTargets: pushTargets,
           });
           maybeRunGitAutoGc(rpc, repo, {
             dataDir: dDir,
@@ -3625,6 +3826,19 @@ export function createGitSyncEngine({
           assets: 0,
           deleted: 0,
           did_push: true,
+        };
+      }
+      if (batch.plans.some((p) => p._deletions_aborted)) {
+        return {
+          status: '已跳过',
+          summary: skippedSummary || tr(loc, '根目录身份已变化，已中止本轮并降级为仅合并', 'Root identity changed; round aborted and downgraded to merge-only'),
+          skipped_items: skippedItems,
+          pushed: 0,
+          pulled: 0,
+          conflicts: 0,
+          assets: 0,
+          deleted: 0,
+          did_push: false,
         };
       }
       return {
@@ -3753,10 +3967,11 @@ export function createGitSyncEngine({
     if (!confirmed) {
       const reasonItems = assessBatchDangerousChanges(rpc, batch, effectiveCfg);
       if (reasonItems.length > 0) {
+        const confirmOnlyPath = batch.plans.every((p) => !p.is_partial_sync) ? null : onlyPath;
         const pending = buildPendingConfirm(rpc, batch, reasonItems, {
           configStore,
           locale: loc,
-          onlyPath,
+          onlyPath: confirmOnlyPath,
           onlyNbRoot: onlyNbRoot || (configStore ? configStore.state.notebookRoot : null),
         });
         if (configStore) {
