@@ -4,17 +4,13 @@
   <img alt="Sync" src="assets/card-en-light.png">
 </picture>
 
-- **Three backends**: Sync multiple notebooks over Local Mirror, WebDAV, and Git; configured targets run simultaneously with independent progress bars.
-- **Auto on save**: Incremental sync runs automatically on save, plus one-click Sync Now.
-- **Scheduled sync** — With automatic sync enabled, sync runs every 5 minutes, 30 minutes, or 1 hour (default: 5 minutes). Runs with no changes add no log entry. Repeated failures alert only once.
-- **Conflict-safe**: Choose conflict copy, local-first, or remote-first with destructive guardrails. With deletion protection enabled, confirm before uploading a note that was deleted remotely.
-- **Deletions sync**: A note or attachment deleted on one side and unchanged on the other is deleted there on the next sync instead of coming back. Local files go to the system Trash, Git keeps them in history, WebDAV moves them to `.block-sync-trash`, and mirrors move them to the recovery folder. Large batches ask for confirmation first.
-- **Sync alerts** — Get an alert when sync fails, encounters a conflict, or needs approval. Block uses an in-app alert in the foreground and a system notification in the background. If delivery fails, Sync retries on a later system event. You can turn alerts off in sync settings.
-- **Resume sync** — With automatic sync enabled, sync runs after the computer wakes or reconnects, using the existing safety checks.
-- **Git pushes** — Sync pushes commits it can identify as its own. Review and handle any other unpushed commits in Git before retrying sync.
-- **Local Git worktrees** — Switch to the configured branch before syncing. If the remote branch has new commits, update the worktree in your Git client before resuming notebook sync.
-- **System credentials** — Git tokens and WebDAV passwords go in the system credential store. Existing credentials migrate after a verified write. Migration retries if the store is locked. Replace or clear old credentials that exceed 1536 bytes or contain NUL characters. Re-enter credentials when changing the server, WebDAV username, or Git repository. Clear Credential applies to settings for the current destination and account. Linux uses Secret Service.
+Want your notes synced across devices like Obsidian Sync, Dropbox, or Nextcloud without paying for an extra official subscription? Sync automatically keeps your notebooks up to date across your own cloud folder (such as iCloud, Dropbox, or OneDrive), a WebDAV drive (such as Nextcloud), or a GitHub/Git repository so your data stays under your control.
 
-**Install**: Open Block Settings → App Store and search **Sync**. If your version of Block supports system permissions for plugins, you can also enter `blockmd-plugins/block-sync`.
+- **Three ways to sync, multiple notebooks at once**: Connect local cloud folders, WebDAV drives, and Git repositories side by side, each showing its own progress across all your notebooks.
+- **Syncs on save, on schedule, and after wake**: Notes sync incrementally as soon as you save, or whenever you click Sync Now. Automatic sync also checks every 5 minutes, 30 minutes, or 1 hour and catches up automatically after your computer wakes or reconnects.
+- **Conflict copies and recoverable deletions**: Choose conflict copy, local-first, or remote-first when edits collide. Deletions sync across devices without losing data: local files go to your system Trash, WebDAV and mirrors move them to a recovery folder, Git keeps full commit history, and large batch deletions ask for confirmation first.
+- **Clear alerts and keychain protection**: Get an in-app prompt or system notification when a sync fails, hits a conflict, or needs confirmation, while WebDAV passwords and Git tokens stay safely stored in your system keychain. (If you also commit to the same Git repo from another client, pull or merge your branch changes before syncing.)
 
-Older Block versions can install the compatible version from the App Store or use the [v1.3.44 archive](https://github.com/blockmd-plugins/block-sync/releases/download/v1.3.44/block-sync-v1.3.44.tar.gz). Upgrade Block to use notifications, system credentials, and resume sync.
+**Install**: Open Block Settings -> App Store and search **Sync**, or enter `blockmd-plugins/block-sync`.
+
+Older Block versions can install the compatible release from the App Store or use the [v1.3.44 archive](https://github.com/blockmd-plugins/block-sync/releases/download/v1.3.44/block-sync-v1.3.44.tar.gz). Upgrade Block to enable system notifications, keychain storage, and wake-up catch-up sync.
