@@ -17,6 +17,9 @@ import {
   normalizeLog,
   formatReasonItem,
   formatShortSyncMetric,
+  formatSkippedCount,
+  formatSyncFailureLabel,
+  formatSkippedDetails,
 } from './i18n.js';
 import {
   nowHms,
@@ -201,6 +204,7 @@ function createSyncController() {
         notifyHost,
         configStore,
         locale: loc,
+        dataDir,
       }),
       git: createGitSyncEngine({
         callHost,
@@ -751,6 +755,7 @@ function createSyncController() {
       pulled = 0,
       conflicts = 0,
       assets = 0,
+      skippedItems = [],
       noticeKey = '',
       isBackground = false,
     } = {}
@@ -815,6 +820,8 @@ function createSyncController() {
         pulled: Number.parseInt(pulled || 0, 10) || 0,
         conflicts: conflictCount,
         assets: Number.parseInt(assets || 0, 10) || 0,
+        skipped_count: skippedItems.length,
+        skipped_items: skippedItems.slice(0, 8),
         summary: summaryStr,
       };
       lastSuccess = { ...successSnap };
@@ -886,6 +893,8 @@ function createSyncController() {
       pulled: Number.parseInt(pulled || 0, 10) || 0,
       conflicts: conflictCount,
       assets: Number.parseInt(assets || 0, 10) || 0,
+      skipped_count: skippedItems.length,
+      skipped_items: skippedItems.slice(0, 8),
       summary: summaryStr,
       fail_class: failClass,
       transient_streak: transientStreak,
@@ -1210,7 +1219,7 @@ function createSyncController() {
           progress: 1.0,
           label: isTransientBg
             ? t('等待网络，稍后自动重试', 'Offline, will retry')
-            : t('同步失败', 'Sync failed'),
+            : formatSyncFailureLabel(getLocale(), failClass),
           tone: isTransientBg ? 'warning' : 'danger',
           running: false,
         });
@@ -1343,6 +1352,15 @@ function createSyncController() {
     const deleted = Number(res.deleted || 0);
     const totalNotes = pushed + pulled + conflicts;
     const summary = String(res.summary || t('已是最新', 'Up to date'));
+    const skippedItems = res.skipped_items || [];
+    if (skippedItems.length > 0) {
+      appendLog(formatSkippedCount(getLocale(), skippedItems.length), '已跳过', {
+        tone: 'warning',
+        tooltip: formatSkippedDetails(skippedItems),
+        logKey: 'sync_skipped',
+        logArgs: { protocol: proto, count: skippedItems.length, items: skippedItems.slice(0, 8) },
+      });
+    }
 
     if (totalNotes === 0 && assets === 0 && deleted === 0) {
       if (res.did_push) {
@@ -1351,12 +1369,12 @@ function createSyncController() {
           tone: 'success',
           tooltip: summary,
         });
-        recordResult('成功', summary, { protocol: proto, target });
+        recordResult('成功', summary, { protocol: proto, target, skippedItems });
       } else {
-        if (onlyPath === null) {
+        if (onlyPath === null && skippedItems.length === 0) {
           recordNoopLog(proto, summary);
         }
-        recordResult('无变更', summary, { protocol: proto, target });
+        recordResult('无变更', summary, { protocol: proto, target, skippedItems });
       }
     } else {
       recordResult('成功', summary, {
@@ -1366,6 +1384,7 @@ function createSyncController() {
         pulled,
         conflicts,
         assets,
+        skippedItems,
       });
     }
 

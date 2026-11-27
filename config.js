@@ -15,6 +15,8 @@ import {
   isSafeRelMd,
   syncDirKey,
   sanitizeUrlForDisplay,
+  DEFAULT_MAX_FILE_SIZE_MB,
+  normalizeMaxFileSizeMb,
 } from './utils.js';
 
 export const VALID_PROTOCOLS = Object.freeze(['local_mirror', 'webdav', 'git']);
@@ -61,6 +63,8 @@ export const DEFAULT_CONFIG = Object.freeze({
   sync_interval: '5',
   system_notifications: true,
   sync_assets: true,
+  max_file_size_mb: DEFAULT_MAX_FILE_SIZE_MB,
+  ignore_patterns: '',
   conflict_policy: 'keep_both',
   delete_guard: true,
 });
@@ -267,7 +271,7 @@ export function configMatchesSaved(a, b) {
 export function changedProtocols(oldCfg, newCfg) {
   const oldC = oldCfg || {};
   const newC = newCfg || {};
-  const sharedKeys = ['selected_notebooks', 'conflict_policy', 'sync_scope', 'sync_assets', 'delete_guard'];
+  const sharedKeys = ['selected_notebooks', 'conflict_policy', 'sync_scope', 'sync_assets', 'max_file_size_mb', 'ignore_patterns', 'delete_guard'];
   if (sharedKeys.some((k) => JSON.stringify(oldC[k]) !== JSON.stringify(newC[k]))) {
     return new Set(VALID_PROTOCOLS);
   }
@@ -424,6 +428,9 @@ export function normalizeConfig(
 
   const interval = String(raw.sync_interval ?? merged.sync_interval ?? '').trim();
   merged.sync_interval = VALID_SYNC_INTERVALS.includes(interval) ? interval : DEFAULT_CONFIG.sync_interval;
+  merged.max_file_size_mb = normalizeMaxFileSizeMb(Object.hasOwn(raw, 'max_file_size_mb') ? raw.max_file_size_mb : merged.max_file_size_mb);
+  const ignorePatterns = Object.hasOwn(raw, 'ignore_patterns') ? raw.ignore_patterns : merged.ignore_patterns;
+  merged.ignore_patterns = typeof ignorePatterns === 'string' ? ignorePatterns.replace(/\r\n|\\n/g, '\n') : '';
 
   for (const boolKey of [
     'auto_sync',
@@ -497,17 +504,14 @@ export function loadConfigRecord(raw, opts = {}) {
 }
 
 export function configValuesForUI(config, supportsSystem = true) {
-  if (!supportsSystem) {
-    return { ...(config || {}) };
-  }
   const values = {};
   for (const [k, v] of Object.entries(config || {})) {
-    if (!CREDENTIAL_FIELDS.includes(k) && k !== 'credential_refs') {
-      values[k] = v;
+    if (!supportsSystem || (!CREDENTIAL_FIELDS.includes(k) && k !== 'credential_refs')) {
+      values[k] = k === 'ignore_patterns' ? String(v ?? '').replace(/\n/g, '\\n') : v;
     }
   }
-  for (const field of CREDENTIAL_FIELDS) {
-    values[field] = '';
+  if (supportsSystem) {
+    for (const field of CREDENTIAL_FIELDS) values[field] = '';
   }
   return values;
 }

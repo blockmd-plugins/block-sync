@@ -15,6 +15,7 @@ import {
   logForPage,
   formatShortSyncMetric,
   localizeResultSummary,
+  formatSkippedDetails,
   normalizeLog,
 } from './i18n.js';
 import {
@@ -687,6 +688,26 @@ function syncIntervalItem(cfg, locale) {
   };
 }
 
+function fileSyncOptions(cfg, locale) {
+  return [
+    {
+      kind: 'input',
+      id: 'max_file_size_mb',
+      label: tr(locale, '单文件大小上限 (MB)', 'Per-file size limit (MB)'),
+      value: String(cfg.max_file_size_mb ?? '50'),
+      placeholder: '50 (1–64)',
+    },
+    {
+      kind: 'input',
+      id: 'ignore_patterns',
+      label: tr(locale, '忽略规则', 'Ignore rules'),
+      layout: 'stacked',
+      value: String(cfg.ignore_patterns ?? '').replace(/\n/g, '\\n'),
+      placeholder: tr(locale, '用 \\n 分隔，例如 *.mp4\\nassets/videos/*', 'Separate with \\n, e.g. *.mp4\\nassets/videos/*'),
+    },
+  ];
+}
+
 function notificationSwitch(cfg, locale) {
   return {
     kind: 'switch',
@@ -884,7 +905,7 @@ function buildProgressItem(ctx, protocol, cfg) {
       status = hm ? `${hm} · ${metric}` : metric;
       progress = 1.0;
       tone = 'success';
-      tooltip = targetTip;
+      tooltip = formatSkippedDetails(okRec.skipped_items) || targetTip;
     } else {
       status = tr(locale, '已启用 · 等待同步', 'Enabled · Ready to sync');
       progress = 0.0;
@@ -998,6 +1019,7 @@ function buildLegacyCards(ctx, c) {
     conflictPolicyItem(c, locale),
     autoSyncSwitch(c, locale),
     syncIntervalItem(c, locale),
+    ...fileSyncOptions(c, locale),
     {
       kind: 'actions',
       visible_when: { control_id: 'protocol', in: ['webdav', 'git'] },
@@ -1264,6 +1286,7 @@ export function buildSettingsPage(ctx, cfg = null) {
         conflictPolicyItem(c, locale),
         autoSyncSwitch(c, locale),
         syncIntervalItem(c, locale),
+        ...fileSyncOptions(c, locale),
       ],
     };
     if (supportsSystem) {

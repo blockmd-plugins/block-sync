@@ -16,6 +16,7 @@ export const LOG_STATUS_EN = Object.freeze({
   '失败': 'Failed',
   '未连通': 'Connection Failed',
   '已取消': 'Canceled',
+  '已跳过': 'Skipped',
   '冲突副本': 'Conflict Copy',
 });
 
@@ -101,6 +102,7 @@ export function classifyLogStatus(rawStatus) {
     '失败': ['失败', 'danger'],
     '未连通': ['未连通', 'danger'],
     '已取消': ['已取消', 'info'],
+    '已跳过': ['已跳过', 'warning'],
     '冲突副本': ['冲突副本', 'warning'],
   };
   if (Object.hasOwn(exact, s)) {
@@ -351,6 +353,8 @@ export function renderStructuredLog(locale, key, args) {
       const errStr = localizeError(locale, String(a.error || ''));
       return [tr(locale, `删除失败 ${path}`, `Delete failed: ${path}`), errStr];
     }
+    case 'sync_skipped':
+      return [formatSkippedCount(locale, a.count), formatSkippedDetails(a.items)];
     case 'assets_synced': {
       const prefix = String(a.prefix || '');
       const count = Number.parseInt(a.count || 0, 10) || 0;
@@ -454,6 +458,25 @@ export function logForPage(locale, entry) {
   return item;
 }
 
+export function formatSyncFailureLabel(locale, code) {
+  if (code === 'file_limit') return tr(locale, '文件超过大小上限', 'File size limit exceeded');
+  if (code === 'quota_full') return tr(locale, '存储空间不足', 'Insufficient storage');
+  if (code === 'fs_error') return tr(locale, '文件访问失败', 'File access failed');
+  return tr(locale, '同步失败', 'Sync failed');
+}
+
+export function formatSkippedCount(locale, count) {
+  return tr(locale, `已跳过 ${count} 个文件`, `Skipped ${count} files`);
+}
+
+export function formatSkippedDetails(items) {
+  if (!Array.isArray(items)) return '';
+  return items.slice(0, 8).map(({ path, reason }) => {
+    const shown = /[\u0000-\u001f\u007f]/.test(path) ? JSON.stringify(path) : path;
+    return `${shown}: ${reason}`;
+  }).join('\n');
+}
+
 export function formatShortSyncMetric(locale, rec) {
   if (!rec || typeof rec !== 'object') {
     return tr(locale, '已是最新', 'Up to date');
@@ -467,6 +490,7 @@ export function formatShortSyncMetric(locale, rec) {
   if (pulled > 0) parts.push(tr(locale, `拉 ${pulled}`, `${pulled} pulled`));
   if (conflicts > 0) parts.push(tr(locale, `冲突 ${conflicts}`, `${conflicts} conflicts`));
   if (assets > 0) parts.push(tr(locale, `附件 ${assets}`, `${assets} assets`));
+  if (rec.skipped_count > 0) parts.push(formatSkippedCount(locale, rec.skipped_count));
   if (parts.length > 0) {
     return parts.join(' / ');
   }
