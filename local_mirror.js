@@ -95,9 +95,11 @@ function isAlreadyExistsError(exc) {
 // ============================================================================
 
 /** Stat a filesystem path through host.fs.stat; returns { exists: false } when missing. */
-export function fsStat(callHost, path) {
+export function fsStat(callHost, path, { lstat = false } = {}) {
   const rpc = resolveCallHost(callHost);
-  const res = rpc('host.fs.stat', { path: String(path ?? '') });
+  const payload = { path: String(path ?? '') };
+  if (lstat) payload.lstat = true;
+  const res = rpc('host.fs.stat', payload);
   return res && typeof res === 'object' ? res : { exists: false, path: String(path ?? '') };
 }
 
@@ -881,33 +883,45 @@ export function clearRecoveryDirCache(callHost, rootDir = '') {
   }
 }
 
-function resolveNotebookRecoveryDir(rpc, cleanRoot) {
-  if (typeof rpc !== 'function' || !cleanRoot) return '';
+function resolveNotebookRecoveryDetails(rpc, cleanRoot) {
+  const empty = { dir: '', previousPaths: [] };
+  if (typeof rpc !== 'function' || !cleanRoot) return empty;
   let cache = hostDataDirCacheByRpc.get(rpc);
   if (!cache) {
     cache = { unsupported: false, dirs: new Map() };
     hostDataDirCacheByRpc.set(rpc, cache);
   }
-  if (cache.unsupported) return '';
-  if (cache.dirs.has(cleanRoot)) return cache.dirs.get(cleanRoot) || '';
+  if (cache.unsupported) return empty;
+  if (cache.dirs.has(cleanRoot)) {
+    const cached = cache.dirs.get(cleanRoot);
+    if (cached && typeof cached === 'object') return cached;
+    return { dir: cached || '', previousPaths: [] };
+  }
   try {
     const res = rpc('host.notebooks.data_dir', { path: cleanRoot });
     const nbDataPath = trimTrailingSlash(res && res.path ? res.path : '');
+    const prevPaths = Array.isArray(res && res.previous_paths)
+      ? res.previous_paths.map((p) => trimTrailingSlash(p)).filter(Boolean)
+      : [];
     if (nbDataPath) {
-      const recDir = posixJoin(nbDataPath, 'recovery');
-      cache.dirs.set(cleanRoot, recDir);
-      return recDir;
+      const details = { dir: posixJoin(nbDataPath, 'recovery'), previousPaths: prevPaths };
+      cache.dirs.set(cleanRoot, details);
+      return details;
     }
   } catch (exc) {
     if (isRecoveryMethodUnsupportedError(exc)) {
       cache.unsupported = true;
-      return '';
+      return empty;
     }
-    cache.dirs.set(cleanRoot, '');
-    return '';
+    cache.dirs.set(cleanRoot, empty);
+    return empty;
   }
-  cache.dirs.set(cleanRoot, '');
-  return '';
+  cache.dirs.set(cleanRoot, empty);
+  return empty;
+}
+
+function resolveNotebookRecoveryDir(rpc, cleanRoot) {
+  return resolveNotebookRecoveryDetails(rpc, cleanRoot).dir;
 }
 
 /**
@@ -1103,6 +1117,22 @@ function stashEntryTimestampMs(entry, name) {
   return 0;
 }
 
+const RECOGNIZED_STASH_FILE_RE = /^\d{15}-[0-9a-f]{8}-.+/;
+
+function isRecognizedStashFileName(name) {
+  return RECOGNIZED_STASH_FILE_RE.test(String(name || ''));
+}
+
+function isVerifiedRegularStashFile(callHost, filePath, name) {
+  if (!isRecognizedStashFileName(name)) return false;
+  try {
+    const st = fsStat(callHost, filePath, { lstat: true });
+    return Boolean(st && st.exists && st.is_regular === true && !st.is_dir && !st.is_symlink);
+  } catch (_err) {
+    return false;
+  }
+}
+
 function pruneStashDir(callHost, stashDir, keepName, nowMs) {
   try {
     const expireBeforeMs = nowMs - RECOVERY_RETENTION_MS;
@@ -1110,13 +1140,15 @@ function pruneStashDir(callHost, stashDir, keepName, nowMs) {
     const entries = fsList(callHost, stashDir, false);
     const surviving = [];
     for (const entry of entries) {
-      if (!entry || entry.is_dir) continue;
+      if (!entry || entry.is_dir || entry.is_symlink) continue;
       const name = String(entry.name || posixBasename(entry.path || ''));
-      if (!name) continue;
+      if (!name || !isRecognizedStashFileName(name)) continue;
+      const entryPath = posixJoin(stashDir, name);
+      if (!isVerifiedRegularStashFile(callHost, entryPath, name)) continue;
       const tsMs = stashEntryTimestampMs(entry, name);
       if (name !== keepName && tsMs > 0 && tsMs < expireBeforeMs) {
         try {
-          fsDelete(callHost, posixJoin(stashDir, name));
+          fsDelete(callHost, entryPath);
         } catch (_err) {
           // Ignore prune errors.
         }
@@ -1129,8 +1161,10 @@ function pruneStashDir(callHost, stashDir, keepName, nowMs) {
       for (const item of surviving.slice(0, surviving.length - MAX_STASH_ENTRIES)) {
         if (item.name === keepName) continue;
         if (keepName && item.tsMs >= protectAfterMs) continue;
+        const entryPath = posixJoin(stashDir, item.name);
+        if (!isVerifiedRegularStashFile(callHost, entryPath, item.name)) continue;
         try {
-          fsDelete(callHost, posixJoin(stashDir, item.name));
+          fsDelete(callHost, entryPath);
         } catch (_err) {
           // Ignore prune errors.
         }
@@ -1251,11 +1285,11 @@ function moveToRecoveryStash(callHost, srcPath, rootDir, relPath, nowMsFn = () =
 function moveDirFilesToRecovery(rpc, srcDir, recoveryDir, nowMs) {
   let dirSt;
   try {
-    dirSt = fsStat(rpc, srcDir);
+    dirSt = fsStat(rpc, srcDir, { lstat: true });
   } catch (_statErr) {
     return;
   }
-  if (!dirSt.exists || !dirSt.is_dir) return;
+  if (!dirSt.exists || !dirSt.is_dir || dirSt.is_symlink) return;
   let entries = [];
   try {
     entries = fsList(rpc, srcDir, false);
@@ -1264,14 +1298,15 @@ function moveDirFilesToRecovery(rpc, srcDir, recoveryDir, nowMs) {
   }
   let ensuredRecoveryDir = false;
   for (const entry of entries) {
-    if (!entry || entry.is_dir || entry.is_regular === false || entry.is_file === false) continue;
+    if (!entry || entry.is_dir || entry.is_symlink || entry.is_regular === false || entry.is_file === false) continue;
     const name = String(entry.name || posixBasename(entry.path || '')).trim();
-    if (!name) continue;
+    if (!name || !isRecognizedStashFileName(name)) continue;
     const srcPath = entry.path ? String(entry.path) : posixJoin(srcDir, name);
+    if (!isVerifiedRegularStashFile(rpc, srcPath, name)) continue;
     try {
       if (!ensuredRecoveryDir) {
-        const recSt = fsStat(rpc, recoveryDir);
-        if (recSt.exists && !recSt.is_dir) return;
+        const recSt = fsStat(rpc, recoveryDir, { lstat: true });
+        if (recSt.exists && (!recSt.is_dir || recSt.is_symlink)) return;
         fsMkdir(rpc, recoveryDir, true);
         ensuredRecoveryDir = true;
       }
@@ -1303,6 +1338,7 @@ export function migrateLegacyRecoveryDirs(
     const rpc = resolveCallHost(callHost);
     const cleanRoot = trimTrailingSlash(rootDir);
     if (!cleanRoot) return;
+    const nbDetails = resolveNotebookRecoveryDetails(rpc, cleanRoot);
     const recoveryDir = recoveryDirForRoot(rpc, cleanRoot, dataDir);
     if (!recoveryDir) return;
     const nowMs = nowMsFn();
@@ -1310,7 +1346,8 @@ export function migrateLegacyRecoveryDirs(
     const pluginDataDir = resolvePluginDataDir(rpc, dataDir);
     if (pluginDataDir) {
       const hashRoots = [cleanRoot];
-      for (const extra of extraHashRoots || []) {
+      const mergedExtras = [...(nbDetails.previousPaths || []), ...(extraHashRoots || [])];
+      for (const extra of mergedExtras) {
         const cleanExtra = trimTrailingSlash(extra);
         if (cleanExtra && !hashRoots.includes(cleanExtra)) hashRoots.push(cleanExtra);
       }
@@ -1326,11 +1363,11 @@ export function migrateLegacyRecoveryDirs(
       const legacyDir = posixJoin(cleanRoot, legacyName);
       let dirSt;
       try {
-        dirSt = fsStat(rpc, legacyDir);
+        dirSt = fsStat(rpc, legacyDir, { lstat: true });
       } catch (_statErr) {
         continue;
       }
-      if (!dirSt.exists || !dirSt.is_dir) continue;
+      if (!dirSt.exists || !dirSt.is_dir || dirSt.is_symlink) continue;
 
       let entries = [];
       try {
@@ -1341,14 +1378,15 @@ export function migrateLegacyRecoveryDirs(
 
       let ensuredRecoveryDir = false;
       for (const entry of entries) {
-        if (!entry || entry.is_dir || entry.is_regular === false || entry.is_file === false) continue;
+        if (!entry || entry.is_dir || entry.is_symlink || entry.is_regular === false || entry.is_file === false) continue;
         const name = String(entry.name ?? '') || posixBasename(entry.path || '');
-        if (!name) continue;
+        if (!name || !isRecognizedStashFileName(name)) continue;
         const srcPath = entry.path ? String(entry.path) : posixJoin(legacyDir, name);
+        if (!isVerifiedRegularStashFile(rpc, srcPath, name)) continue;
         try {
           if (!ensuredRecoveryDir) {
-            const recSt = fsStat(rpc, recoveryDir);
-            if (recSt.exists && !recSt.is_dir) break;
+            const recSt = fsStat(rpc, recoveryDir, { lstat: true });
+            if (recSt.exists && (!recSt.is_dir || recSt.is_symlink)) break;
             fsMkdir(rpc, recoveryDir, true);
             ensuredRecoveryDir = true;
           }
@@ -2346,11 +2384,20 @@ export function computeThreeWaySyncPlan({
   const rpc = resolveCallHost(callHost);
   const scope = cfg.sync_scope || 'all';
   const policy = cfg.conflict_policy || 'keep_both';
-  const originalBaseMap = configStore ? configStore.getBaseMap(metaKey, ...aliases, legacyKey, ...legacyAliases) : {};
+  const candidateLegacyKeys = [legacyKey, ...(legacyAliases || [])].filter(Boolean);
+  const allowLegacy =
+    candidateLegacyKeys.length > 0 &&
+    (!(configStore && typeof configStore.allowLegacyFallback === 'function') ||
+      configStore.allowLegacyFallback(nbKeyVal, protocol, candidateLegacyKeys));
+  const effectiveLegacyKeys = allowLegacy ? candidateLegacyKeys : [];
+  const originalBaseMap = configStore ? configStore.getBaseMap(metaKey, ...aliases, ...effectiveLegacyKeys) : {};
   const baseMap = { ...originalBaseMap };
   const initializedMap = configStore ? configStore.state.syncMeta[INITIALIZED_META_KEY] : null;
   const isInitialized = Boolean(
-    (initializedMap && typeof initializedMap === 'object' && [metaKey, ...aliases].some((k) => Boolean(initializedMap[k]))) ||
+    (initializedMap &&
+      typeof initializedMap === 'object' &&
+      ([metaKey, ...aliases].some((k) => Boolean(initializedMap[k])) ||
+        effectiveLegacyKeys.some((k) => Boolean(initializedMap[k])))) ||
       Object.keys(baseMap).length > 0
   );
   const isFirstSync = !isInitialized;

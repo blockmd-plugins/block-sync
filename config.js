@@ -36,6 +36,7 @@ export const WEBDAV_TRASH_DIR = '.block-sync-trash';
 export const LAYOUTS_META_KEY = 'notebook_layouts';
 export const INITIALIZED_META_KEY = 'initialized_targets';
 export const TOMBSTONES_META_KEY = '__tombstones__';
+export const NOTEBOOK_ID_MAP_KEY = 'notebook_id_map';
 export const MAX_TOMBSTONES_PER_NB = 4000;
 export const MAX_STORED_CONFIRM_SAMPLES = 30;
 export const MAX_WEBDAV_DIRS = 2000;
@@ -668,6 +669,39 @@ export function notebookSlug(nbRoot, callHost, fallbackRoot = '', homeDir = '') 
   return `${safe.slice(0, 24)}-${hash.slice(0, 8)}`;
 }
 
+export function parseNbMetaKey(mk) {
+  const s = String(mk || '');
+  if (!s.startsWith('nb:')) return null;
+  let bestIdx = -1;
+  let bestProto = '';
+  for (const proto of VALID_PROTOCOLS) {
+    const marker = `|${proto}:`;
+    const idx = s.indexOf(marker, 3);
+    if (idx > 3 && (bestIdx < 0 || idx < bestIdx)) {
+      bestIdx = idx;
+      bestProto = proto;
+    }
+  }
+  if (bestIdx > 3) {
+    return {
+      nb: s.slice(3, bestIdx),
+      protocol: bestProto,
+      target: s.slice(bestIdx + bestProto.length + 2),
+      rest: s.slice(bestIdx),
+    };
+  }
+  const lastPipe = s.lastIndexOf('|');
+  if (lastPipe > 3) {
+    return {
+      nb: s.slice(3, lastPipe),
+      protocol: '',
+      target: '',
+      rest: s.slice(lastPipe),
+    };
+  }
+  return null;
+}
+
 export function computeNotebookSubdirMap({
   notebooks,
   protocol,
@@ -719,12 +753,12 @@ export function computeNotebookSubdirMap({
       legacyRoot = true;
       continue;
     }
-    if (!key.startsWith('nb:') || !key.includes(marker)) {
+    const parsed = parseNbMetaKey(key);
+    if (!parsed || parsed.protocol !== protocol) {
       continue;
     }
-    const markerIdx = key.lastIndexOf(marker);
-    const nb = resolveNbPath(key.slice(3, markerIdx));
-    const location = key.slice(markerIdx + marker.length);
+    const nb = resolveNbPath(parsed.nb);
+    const location = parsed.target;
     for (const base of targetBases) {
       if (location === base) {
         if (!historical.has(nb)) historical.set(nb, new Set());
@@ -900,6 +934,9 @@ export function createConfigStore({
     pendingNotices: {},
     connStates: {},
     credentialCleanup: new Set(),
+    notebookIdMap: { by_id: {}, by_path: {} },
+    blockedLegacyIds: new Set(),
+    hostSupportsNotebookIds: false,
   };
 
   const normOpts = () => ({
@@ -1057,90 +1094,130 @@ export function createConfigStore({
     return [next, changed];
   };
 
-  const applyAliasMigrations = (aliasMap, { oldPath = '', newPath = '', persist = false, preMigratedNbConfigs = false, preMigratedGlobal = false } = {}) => {
+  const mergeTombstoneBuckets = (existingBucket, incomingBucket) => {
+    const out = {};
+    for (const bucket of [existingBucket, incomingBucket]) {
+      if (!bucket || typeof bucket !== 'object' || Array.isArray(bucket)) continue;
+      for (const [itemKey, rawEntry] of Object.entries(bucket)) {
+        if (!rawEntry || typeof rawEntry !== 'object') continue;
+        const hash = typeof rawEntry.hash === 'string' ? rawEntry.hash : '';
+        if (!hash) continue;
+        const tsNum = Number(rawEntry.ts);
+        const ts = Number.isFinite(tsNum) ? tsNum : 0;
+        const prev = out[itemKey];
+        if (!prev || ts >= prev.ts) {
+          out[itemKey] = { hash, ts };
+        }
+      }
+    }
+    const entries = Object.entries(out);
+    if (entries.length > MAX_TOMBSTONES_PER_NB) {
+      entries.sort((a, b) => Number((b[1] && b[1].ts) || 0) - Number((a[1] && a[1].ts) || 0));
+      return Object.fromEntries(entries.slice(0, MAX_TOMBSTONES_PER_NB));
+    }
+    return out;
+  };
+
+  const applyAliasMigrations = (
+    aliasMap,
+    {
+      oldPath = '',
+      newPath = '',
+      persist = false,
+      preMigratedNbConfigs = false,
+      preMigratedGlobal = false,
+      nextIdMap = null,
+      nextBlockedLegacyIds = null,
+    } = {}
+  ) => {
     const rpc = getRpc();
     const dirty = {};
+    const idToCurrentPath = new Map();
+    for (const kn of state.knownNotebooks) {
+      if (kn && kn.id && kn.path) idToCurrentPath.set(String(kn.id), kn.path);
+    }
     const ensureSelectedPathReplaced = (cfg) => {
-      if (!cfg || typeof cfg !== 'object' || !oldPath || !newPath || !Array.isArray(cfg.selected_notebooks)) return false;
+      if (!cfg || typeof cfg !== 'object' || !Array.isArray(cfg.selected_notebooks)) return [cfg, false];
       let mod = false;
       const nextSel = [];
       const seen = new Set();
       for (const item of cfg.selected_notebooks) {
-        const mapped = item === oldPath ? newPath : item;
+        let mapped = item;
+        if (oldPath && newPath && mapped === oldPath) {
+          mapped = newPath;
+        } else if (aliasMap && aliasMap.has(mapped)) {
+          const targetId = aliasMap.get(mapped);
+          mapped = idToCurrentPath.get(targetId) || newPath || mapped;
+        }
         if (mapped !== item) mod = true;
         if (mapped && !seen.has(mapped)) {
           seen.add(mapped);
           nextSel.push(mapped);
         }
       }
-      if (mod) cfg.selected_notebooks = nextSel;
-      return mod;
+      if (!mod) return [cfg, false];
+      return [{ ...cfg, selected_notebooks: nextSel }, true];
     };
 
-    // Migrate notebookConfigs keys and selected_notebooks inside each record.
-    const [migratedNbCfgs, nbCfgsKeyChanged] = rewriteScopedAliasMap(state.notebookConfigs, aliasMap);
+    // Prepare candidate notebookConfigs without mutating state until persistence succeeds.
+    const [migratedNbCfgsRaw, nbCfgsKeyChanged] = rewriteScopedAliasMap(state.notebookConfigs, aliasMap);
+    const candNotebookConfigs = {};
     let nbCfgsSelChanged = false;
-    if (migratedNbCfgs && typeof migratedNbCfgs === 'object') {
-      for (const [k, cfg] of Object.entries(migratedNbCfgs)) {
-        if (ensureSelectedPathReplaced(cfg)) nbCfgsSelChanged = true;
-        migratedNbCfgs[k] = cfg;
+    if (migratedNbCfgsRaw && typeof migratedNbCfgsRaw === 'object') {
+      for (const [k, cfg] of Object.entries(migratedNbCfgsRaw)) {
+        const [nextCfg, selChanged] = ensureSelectedPathReplaced(cfg);
+        if (selChanged) nbCfgsSelChanged = true;
+        candNotebookConfigs[k] = nextCfg;
       }
     }
     if (nbCfgsKeyChanged || nbCfgsSelChanged || preMigratedNbConfigs) {
-      state.notebookConfigs = migratedNbCfgs;
       const toStore = {};
-      for (const [k, v] of Object.entries(state.notebookConfigs)) {
+      for (const [k, v] of Object.entries(candNotebookConfigs)) {
         toStore[k] = encodeConfigSelected(v);
       }
       dirty.notebook_configs = toStore;
     }
 
-    const sharedSelChanged = ensureSelectedPathReplaced(state.storedGlobal);
-    ensureSelectedPathReplaced(state.config);
-    ensureSelectedPathReplaced(state.savedConfig);
-    if ((sharedSelChanged || preMigratedGlobal) && state.storedGlobal) {
-      dirty.config = encodeConfigSelected(state.storedGlobal);
+    const [candStoredGlobal, sharedSelChanged] = ensureSelectedPathReplaced(state.storedGlobal);
+    const [candConfig] = ensureSelectedPathReplaced(state.config);
+    const [candSavedConfig] = ensureSelectedPathReplaced(state.savedConfig);
+    if ((sharedSelChanged || preMigratedGlobal) && candStoredGlobal) {
+      dirty.config = encodeConfigSelected(candStoredGlobal);
     }
 
     const [migratedRes, resChanged] = rewriteScopedAliasMap(state.notebookResults, aliasMap);
     if (resChanged) {
-      state.notebookResults = migratedRes;
       dirty.notebook_results = migratedRes;
     }
 
     const [migratedConfs, confsChanged] = rewriteScopedAliasMap(state.pendingConfirms, aliasMap, { isConfirm: true, oldPath, newPath });
     if (confsChanged) {
-      state.pendingConfirms = migratedConfs;
-      state.savedPendingConfirms = { ...migratedConfs };
-      state.pendingConfirm = getPendingConfirm();
       dirty.pending_confirms = migratedConfs;
     }
 
     const [migratedConn, connChanged] = rewriteScopedAliasMap(state.connStates, aliasMap);
     if (connChanged) {
-      state.connStates = migratedConn;
       dirty.conn_states = migratedConn;
     }
 
+    let migratedNotices = state.pendingNotices;
+    let noticesChanged = false;
     if (state.supportsSystem) {
-      const [migratedNotices, noticesChanged] = rewriteScopedAliasMap(state.pendingNotices, aliasMap, { isNotice: true, oldPath, newPath });
+      [migratedNotices, noticesChanged] = rewriteScopedAliasMap(state.pendingNotices, aliasMap, { isNotice: true, oldPath, newPath });
       if (noticesChanged) {
-        state.pendingNotices = migratedNotices;
         dirty.pending_notices = migratedNotices;
       }
     }
 
-    // Migrate syncMeta: nb:<old>|... keys, INITIALIZED_META_KEY, TOMBSTONES_META_KEY, LAYOUTS_META_KEY.
+    // Prepare syncMeta copy: nb:<old>|... keys (supporting '|' in paths), INITIALIZED_META_KEY, TOMBSTONES_META_KEY, LAYOUTS_META_KEY.
     let syncMetaChanged = false;
     const nextMeta = {};
     const rewriteMetaKey = (mk) => {
-      if (!mk.startsWith('nb:')) return mk;
-      const pipeIdx = mk.indexOf('|', 3);
-      if (pipeIdx <= 3) return mk;
-      const oldNb = mk.slice(3, pipeIdx);
-      const newNb = aliasMap.get(oldNb);
-      if (!newNb || newNb === oldNb) return mk;
-      return `nb:${newNb}${mk.slice(pipeIdx)}`;
+      const parsed = parseNbMetaKey(mk);
+      if (!parsed) return mk;
+      const newNb = aliasMap.get(parsed.nb);
+      if (!newNb || newNb === parsed.nb) return mk;
+      return `nb:${newNb}${parsed.rest}`;
     };
     for (const [mk, mv] of Object.entries(state.syncMeta || {})) {
       if (mk === INITIALIZED_META_KEY && mv && typeof mv === 'object' && !Array.isArray(mv)) {
@@ -1158,13 +1235,7 @@ export function createConfigStore({
         for (const [tk, tv] of Object.entries(mv)) {
           const newTk = aliasMap.get(tk) || tk;
           if (newTk !== tk) syncMetaChanged = true;
-          if (newTk === tk) {
-            tombsOut[newTk] = tv;
-          } else if (!Object.hasOwn(mv, newTk) && !Object.hasOwn(tombsOut, newTk)) {
-            tombsOut[newTk] = tv;
-          } else if (tv && typeof tv === 'object' && !Array.isArray(tv)) {
-            tombsOut[newTk] = { ...tv, ...(tombsOut[newTk] || {}) };
-          }
+          tombsOut[newTk] = mergeTombstoneBuckets(tombsOut[newTk], tv);
         }
         nextMeta[mk] = tombsOut;
         continue;
@@ -1196,21 +1267,94 @@ export function createConfigStore({
       }
     }
     if (syncMetaChanged) {
-      state.syncMeta = nextMeta;
       dirty.sync_meta = nextMeta;
     }
 
-    if (persist && Object.keys(dirty).length > 0) {
-      try {
-        if (state.supportsSystem) {
-          storageSetMany(rpc, dirty);
-        } else {
-          for (const [k, v] of Object.entries(dirty)) storageSet(rpc, k, v);
-        }
-      } catch (_err) {
-        // Silent best-effort migration.
+    let idMapDirty = false;
+    let idMapPayload = null;
+    if (nextIdMap || nextBlockedLegacyIds) {
+      const candIdMap = nextIdMap || state.notebookIdMap;
+      const candBlocked = nextBlockedLegacyIds || state.blockedLegacyIds;
+      const prevStr = JSON.stringify({
+        by_id: state.notebookIdMap.by_id || {},
+        by_path: state.notebookIdMap.by_path || {},
+        blocked_legacy_ids: [...state.blockedLegacyIds].sort(),
+      });
+      const nextPayload = {
+        by_id: { ...(candIdMap.by_id || {}) },
+        by_path: { ...(candIdMap.by_path || {}) },
+        blocked_legacy_ids: [...candBlocked].sort(),
+      };
+      if (JSON.stringify(nextPayload) !== prevStr) {
+        idMapDirty = true;
+        idMapPayload = nextPayload;
+        dirty[NOTEBOOK_ID_MAP_KEY] = nextPayload;
       }
     }
+
+    const commitInMemory = (persistedKeys = null) => {
+      const has = (k) => !persistedKeys || persistedKeys.has(k);
+      if ((nbCfgsKeyChanged || nbCfgsSelChanged || preMigratedNbConfigs) && has('notebook_configs')) {
+        state.notebookConfigs = candNotebookConfigs;
+      }
+      if ((sharedSelChanged || preMigratedGlobal) && has('config')) {
+        state.storedGlobal = candStoredGlobal;
+        state.config = candConfig;
+        state.savedConfig = candSavedConfig;
+      }
+      if (resChanged && has('notebook_results')) {
+        state.notebookResults = migratedRes;
+      }
+      if (confsChanged && has('pending_confirms')) {
+        state.pendingConfirms = migratedConfs;
+        state.savedPendingConfirms = { ...migratedConfs };
+        state.pendingConfirm = getPendingConfirm();
+      }
+      if (connChanged && has('conn_states')) {
+        state.connStates = migratedConn;
+      }
+      if (noticesChanged && has('pending_notices')) {
+        state.pendingNotices = migratedNotices;
+      }
+      if (syncMetaChanged && has('sync_meta')) {
+        state.syncMeta = nextMeta;
+      }
+      if (idMapDirty && idMapPayload && has(NOTEBOOK_ID_MAP_KEY)) {
+        state.notebookIdMap = { by_id: { ...idMapPayload.by_id }, by_path: { ...idMapPayload.by_path } };
+        state.blockedLegacyIds = new Set(idMapPayload.blocked_legacy_ids);
+      }
+    };
+
+    if (persist && Object.keys(dirty).length > 0) {
+      if (state.supportsSystem) {
+        try {
+          storageSetMany(rpc, dirty);
+          commitInMemory();
+        } catch (_err) {
+          // Do not discard or corrupt in-memory baselines if atomic storage write fails.
+          return false;
+        }
+      } else {
+        // Persist ID map and sync baselines before auxiliary config/state keys.
+        const order = [NOTEBOOK_ID_MAP_KEY, 'sync_meta', 'notebook_configs', 'config', 'notebook_results', 'pending_confirms', 'conn_states', 'pending_notices'];
+        const written = new Set();
+        try {
+          for (const k of order) {
+            if (Object.hasOwn(dirty, k)) {
+              storageSet(rpc, k, dirty[k]);
+              written.add(k);
+            }
+          }
+          commitInMemory(written);
+        } catch (_err) {
+          commitInMemory(written);
+          return false;
+        }
+      }
+    } else if (!persist) {
+      commitInMemory();
+    }
+    return true;
   };
 
   const resultKey = () => {
@@ -1299,28 +1443,52 @@ export function createConfigStore({
     const entries = [];
     const seen = new Set();
     const activeNorm = normAbsPath(state.notebookRoot, state.homeDir);
+    const byPathMap = (state.notebookIdMap && state.notebookIdMap.by_path) || {};
 
-    const addEntry = (pathRaw, nameRaw = '', active = false, idRaw = '') => {
+    const addEntry = (pathRaw, nameRaw = '', active = false, idRaw = '', prevRaw = [], allowReverseLookup = false) => {
       const norm = normAbsPath(pathRaw, state.homeDir);
       if (!norm || seen.has(norm)) return;
       seen.add(norm);
       const label = String(nameRaw || '').trim() || posixBasename(norm) || norm;
-      const id = String(idRaw || '').trim();
-      const entry = { path: norm, name: label, active: Boolean(active) };
+      let id = String(idRaw || '').trim();
+      if (!id && allowReverseLookup && typeof byPathMap[norm] === 'string' && byPathMap[norm]) {
+        id = String(byPathMap[norm]).trim();
+      }
+      const prevPaths = [];
+      const seenPrev = new Set();
+      if (Array.isArray(prevRaw)) {
+        for (const p of prevRaw) {
+          const np = normAbsPath(p, state.homeDir);
+          if (np && np !== norm && !seenPrev.has(np)) {
+            seenPrev.add(np);
+            prevPaths.push(np);
+          }
+        }
+      }
+      const entry = { path: norm, name: label, active: Boolean(active), previous_paths: prevPaths };
       if (id) entry.id = id;
       entries.push(entry);
     };
 
     let hostListed = false;
+    let hostProvidedIDs = false;
     if (state.supportsMultiNotebook) {
       try {
         const res = getRpc()('host.notebooks.list', {});
         if (res && Array.isArray(res.notebooks)) {
           hostListed = true;
+          hostProvidedIDs = res.notebooks.some((item) => item && typeof item === 'object' && String(item.id || '').trim() !== '');
           for (const item of res.notebooks) {
             if (item && typeof item === 'object') {
               const p = item.path;
-              addEntry(p, item.name, Boolean(item.active) || (Boolean(activeNorm) && normAbsPath(p, state.homeDir) === activeNorm), item.id);
+              addEntry(
+                p,
+                item.name,
+                Boolean(item.active) || (Boolean(activeNorm) && normAbsPath(p, state.homeDir) === activeNorm),
+                item.id,
+                item.previous_paths,
+                !hostProvidedIDs
+              );
             }
           }
         }
@@ -1328,19 +1496,27 @@ export function createConfigStore({
         // Fallback to cached notebooks.
       }
     }
+    state.hostSupportsNotebookIds = hostProvidedIDs;
 
     if (!hostListed) {
       for (const existing of state.knownNotebooks) {
         if (existing && typeof existing === 'object') {
-          addEntry(existing.path, existing.name, Boolean(activeNorm) && normAbsPath(existing.path, state.homeDir) === activeNorm, existing.id);
+          addEntry(
+            existing.path,
+            existing.name,
+            Boolean(activeNorm) && normAbsPath(existing.path, state.homeDir) === activeNorm,
+            existing.id,
+            existing.previous_paths,
+            true
+          );
         } else if (typeof existing === 'string') {
-          addEntry(existing, '', Boolean(activeNorm) && normAbsPath(existing, state.homeDir) === activeNorm);
+          addEntry(existing, '', Boolean(activeNorm) && normAbsPath(existing, state.homeDir) === activeNorm, '', [], true);
         }
       }
     }
 
     if (activeNorm) {
-      addEntry(activeNorm, posixBasename(activeNorm) || activeNorm, true);
+      addEntry(activeNorm, posixBasename(activeNorm) || activeNorm, true, '', [], !hostProvidedIDs);
     }
     state.knownNotebooks = entries;
     return entries;
@@ -1370,14 +1546,65 @@ export function createConfigStore({
 
   const loadState = () => {
     const rpc = getRpc();
+    const idMapRes = storageGet(rpc, NOTEBOOK_ID_MAP_KEY);
+    const rawMap = idMapRes.found && idMapRes.value && typeof idMapRes.value === 'object' && !Array.isArray(idMapRes.value)
+      ? idMapRes.value
+      : null;
+    state.notebookIdMap = {
+      by_id: rawMap && rawMap.by_id && typeof rawMap.by_id === 'object' ? { ...rawMap.by_id } : {},
+      by_path: rawMap && rawMap.by_path && typeof rawMap.by_path === 'object' ? { ...rawMap.by_path } : {},
+    };
+    state.blockedLegacyIds = new Set(
+      rawMap && Array.isArray(rawMap.blocked_legacy_ids)
+        ? rawMap.blocked_legacy_ids.map((x) => String(x || '').trim()).filter(Boolean)
+        : []
+    );
+
     refreshKnownNotebooks();
-    const aliasMap = new Map();
+
+    const activePathToId = new Map();
     for (const kn of state.knownNotebooks) {
-      if (kn && kn.id && kn.path && kn.path !== kn.id) {
+      if (kn && kn.path && kn.id) activePathToId.set(kn.path, kn.id);
+    }
+
+    const aliasMap = new Map();
+    const nextBlockedLegacyIds = new Set(state.blockedLegacyIds);
+    const nextIdMap = {
+      by_id: { ...(state.notebookIdMap.by_id || {}) },
+      by_path: { ...(state.notebookIdMap.by_path || {}) },
+    };
+
+    for (const kn of state.knownNotebooks) {
+      if (!kn || !kn.id || !kn.path || kn.path === kn.id) continue;
+      const recordedOwner = nextIdMap.by_path[kn.path];
+      const replacedPriorOwner = Boolean(state.hostSupportsNotebookIds && recordedOwner && recordedOwner !== kn.id);
+      if (replacedPriorOwner) {
+        // Same-name new directory replaced an earlier notebook at kn.path: never migrate
+        // old path keys or allow legacy baseline fallback onto kn.id.
+        nextBlockedLegacyIds.add(kn.id);
+      } else if (!recordedOwner || recordedOwner === kn.id) {
         aliasMap.set(kn.path, kn.id);
       }
+      if (Array.isArray(kn.previous_paths)) {
+        for (const prevPath of kn.previous_paths) {
+          if (!prevPath || prevPath === kn.path || prevPath === kn.id) continue;
+          const activeOwner = activePathToId.get(prevPath);
+          if (activeOwner && activeOwner !== kn.id) continue;
+          const mapOwner = nextIdMap.by_path[prevPath];
+          if (mapOwner && mapOwner !== kn.id) continue;
+          aliasMap.set(prevPath, kn.id);
+        }
+      }
+      if (state.hostSupportsNotebookIds) {
+        const oldPathForId = nextIdMap.by_id[kn.id];
+        if (oldPathForId && oldPathForId !== kn.path && nextIdMap.by_path[oldPathForId] === kn.id) {
+          delete nextIdMap.by_path[oldPathForId];
+        }
+        nextIdMap.by_id[kn.id] = kn.path;
+        nextIdMap.by_path[kn.path] = kn.id;
+      }
     }
-    const key = nbKey();
+
     const opts = normOpts();
 
     let preMigratedNbConfigs = false;
@@ -1386,14 +1613,12 @@ export function createConfigStore({
       state.notebookConfigs = {};
       for (const [k, v] of Object.entries(nbCfgsRes.value)) {
         if (v && typeof v === 'object' && !Array.isArray(v)) {
-          const decodedKey = aliasMap.get(String(k)) || String(k);
-          if (decodedKey !== String(k)) preMigratedNbConfigs = true;
+          const rawKey = String(k);
+          if (aliasMap.has(rawKey)) preMigratedNbConfigs = true;
           if (Array.isArray(v.selected_notebooks) && v.selected_notebooks.some((x) => aliasMap.has(normAbsPath(x, state.homeDir)))) {
             preMigratedNbConfigs = true;
           }
-          if (!Object.hasOwn(state.notebookConfigs, decodedKey) || decodedKey === String(k)) {
-            state.notebookConfigs[decodedKey] = loadConfigRecord(decodeConfigSelected(v), opts);
-          }
+          state.notebookConfigs[rawKey] = loadConfigRecord(decodeConfigSelected(v), opts);
         }
       }
     } else {
@@ -1410,34 +1635,6 @@ export function createConfigStore({
     state.storedGlobal = rawCfg !== null ? loadConfigRecord(decodeConfigSelected(rawCfg), opts) : null;
     if (state.storedGlobal && !Object.hasOwn(rawCfg, 'selected_notebooks')) {
       delete state.storedGlobal.selected_notebooks;
-    }
-
-    if (!state.supportsMultiNotebook) {
-      if (Object.hasOwn(state.notebookConfigs, key)) {
-        state.config = { ...state.notebookConfigs[key] };
-      } else if (rawCfg !== null && (!Array.isArray(rawCfg.selected_notebooks) || rawCfg.selected_notebooks.length === 0)) {
-        state.config = { ...state.storedGlobal };
-      } else {
-        state.config = cloneDefaultConfig();
-      }
-      if (state.notebookRoot) {
-        state.config.selected_notebooks = [normAbsPath(state.notebookRoot, state.homeDir)];
-      }
-    } else if (rawCfg !== null && Object.hasOwn(rawCfg, 'selected_notebooks')) {
-      state.config = { ...state.storedGlobal };
-    } else if (Object.hasOwn(state.notebookConfigs, key)) {
-      state.config = { ...state.notebookConfigs[key] };
-      if (state.notebookRoot) {
-        state.config.selected_notebooks = [normAbsPath(state.notebookRoot, state.homeDir)];
-      }
-    } else if (rawCfg !== null) {
-      state.config = { ...state.storedGlobal };
-      state.config.selected_notebooks = state.notebookRoot ? [normAbsPath(state.notebookRoot, state.homeDir)] : [];
-    } else {
-      state.config = cloneDefaultConfig();
-      if (state.notebookRoot) {
-        state.config.selected_notebooks = [normAbsPath(state.notebookRoot, state.homeDir)];
-      }
     }
 
     const nbRes = storageGet(rpc, 'notebook_results');
@@ -1481,9 +1678,6 @@ export function createConfigStore({
         state.pendingConfirms[legacyPc.scope_key] = legacyPc;
       }
     }
-    state.pendingConfirm = getPendingConfirm();
-    state.savedPendingConfirms = { ...state.pendingConfirms };
-    state.savedConfig = { ...state.config };
 
     const connRes = storageGet(rpc, 'conn_states');
     state.connStates = connRes.found && connRes.value && typeof connRes.value === 'object' && !Array.isArray(connRes.value)
@@ -1504,9 +1698,55 @@ export function createConfigStore({
         state.credentialCleanup = new Set();
       }
     }
-    if (aliasMap.size > 0) {
-      applyAliasMigrations(aliasMap, { persist: true, preMigratedNbConfigs, preMigratedGlobal });
+
+    if (aliasMap.size > 0 || state.hostSupportsNotebookIds) {
+      applyAliasMigrations(aliasMap, {
+        persist: true,
+        preMigratedNbConfigs,
+        preMigratedGlobal,
+        nextIdMap,
+        nextBlockedLegacyIds,
+      });
     }
+
+    const key = nbKey();
+    const activeNorm = normAbsPath(state.notebookRoot, state.homeDir);
+    const activeNbRecord =
+      (Object.hasOwn(state.notebookConfigs, key) && state.notebookConfigs[key]) ||
+      (activeNorm && !state.blockedLegacyIds.has(key) && Object.hasOwn(state.notebookConfigs, activeNorm) && state.notebookConfigs[activeNorm]) ||
+      null;
+
+    if (!state.supportsMultiNotebook) {
+      if (activeNbRecord) {
+        state.config = { ...activeNbRecord };
+      } else if (rawCfg !== null && (!Array.isArray(rawCfg.selected_notebooks) || rawCfg.selected_notebooks.length === 0)) {
+        state.config = { ...state.storedGlobal };
+      } else {
+        state.config = cloneDefaultConfig();
+      }
+      if (state.notebookRoot) {
+        state.config.selected_notebooks = [activeNorm];
+      }
+    } else if (rawCfg !== null && Object.hasOwn(rawCfg, 'selected_notebooks')) {
+      state.config = { ...state.storedGlobal };
+    } else if (activeNbRecord) {
+      state.config = { ...activeNbRecord };
+      if (state.notebookRoot) {
+        state.config.selected_notebooks = [activeNorm];
+      }
+    } else if (rawCfg !== null) {
+      state.config = { ...state.storedGlobal };
+      state.config.selected_notebooks = state.notebookRoot ? [activeNorm] : [];
+    } else {
+      state.config = cloneDefaultConfig();
+      if (state.notebookRoot) {
+        state.config.selected_notebooks = [activeNorm];
+      }
+    }
+
+    state.pendingConfirm = getPendingConfirm();
+    state.savedPendingConfirms = { ...state.pendingConfirms };
+    state.savedConfig = { ...state.config };
     return state;
   };
 
@@ -1847,16 +2087,58 @@ export function createConfigStore({
     return null;
   };
 
+  const allowLegacyFallback = (targetNbKey, protocol = '', legacyCandidates = []) => {
+    const nb = String(targetNbKey || '').trim();
+    if (!nb) return false;
+    if (state.blockedLegacyIds.has(nb)) return false;
+    const kn = state.knownNotebooks.find((item) => item && (item.id === nb || item.path === nb));
+    const knPath = kn ? kn.path : '';
+    if (knPath && state.notebookIdMap && state.notebookIdMap.by_path) {
+      const prevOwner = state.notebookIdMap.by_path[knPath];
+      if (prevOwner && prevOwner !== nb) return false;
+    }
+    const candidates = Array.isArray(legacyCandidates) ? legacyCandidates.filter(Boolean) : [];
+    const targetMatch = (parsed) => {
+      if (!parsed || !parsed.protocol || !parsed.target) return true;
+      if (candidates.length === 0) return !protocol || parsed.protocol === protocol;
+      const full = `${parsed.protocol}:${parsed.target}`;
+      return candidates.some((lk) => full === lk || full.startsWith(`${lk}::`));
+    };
+    for (const [mk, entry] of Object.entries(state.syncMeta || {})) {
+      if (mk === LAYOUTS_META_KEY || mk === TOMBSTONES_META_KEY || mk === INITIALIZED_META_KEY) continue;
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry) || Object.keys(entry).length === 0) continue;
+      const parsed = parseNbMetaKey(mk);
+      if (parsed && parsed.nb && parsed.nb !== nb && (!protocol || parsed.protocol === protocol) && targetMatch(parsed)) {
+        return false;
+      }
+    }
+    const initMap = state.syncMeta && state.syncMeta[INITIALIZED_META_KEY];
+    if (initMap && typeof initMap === 'object' && !Array.isArray(initMap)) {
+      for (const [ik, iv] of Object.entries(initMap)) {
+        if (!iv) continue;
+        const parsed = parseNbMetaKey(ik);
+        if (parsed && parsed.nb && parsed.nb !== nb && (!protocol || parsed.protocol === protocol) && targetMatch(parsed)) {
+          return false;
+        }
+      }
+    }
+    return true;
+  };
+
   const lookupOtherProtocolHash = (targetNbKey, itemKey, targetHash, excludeMetaKey = null) => {
     if (!targetNbKey || !itemKey || !targetHash) return null;
-    const nbPrefix = `nb:${targetNbKey}|`;
     const isDefaultNb = targetNbKey === normAbsPath(state.notebookRoot, state.homeDir) || targetNbKey === 'default';
     for (const [mk, entry] of Object.entries(state.syncMeta)) {
       if (mk === LAYOUTS_META_KEY || mk === INITIALIZED_META_KEY || mk === TOMBSTONES_META_KEY || mk === excludeMetaKey) {
         continue;
       }
       if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
-      if (!(mk.startsWith(nbPrefix) || (!mk.startsWith('nb:') && isDefaultNb))) continue;
+      const parsed = parseNbMetaKey(mk);
+      if (parsed) {
+        if (parsed.nb !== targetNbKey) continue;
+      } else if (!(isDefaultNb && allowLegacyFallback(targetNbKey, '', [mk]))) {
+        continue;
+      }
       const val = entry[itemKey];
       if (typeof val === 'string' && val === targetHash) {
         return val;
@@ -1875,6 +2157,7 @@ export function createConfigStore({
     notebookKey: nbKey,
     notebookLabel: (root = null) => notebookLabel(pathForKeyOrPath(root !== undefined && root !== null ? root : state.notebookRoot), state.locale, state.notebookRoot, state.homeDir),
     notebookSlug: (root = null) => notebookSlug(pathForKeyOrPath(root !== undefined && root !== null ? root : state.notebookRoot), getRpc(), state.notebookRoot, state.homeDir),
+    allowLegacyFallback,
     onNotebookRenamed: (params = {}) => {
       const id = String((params && params.id) || '').trim();
       const oldPath = normAbsPath((params && params.old_path) || '', state.homeDir);
@@ -1886,10 +2169,26 @@ export function createConfigStore({
       refreshKnownNotebooks();
       if (newPath && !state.knownNotebooks.some((kn) => kn && kn.path === newPath)) {
         const nextList = state.knownNotebooks.filter((kn) => !(kn && ((id && kn.id === id) || (oldPath && kn.path === oldPath))));
-        const entry = { path: newPath, name: posixBasename(newPath) || newPath, active: state.notebookRoot === newPath };
+        const prev = oldPath && oldPath !== newPath ? [oldPath] : [];
+        const entry = { path: newPath, name: posixBasename(newPath) || newPath, active: state.notebookRoot === newPath, previous_paths: prev };
         if (id) entry.id = id;
         nextList.push(entry);
         state.knownNotebooks = nextList;
+      }
+      const nextIdMap = {
+        by_id: { ...(state.notebookIdMap.by_id || {}) },
+        by_path: { ...(state.notebookIdMap.by_path || {}) },
+      };
+      if (id && newPath) {
+        const prevRecorded = nextIdMap.by_id[id];
+        if (prevRecorded && prevRecorded !== newPath && nextIdMap.by_path[prevRecorded] === id) {
+          delete nextIdMap.by_path[prevRecorded];
+        }
+        if (oldPath && nextIdMap.by_path[oldPath] === id) {
+          delete nextIdMap.by_path[oldPath];
+        }
+        nextIdMap.by_id[id] = newPath;
+        nextIdMap.by_path[newPath] = id;
       }
       const renameAliases = new Map();
       const targetKey = id || newPath;
@@ -1899,8 +2198,8 @@ export function createConfigStore({
       if (newPath && id && newPath !== id) {
         renameAliases.set(newPath, id);
       }
-      if (renameAliases.size > 0 || (oldPath && newPath && oldPath !== newPath)) {
-        applyAliasMigrations(renameAliases, { oldPath, newPath, persist: true });
+      if (renameAliases.size > 0 || (oldPath && newPath && oldPath !== newPath) || (id && newPath)) {
+        applyAliasMigrations(renameAliases, { oldPath, newPath, persist: true, nextIdMap });
       }
       return { id, oldPath, newPath, activeRenamed };
     },

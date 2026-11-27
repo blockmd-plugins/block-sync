@@ -2458,11 +2458,16 @@ export function createWebDAVSyncEngine({
 
     localNotes = Object.fromEntries(Object.entries(localNotes).filter(([path]) => skips.check(path)));
     remoteNotes = Object.fromEntries(Object.entries(remoteNotes).filter(([path]) => skips.check(path)));
-    const baseMap = configStore ? configStore.getBaseMap(metaKey, legacyKey) : {};
+    const allowLegacy =
+      Boolean(legacyKey) &&
+      (!(configStore && typeof configStore.allowLegacyFallback === 'function') ||
+        configStore.allowLegacyFallback(nbKeyVal, 'webdav', [legacyKey]));
+    const effectiveLegacyKey = allowLegacy ? legacyKey : null;
+    const baseMap = configStore ? configStore.getBaseMap(metaKey, effectiveLegacyKey) : {};
     const initMap = (configStore && configStore.state.syncMeta[INITIALIZED_META_KEY]) || {};
     const hasMeta = Boolean(
       Object.keys(baseMap).length > 0 ||
-      (initMap && (initMap[metaKey] || (legacyKey && initMap[legacyKey])))
+      (initMap && (initMap[metaKey] || (effectiveLegacyKey && initMap[effectiveLegacyKey])))
     );
     const isFirstSync = !hasMeta;
 

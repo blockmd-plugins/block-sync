@@ -42,6 +42,7 @@ import {
   LAYOUTS_META_KEY,
   INITIALIZED_META_KEY,
   TOMBSTONES_META_KEY,
+  parseNbMetaKey,
   storageGet,
   storageSet,
   cfgForProtocol,
@@ -2098,8 +2099,15 @@ function createSyncController() {
 
   const recordDeletedEventTombstones = (nbKey, localDir, relPath, folder) => {
     if (!nbKey || (!folder && !relPath)) return false;
-    const nbPrefix = `nb:${nbKey}|`;
     const defaultNb = nbKey === configStore.notebookKey();
+    const matchesTargetNb = (mk) => {
+      const parsed = parseNbMetaKey(mk);
+      if (parsed) return parsed.nb === nbKey;
+      if (!mk.startsWith('nb:')) {
+        return defaultNb && configStore.allowLegacyFallback(nbKey, '', [mk]);
+      }
+      return false;
+    };
     let dirOk = false;
     if (localDir) {
       try {
@@ -2133,7 +2141,7 @@ function createSyncController() {
         ) {
           continue;
         }
-        if (!(mk.startsWith(nbPrefix) || (!mk.startsWith('nb:') && defaultNb))) continue;
+        if (!matchesTargetNb(mk)) continue;
         for (const [itemKey, itemHash] of Object.entries(entry)) {
           if (typeof itemHash !== 'string' || !itemHash) continue;
           const [, itemRel] = splitItemKey(itemKey);
@@ -2162,7 +2170,7 @@ function createSyncController() {
       ) {
         continue;
       }
-      if (!(mk.startsWith(nbPrefix) || (!mk.startsWith('nb:') && defaultNb))) continue;
+      if (!matchesTargetNb(mk)) continue;
       for (const [itemKey, itemHash] of Object.entries(entry)) {
         if (typeof itemHash !== 'string' || !itemHash) continue;
         const [, itemRel] = splitItemKey(itemKey);
@@ -2182,9 +2190,13 @@ function createSyncController() {
   const runInitialMaintenance = () => {
     if (!configStore) return;
     try {
-      const nbs = configStore.state.knownNotebooks.map((nb) => nb.path).filter(Boolean);
-      for (const nbPath of nbs) {
-        migrateLegacyRecoveryDirs(callHost, nbPath, { dataDir });
+      const known = configStore.state.knownNotebooks.filter((nb) => nb && nb.path);
+      const nbs = known.map((nb) => nb.path);
+      for (const kn of known) {
+        migrateLegacyRecoveryDirs(callHost, kn.path, {
+          dataDir,
+          extraHashRoots: Array.isArray(kn.previous_paths) ? kn.previous_paths : [],
+        });
       }
       cleanupRecoveryDirs(callHost, { dataDir, notebooks: nbs });
     } catch (_err) {
