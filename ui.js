@@ -634,6 +634,21 @@ function protocolEnableSwitch(protocol, config, locale) {
   };
 }
 
+// Drop a protocol's config fields, progress and actions while its enable switch is off.
+// The host re-renders on every switch change, so this takes effect immediately.
+function hideDisabledProtocolItems(items, cfg, protocol) {
+  const enableKeys = Object.values(PROTOCOL_ENABLED_KEYS);
+  return items.filter((it) => {
+    const cond = it.visible_when;
+    if (!cond) return true;
+    if (cond.control_id === 'git_auth') return protocolEnabled(cfg, 'git');
+    if (cond.control_id !== 'protocol') return true;
+    if (it.kind === 'switch' && enableKeys.includes(it.id)) return true;
+    if (Array.isArray(cond.in) && cond.in.length > 0) return protocolEnabled(cfg, protocol);
+    return protocolEnabled(cfg, cond.equals);
+  });
+}
+
 function conflictPolicyItem(cfg, locale) {
   return {
     kind: 'segmented',
@@ -994,7 +1009,11 @@ function buildLegacyCards(ctx, c) {
     targetItems.push(notificationSwitch(c, locale));
   }
 
-  return [{ id: 'target-card', title: tr(locale, '同步设置', 'Sync Settings'), items: targetItems }];
+  return [{
+    id: 'target-card',
+    title: tr(locale, '同步设置', 'Sync Settings'),
+    items: hideDisabledProtocolItems(targetItems, c, protocol),
+  }];
 }
 
 export function buildSettingsPage(ctx, cfg = null) {
@@ -1234,7 +1253,7 @@ export function buildSettingsPage(ctx, cfg = null) {
     const targetCard = {
       id: 'target-card',
       title: tr(locale, '同步目标', 'Sync Destination'),
-      items: targetItems,
+      items: hideDisabledProtocolItems(targetItems, c, protocol),
     };
     if (targetMeta) targetCard.meta = targetMeta;
 
