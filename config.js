@@ -1036,6 +1036,7 @@ export function createConfigStore({
     blockedLegacyIds: new Set(),
     hostSupportsNotebookIds: false,
     pendingMigration: null,
+    pendingMigrations: new Map(),
   };
 
   const normOpts = () => ({
@@ -1296,6 +1297,46 @@ export function createConfigStore({
     return { merged, mergedTs };
   };
 
+  const syncLegacyPendingSummary = () => {
+    const it = state.pendingMigrations.values().next();
+    state.pendingMigration = it && !it.done ? it.value : null;
+  };
+
+  const clearPendingMigrationsFor = (migrationKey = '', ownerKeys = null) => {
+    const key = String(migrationKey || '').trim();
+    if (key) {
+      state.pendingMigrations.delete(key);
+    }
+    const owned = ownerKeys instanceof Set ? ownerKeys : null;
+    if (owned && owned.size > 0) {
+      for (const [mKey, pm] of [...state.pendingMigrations.entries()]) {
+        if (owned.has(mKey)) {
+          state.pendingMigrations.delete(mKey);
+          continue;
+        }
+        if (pm && mKey === '__load__' && pm.affectedNbKeys instanceof Set) {
+          let remaining = false;
+          for (const ak of pm.affectedNbKeys) {
+            if (!owned.has(ak)) {
+              remaining = true;
+              break;
+            }
+          }
+          if (!remaining) {
+            state.pendingMigrations.delete(mKey);
+          } else {
+            for (const ak of owned) {
+              pm.affectedNbKeys.delete(ak);
+              if (pm.aliasMap instanceof Map) pm.aliasMap.delete(ak);
+              if (pm.baselineAliasMap instanceof Map) pm.baselineAliasMap.delete(ak);
+            }
+          }
+        }
+      }
+    }
+    syncLegacyPendingSummary();
+  };
+
   const applyAliasMigrations = (
     aliasMap,
     {
@@ -1307,6 +1348,7 @@ export function createConfigStore({
       preMigratedGlobal = false,
       nextIdMap = null,
       nextBlockedLegacyIds = null,
+      migrationKey = '',
     } = {}
   ) => {
     const rpc = getRpc();
@@ -1332,7 +1374,8 @@ export function createConfigStore({
       return affected;
     };
     const recordPending = () => {
-      const prev = state.pendingMigration;
+      const mKey = String(migrationKey || '').trim() || '__global__';
+      const prev = state.pendingMigrations.get(mKey) || null;
       const mergedUi = new Map(prev ? prev.aliasMap : []);
       for (const [k, v] of uiAlias.entries()) mergedUi.set(k, v);
       const mergedBase = new Map(prev ? prev.baselineAliasMap : []);
@@ -1351,7 +1394,7 @@ export function createConfigStore({
         ...(prev && prev.affectedNbKeys ? prev.affectedNbKeys : []),
         ...collectAffectedKeys(),
       ]);
-      state.pendingMigration = {
+      state.pendingMigrations.set(mKey, {
         aliasMap: mergedUi,
         baselineAliasMap: mergedBase,
         oldPath: oldPath || (prev ? prev.oldPath : ''),
@@ -1361,7 +1404,8 @@ export function createConfigStore({
         nextIdMap: mergedIdMap,
         nextBlockedLegacyIds: mergedBlocked,
         affectedNbKeys: mergedAffected,
-      };
+      });
+      syncLegacyPendingSummary();
     };
 
     const ensureSelectedPathReplaced = (cfg) => {
@@ -2189,6 +2233,15 @@ export function createConfigStore({
     );
 
     if (aliasMap.size > 0 || baselineAliasMap.size > 0 || state.hostSupportsNotebookIds) {
+      const loadKeys = new Set();
+      for (const [k, v] of aliasMap.entries()) {
+        if (k) loadKeys.add(k);
+        if (v) loadKeys.add(v);
+      }
+      for (const [k, v] of baselineAliasMap.entries()) {
+        if (k) loadKeys.add(k);
+        if (v) loadKeys.add(v);
+      }
       const ok = applyAliasMigrations(aliasMap, {
         baselineAliasMap,
         persist: true,
@@ -2196,8 +2249,9 @@ export function createConfigStore({
         preMigratedGlobal,
         nextIdMap,
         nextBlockedLegacyIds,
+        migrationKey: '__load__',
       });
-      if (ok) state.pendingMigration = null;
+      if (ok) clearPendingMigrationsFor('__load__', loadKeys);
     }
 
     const key = nbKey();
@@ -2382,15 +2436,55 @@ export function createConfigStore({
       nbRoot = '',
       tsNow = Date.now(),
       markInitialized = true,
+      partial = false,
+      deletedKeys = [],
     } = {}
   ) => {
     const mk = String(targetMetaKey || '').trim();
     const rootIdent = String(rootIdentity || '').trim();
-    if (!mk || verified !== true || !rootIdent) return false;
+    if (!mk) return false;
     const prevBase =
       state.syncMeta[mk] && typeof state.syncMeta[mk] === 'object' && !Array.isArray(state.syncMeta[mk])
         ? state.syncMeta[mk]
         : {};
+    if (partial) {
+      if (verified !== true) return false;
+      const merged = { ...prevBase };
+      const patch = nextBaseMap && typeof nextBaseMap === 'object' && !Array.isArray(nextBaseMap) ? nextBaseMap : {};
+      for (const [k, v] of Object.entries(patch)) {
+        if (typeof v === 'string' && v) {
+          merged[k] = v;
+        }
+      }
+      for (const dk of Array.isArray(deletedKeys) ? deletedKeys : []) {
+        delete merged[dk];
+      }
+      state.syncMeta[mk] = merged;
+
+      const allTs =
+        state.syncMeta[BASE_TIMESTAMPS_META_KEY] &&
+        typeof state.syncMeta[BASE_TIMESTAMPS_META_KEY] === 'object' &&
+        !Array.isArray(state.syncMeta[BASE_TIMESTAMPS_META_KEY])
+          ? { ...state.syncMeta[BASE_TIMESTAMPS_META_KEY] }
+          : {};
+      const prevKeyTs = allTs[mk] && typeof allTs[mk] === 'object' && !Array.isArray(allTs[mk]) ? allTs[mk] : {};
+      const nextKeyTs = {};
+      const nowVal = Number.isFinite(Number(tsNow)) && Number(tsNow) > 0 ? Number(tsNow) : Date.now();
+      for (const [itemK, itemH] of Object.entries(merged)) {
+        if (typeof itemH !== 'string' || !itemH) continue;
+        if (prevBase[itemK] === itemH && Number.isFinite(Number(prevKeyTs[itemK])) && Number(prevKeyTs[itemK]) > 0) {
+          nextKeyTs[itemK] = Number(prevKeyTs[itemK]);
+        } else {
+          nextKeyTs[itemK] = nowVal;
+        }
+      }
+      allTs[mk] = nextKeyTs;
+      state.syncMeta[BASE_TIMESTAMPS_META_KEY] = allTs;
+      // Preserve any older rootless baseline untouched until a full sync verifies everything.
+      return true;
+    }
+
+    if (verified !== true || !rootIdent) return false;
     const cleanBase = nextBaseMap && typeof nextBaseMap === 'object' && !Array.isArray(nextBaseMap) ? { ...nextBaseMap } : {};
     state.syncMeta[mk] = cleanBase;
 
@@ -2453,41 +2547,49 @@ export function createConfigStore({
   };
 
   const hasPendingMigration = (nbRootOrKey = null) => {
-    const pm = state.pendingMigration;
-    if (!pm) return false;
+    if (!(state.pendingMigrations instanceof Map) || state.pendingMigrations.size === 0) return false;
     if (nbRootOrKey === null || nbRootOrKey === undefined || nbRootOrKey === '') return true;
-    const affected = pm.affectedNbKeys;
-    if (!(affected instanceof Set) || affected.size === 0) return true;
     const clean = String(nbRootOrKey || '').trim();
     if (clean === '__multi__' || clean === 'default') return true;
     const norm = normAbsPath(clean, state.homeDir);
     const idVal = norm ? idForPath(norm) : '';
-    return affected.has(clean) || (norm && affected.has(norm)) || (idVal && affected.has(idVal));
+    for (const pm of state.pendingMigrations.values()) {
+      const affected = pm && pm.affectedNbKeys;
+      if (!(affected instanceof Set) || affected.size === 0) return true;
+      if (affected.has(clean) || (norm && affected.has(norm)) || (idVal && affected.has(idVal))) {
+        return true;
+      }
+    }
+    return false;
   };
 
   const retryPendingMigrations = () => {
-    const pm = state.pendingMigration;
-    if (!pm) return true;
+    if (!(state.pendingMigrations instanceof Map) || state.pendingMigrations.size === 0) return true;
     refreshKnownNotebooks();
-    const mergedBlocked = new Set([
-      ...(state.blockedLegacyIds || []),
-      ...(pm.nextBlockedLegacyIds || []),
-    ]);
-    const ok = applyAliasMigrations(pm.aliasMap, {
-      baselineAliasMap: pm.baselineAliasMap,
-      oldPath: pm.oldPath,
-      newPath: pm.newPath,
-      persist: true,
-      preMigratedNbConfigs: pm.preMigratedNbConfigs,
-      preMigratedGlobal: pm.preMigratedGlobal,
-      nextIdMap: pm.nextIdMap,
-      nextBlockedLegacyIds: mergedBlocked,
-    });
-    if (ok) {
-      state.pendingMigration = null;
-      return true;
+    let allOk = true;
+    for (const [mKey, pm] of [...state.pendingMigrations.entries()]) {
+      const mergedBlocked = new Set([
+        ...(state.blockedLegacyIds || []),
+        ...(pm.nextBlockedLegacyIds || []),
+      ]);
+      const ok = applyAliasMigrations(pm.aliasMap, {
+        baselineAliasMap: pm.baselineAliasMap,
+        oldPath: pm.oldPath,
+        newPath: pm.newPath,
+        persist: true,
+        preMigratedNbConfigs: pm.preMigratedNbConfigs,
+        preMigratedGlobal: pm.preMigratedGlobal,
+        nextIdMap: pm.nextIdMap,
+        nextBlockedLegacyIds: mergedBlocked,
+        migrationKey: mKey,
+      });
+      if (ok) {
+        clearPendingMigrationsFor(mKey, pm.affectedNbKeys);
+      } else {
+        allOk = false;
+      }
     }
-    return false;
+    return allOk && state.pendingMigrations.size === 0;
   };
 
   const commitSystemConfig = (notebooks, shared, current, { migrate = null, clearPending = false } = {}) => {
@@ -2965,6 +3067,13 @@ export function createConfigStore({
       const id = String((params && params.id) || '').trim();
       const oldPath = normAbsPath((params && params.old_path) || '', state.homeDir);
       const newPath = normAbsPath((params && params.new_path) || '', state.homeDir);
+      const prevKnownSnapshot = Array.isArray(state.knownNotebooks) ? [...state.knownNotebooks] : [];
+      const prevIdMapSnapshot = {
+        by_id: { ...((state.notebookIdMap && state.notebookIdMap.by_id) || {}) },
+        by_path: { ...((state.notebookIdMap && state.notebookIdMap.by_path) || {}) },
+        identities: { ...((state.notebookIdMap && state.notebookIdMap.identities) || {}) },
+        path_identities: { ...((state.notebookIdMap && state.notebookIdMap.path_identities) || {}) },
+      };
       const activeRenamed = Boolean(oldPath && state.notebookRoot === oldPath);
       if (activeRenamed && newPath) {
         state.notebookRoot = newPath;
@@ -2978,24 +3087,69 @@ export function createConfigStore({
         !Array.isArray(state.syncMeta[ROOT_IDENTITIES_META_KEY])
           ? state.syncMeta[ROOT_IDENTITIES_META_KEY]
           : {};
-      const recordedOldIds = [];
-      const addRec = (v) => {
-        const s = String(v || '').trim();
-        if (s && !recordedOldIds.includes(s)) recordedOldIds.push(s);
-      };
-      if (resolvedId) {
-        addRec(state.notebookIdMap && state.notebookIdMap.identities && state.notebookIdMap.identities[resolvedId]);
-        addRec(rawRootIds[resolvedId]);
-      }
-      if (oldPath) {
-        addRec(state.notebookIdMap && state.notebookIdMap.path_identities && state.notebookIdMap.path_identities[oldPath]);
-        addRec(rawRootIds[oldPath]);
-      }
       const liveVerified = Boolean(live.verified && live.rootIdentity && (!resolvedId || !live.id || live.id === resolvedId));
-      const rootMatchesOld = liveVerified && recordedOldIds.length > 0 && recordedOldIds.every((v) => v === live.rootIdentity);
-      const noConflictingOld = liveVerified && (recordedOldIds.length === 0 || rootMatchesOld);
 
       refreshKnownNotebooks();
+      const hostKnownSnapshot = Array.isArray(state.knownNotebooks) ? [...state.knownNotebooks] : [];
+      const combinedKnown = [...prevKnownSnapshot, ...hostKnownSnapshot];
+
+      // Check ownership and recorded dev:ino individually for each source key before
+      // updating state.knownNotebooks / state.notebookIdMap so foreign baselines cannot merge.
+      const checkSourceKey = (srcPath, { isOldPath = false } = {}) => {
+        if (!liveVerified || !srcPath) return { allowUI: false, allowBaseline: false };
+        const mapOwner = prevIdMapSnapshot.by_path[srcPath];
+        if (mapOwner && (!resolvedId || mapOwner !== resolvedId)) {
+          return { allowUI: false, allowBaseline: false };
+        }
+        const foreignKn = combinedKnown.some(
+          (kn) =>
+            kn &&
+            kn.id &&
+            (!resolvedId || kn.id !== resolvedId) &&
+            (kn.path === srcPath || (Array.isArray(kn.previous_paths) && kn.previous_paths.includes(srcPath)))
+        );
+        if (foreignKn) {
+          return { allowUI: false, allowBaseline: false };
+        }
+        if (!isOldPath) {
+          const idClaimed = Boolean(
+            resolvedId &&
+              (prevIdMapSnapshot.by_path[srcPath] === resolvedId ||
+                prevIdMapSnapshot.by_id[resolvedId] === srcPath ||
+                combinedKnown.some(
+                  (kn) =>
+                    kn &&
+                    kn.id === resolvedId &&
+                    (kn.path === srcPath || (Array.isArray(kn.previous_paths) && kn.previous_paths.includes(srcPath)))
+                ))
+          );
+          if (!idClaimed) {
+            return { allowUI: false, allowBaseline: false };
+          }
+        }
+        const recIds = [];
+        const addSrcRec = (v) => {
+          const s = String(v || '').trim();
+          if (s && !recIds.includes(s)) recIds.push(s);
+        };
+        addSrcRec(prevIdMapSnapshot.path_identities[srcPath]);
+        addSrcRec(rawRootIds[srcPath]);
+        if (isOldPath && resolvedId) {
+          addSrcRec(prevIdMapSnapshot.identities[resolvedId]);
+          addSrcRec(rawRootIds[resolvedId]);
+        }
+        if (recIds.some((v) => v !== live.rootIdentity)) {
+          return { allowUI: false, allowBaseline: false };
+        }
+        return {
+          allowUI: true,
+          allowBaseline: recIds.length > 0 && recIds.every((v) => v === live.rootIdentity),
+        };
+      };
+
+      const oldKeyCheck = checkSourceKey(oldPath, { isOldPath: true });
+      const newKeyCheck = checkSourceKey(newPath, { isOldPath: false });
+
       if (newPath && !state.knownNotebooks.some((kn) => kn && kn.path === newPath)) {
         const nextList = state.knownNotebooks.filter((kn) => !(kn && ((resolvedId && kn.id === resolvedId) || (oldPath && kn.path === oldPath))));
         const prev = oldPath && oldPath !== newPath ? [oldPath] : [];
@@ -3039,16 +3193,15 @@ export function createConfigStore({
       const renameAliases = new Map();
       const baselineRenameAliases = new Map();
       const targetKey = resolvedId || newPath;
-      if (noConflictingOld) {
-        if (oldPath && targetKey && oldPath !== targetKey) {
-          renameAliases.set(oldPath, targetKey);
-          if (rootMatchesOld) baselineRenameAliases.set(oldPath, targetKey);
-        }
-        if (newPath && resolvedId && newPath !== resolvedId) {
-          renameAliases.set(newPath, resolvedId);
-          if (rootMatchesOld) baselineRenameAliases.set(newPath, resolvedId);
-        }
+      if (oldPath && targetKey && oldPath !== targetKey && oldKeyCheck.allowUI) {
+        renameAliases.set(oldPath, targetKey);
+        if (oldKeyCheck.allowBaseline) baselineRenameAliases.set(oldPath, targetKey);
       }
+      if (newPath && resolvedId && newPath !== resolvedId && newKeyCheck.allowUI) {
+        renameAliases.set(newPath, resolvedId);
+        if (newKeyCheck.allowBaseline) baselineRenameAliases.set(newPath, resolvedId);
+      }
+      const migKey = resolvedId || newPath || oldPath;
       if (
         renameAliases.size > 0 ||
         baselineRenameAliases.size > 0 ||
@@ -3062,8 +3215,12 @@ export function createConfigStore({
           persist: true,
           nextIdMap,
           nextBlockedLegacyIds,
+          migrationKey: migKey,
         });
-        if (ok) state.pendingMigration = null;
+        if (ok) {
+          const ownedKeys = new Set([migKey, resolvedId, oldPath, newPath].filter(Boolean));
+          clearPendingMigrationsFor(migKey, ownedKeys);
+        }
       }
       return { id: resolvedId, oldPath, newPath, activeRenamed, verified: liveVerified };
     },

@@ -64,6 +64,8 @@ import {
   collectSkippedItems,
   checkSyncBufferSize,
   restoreSkippedBase,
+  pruneSkippedPatchEntries,
+  isNotebookRootMismatchError,
   checkMissingSyncPath,
 } from './utils.js';
 import {
@@ -91,6 +93,7 @@ import {
   snapshotHasCloudPlaceholder,
   isConfirmedAbsentOnRoot,
   verifyPlanLiveIdentity,
+  commitPlanBaseline,
 } from './local_mirror.js';
 
 // ============================================================================
@@ -1613,7 +1616,7 @@ export function createHostLocalAdapter({
     return notes;
   };
 
-  const writeNote = (relPath, content, { nbRoot = null, expectedRevision = '' } = {}) => {
+  const writeNote = (relPath, content, { nbRoot = null, expectedRevision = '', expectedRootIdentity = '' } = {}) => {
     const params = {
       path: relPath,
       content: String(content ?? ''),
@@ -1622,10 +1625,13 @@ export function createHostLocalAdapter({
     if (nbRoot && supportsMultiNotebook) {
       params.notebook_root = nbRoot;
     }
+    if (expectedRootIdentity) {
+      params.expected_root_identity = String(expectedRootIdentity);
+    }
     return getRpc()('host.notes.write', params);
   };
 
-  const trashFile = (relPath, revision, { nbRoot = null } = {}) => {
+  const trashFile = (relPath, revision, { nbRoot = null, expectedRootIdentity = '' } = {}) => {
     const params = {
       path: relPath,
       expected_revision: String(revision ?? ''),
@@ -1633,10 +1639,14 @@ export function createHostLocalAdapter({
     if (nbRoot && supportsMultiNotebook) {
       params.notebook_root = nbRoot;
     }
+    if (expectedRootIdentity) {
+      params.expected_root_identity = String(expectedRootIdentity);
+    }
     try {
       const res = getRpc()('host.notes.trash', params);
       return res && res.trashed ? 'deleted' : 'missing';
     } catch (exc) {
+      if (isNotebookRootMismatchError(exc)) return 'root_mismatch';
       const low = String(exc?.message || exc).toLowerCase();
       if (low.includes('unknown host method')) return 'unsupported';
       if (low.includes('note changed')) return 'changed';
@@ -1744,7 +1754,7 @@ export function createHostLocalAdapter({
     nbRoot,
     relPath,
     data,
-    { createOnly = false, expectedHash = null, copyFromPath = '', sourceHash = '', readFallback = null } = {}
+    { createOnly = false, expectedHash = null, expectedRootIdentity = '', copyFromPath = '', sourceHash = '', readFallback = null } = {}
   ) => {
     const rpc = getRpc();
     const cleanRoot = String(nbRoot || '').replace(/\\/g, '/').replace(/\/+$/, '');
@@ -1769,12 +1779,14 @@ export function createHostLocalAdapter({
         }
       }
       try {
-        const copyRes = rpc('host.fs.copy', {
+        const copyParams = {
           from: String(copyFromPath),
           to: fullPath,
           overwrite: !createOnly,
           mkdir_parents: true,
-        });
+        };
+        if (expectedRootIdentity) copyParams.expected_root_identity = String(expectedRootIdentity);
+        const copyRes = rpc('host.fs.copy', copyParams);
         if (sourceHash) {
           const postHash = hashSyncFile(fullPath, rpc, () => null);
           if (postHash !== null && postHash !== sourceHash) {
@@ -1802,12 +1814,14 @@ export function createHostLocalAdapter({
         }
       }
     }
-    return rpc('host.fs.write', {
+    const writeParams = {
       path: fullPath,
       content_base64: bytesToBase64(view),
       atomic: true,
       mkdir_parents: true,
-    });
+    };
+    if (expectedRootIdentity) writeParams.expected_root_identity = String(expectedRootIdentity);
+    return rpc('host.fs.write', writeParams);
   };
 
   return {
@@ -2768,6 +2782,7 @@ export function createWebDAVSyncEngine({
       skipped_items: skips.items,
       skips,
       is_first_sync: isFirstSync,
+      is_partial_sync: Boolean((onlyPath !== null && onlyPath !== undefined && onlyPath !== '') || (scope && scope !== 'all')),
       identity_verified: identityVerified,
       live_identity_verified: Boolean(idCheck && idCheck.verified === true),
       root_identity: idCheck.recorded_root_identity || idCheck.root_identity || '',
@@ -3028,6 +3043,23 @@ export function createWebDAVSyncEngine({
     const subdir = plan.subdir || '';
     const baseMap = { ...(plan.base_map || {}) };
     const originalBaseMap = plan.identity_verified === true ? (plan.original_base_map || plan.base_map || {}) : (plan.base_map || {});
+    const expectedRootId = String((plan.identity_verified === true ? plan.root_identity : '') || plan.live_root_identity || '').trim();
+    const partialBaseMap = {};
+    const deletedKeys = new Set();
+    const setBaseEntry = (k, h) => {
+      baseMap[k] = h;
+      partialBaseMap[k] = h;
+      deletedKeys.delete(k);
+    };
+    const delBaseEntry = (k) => {
+      delete baseMap[k];
+      delete partialBaseMap[k];
+      deletedKeys.add(k);
+    };
+    const restoreBase = () => {
+      restoreSkippedBase(baseMap, originalBaseMap, skips);
+      pruneSkippedPatchEntries(partialBaseMap, deletedKeys, skips);
+    };
     const skips = plan.skips || createSyncSkips(cfg, loc);
     plan.skipped_items = skips.items;
     const localNotes = plan.local_notes || {};
@@ -3047,9 +3079,10 @@ export function createWebDAVSyncEngine({
       }
     );
     const writeLocalAsset = (rel, asset, options) => {
-      if (!asset.filePath) return local.writeAsset(nbRoot, rel, asset.bytes, options);
+      const optsWithRoot = expectedRootId ? { ...options, expectedRootIdentity: expectedRootId } : options;
+      if (!asset.filePath) return local.writeAsset(nbRoot, rel, asset.bytes, optsWithRoot);
       return writeMirrorBytes(rpc, nbRoot, rel, null, {
-        ...options, locale: loc, dataDir, nowMsFn, sourcePath: asset.filePath, sourceHash: asset.hash,
+        ...optsWithRoot, locale: loc, dataDir, nowMsFn, sourcePath: asset.filePath, sourceHash: asset.hash,
       });
     };
 
@@ -3115,6 +3148,18 @@ export function createWebDAVSyncEngine({
     };
 
     let forceSkipDeletions = plan.identity_verified !== true || plan.is_first_sync === true;
+    let rootMismatchAborted = false;
+    const guardLocalWrite = (fn) => {
+      try {
+        return fn();
+      } catch (exc) {
+        if (isNotebookRootMismatchError(exc)) {
+          rootMismatchAborted = true;
+          plan._deletions_aborted = true;
+        }
+        throw exc;
+      }
+    };
     try {
       const startIdCheck = verifyPlanLiveIdentity(rpc, configStore, plan);
       forceSkipDeletions =
@@ -3146,13 +3191,13 @@ export function createWebDAVSyncEngine({
 
       // 1. Sync attachments.
       skips.each(plan.assets_synced, (rel) => {
-        baseMap[`asset:${rel}`] = localAssets[rel];
+        setBaseEntry(`asset:${rel}`, localAssets[rel]);
         if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${rel}`);
       });
 
       skips.each(plan.assets_to_push_new, (rel) => {
         uploadLocalAsset(rel, { createOnly: true });
-        baseMap[`asset:${rel}`] = localAssets[rel];
+        setBaseEntry(`asset:${rel}`, localAssets[rel]);
         if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${rel}`);
         assetCount += 1;
         stepProgress();
@@ -3160,7 +3205,7 @@ export function createWebDAVSyncEngine({
 
       skips.each(plan.assets_to_push_overwrite, ([rel]) => {
         uploadLocalAsset(rel, { expectedHash: remoteAssets[rel] });
-        baseMap[`asset:${rel}`] = localAssets[rel];
+        setBaseEntry(`asset:${rel}`, localAssets[rel]);
         if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${rel}`);
         assetCount += 1;
         stepProgress();
@@ -3172,16 +3217,16 @@ export function createWebDAVSyncEngine({
           stepProgress();
           return;
         }
-        useRemoteAsset(rel, (asset) => writeLocalAsset(rel, asset, { createOnly: true }));
-        baseMap[`asset:${rel}`] = rhash;
+        guardLocalWrite(() => useRemoteAsset(rel, (asset) => writeLocalAsset(rel, asset, { createOnly: true })));
+        setBaseEntry(`asset:${rel}`, rhash);
         if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${rel}`);
         assetCount += 1;
         stepProgress();
       });
 
       skips.each(plan.assets_to_pull_overwrite, ([rel]) => {
-        useRemoteAsset(rel, (asset) => writeLocalAsset(rel, asset, { expectedHash: localAssets[rel] }));
-        baseMap[`asset:${rel}`] = remoteAssets[rel];
+        guardLocalWrite(() => useRemoteAsset(rel, (asset) => writeLocalAsset(rel, asset, { expectedHash: localAssets[rel] })));
+        setBaseEntry(`asset:${rel}`, remoteAssets[rel]);
         if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${rel}`);
         assetCount += 1;
         stepProgress();
@@ -3190,11 +3235,13 @@ export function createWebDAVSyncEngine({
       const deferredAssetOverwrites = [];
       skips.each(plan.asset_conflicts, ([rel, copyRel]) => {
         const rhash = remoteAssets[rel];
-        useRemoteAsset(rel, (asset) => {
-          writeRemoteAsset(copyRel, asset, { createOnly: true });
-          writeLocalAsset(copyRel, asset, { createOnly: true });
-        });
-        baseMap[`asset:${copyRel}`] = rhash;
+        guardLocalWrite(() =>
+          useRemoteAsset(rel, (asset) => {
+            writeRemoteAsset(copyRel, asset, { createOnly: true });
+            writeLocalAsset(copyRel, asset, { createOnly: true });
+          })
+        );
+        setBaseEntry(`asset:${copyRel}`, rhash);
         if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${copyRel}`);
         assetCopyMap[rel] = copyRel;
         deferredAssetOverwrites.push(rel);
@@ -3214,7 +3261,7 @@ export function createWebDAVSyncEngine({
       const localHashes = plan.local_hashes || {};
       const remoteHashes = plan.remote_hashes || {};
       skips.each(plan.synced, (relPath) => {
-        baseMap[relPath] = localHashes[relPath] || sha256Text(localNotes[relPath], rpc);
+        setBaseEntry(relPath, localHashes[relPath] || sha256Text(localNotes[relPath], rpc));
         if (configStore) configStore.clearTombstone(nbKeyVal, relPath);
       });
 
@@ -3225,9 +3272,9 @@ export function createWebDAVSyncEngine({
           stepProgress();
           return;
         }
-        local.writeNote(conflictRel, rewrittenRemoteText, { nbRoot });
+        guardLocalWrite(() => local.writeNote(conflictRel, rewrittenRemoteText, { nbRoot, expectedRootIdentity: expectedRootId }));
         writeRemoteNote(conflictRel, rewrittenRemoteText, { createOnly: true });
-        baseMap[conflictRel] = sha256Text(rewrittenRemoteText, rpc);
+        setBaseEntry(conflictRel, sha256Text(rewrittenRemoteText, rpc));
         if (configStore) configStore.clearTombstone(nbKeyVal, conflictRel);
         conflictCount += 1;
         appendLog(state, tr(loc, `冲突保留 ${prefix}${relPath}`, `Keep conflict copy: ${prefix}${relPath}`), '冲突副本', {
@@ -3242,7 +3289,7 @@ export function createWebDAVSyncEngine({
       skips.each(plan.to_push_new, (relPath) => {
         const text = localNotes[relPath];
         writeRemoteNote(relPath, text, { createOnly: true });
-        baseMap[relPath] = localHashes[relPath] || sha256Text(text, rpc);
+        setBaseEntry(relPath, localHashes[relPath] || sha256Text(text, rpc));
         if (configStore) configStore.clearTombstone(nbKeyVal, relPath);
         pushed += 1;
         appendLog(state, tr(loc, `推送 ${prefix}${relPath}`, `Push ${prefix}${relPath}`), '成功', {
@@ -3259,7 +3306,7 @@ export function createWebDAVSyncEngine({
         const remoteHash = remoteHashes[relPath] || sha256Text(remoteNotes[relPath], rpc);
         const isConflict = baseMap[relPath] !== remoteHash;
         writeRemoteNote(relPath, text, { expectedHash: remoteHash });
-        baseMap[relPath] = localHashes[relPath] || sha256Text(text, rpc);
+        setBaseEntry(relPath, localHashes[relPath] || sha256Text(text, rpc));
         if (configStore) configStore.clearTombstone(nbKeyVal, relPath);
         pushed += 1;
         if (isConflict) {
@@ -3288,11 +3335,11 @@ export function createWebDAVSyncEngine({
           return;
         }
         const text = rewriteNoteAssetLinks(relPath, origText, assetCopyMap);
-        local.writeNote(relPath, text, { nbRoot });
+        guardLocalWrite(() => local.writeNote(relPath, text, { nbRoot, expectedRootIdentity: expectedRootId }));
         if (text !== origText) {
           writeRemoteNote(relPath, text, { expectedHash: origHash });
         }
-        baseMap[relPath] = text === origText ? origHash : sha256Text(text, rpc);
+        setBaseEntry(relPath, text === origText ? origHash : sha256Text(text, rpc));
         if (configStore) configStore.clearTombstone(nbKeyVal, relPath);
         pulled += 1;
         appendLog(state, tr(loc, `拉取 ${prefix}${relPath}`, `Pull ${prefix}${relPath}`), '成功', {
@@ -3310,11 +3357,11 @@ export function createWebDAVSyncEngine({
         const text = rewriteNoteAssetLinks(relPath, origText, assetCopyMap);
         const localHash = localHashes[relPath] || sha256Text(localNotes[relPath], rpc);
         const isConflict = baseMap[relPath] !== localHash;
-        local.writeNote(relPath, text, { nbRoot, expectedRevision: localHash });
+        guardLocalWrite(() => local.writeNote(relPath, text, { nbRoot, expectedRevision: localHash, expectedRootIdentity: expectedRootId }));
         if (text !== origText) {
           writeRemoteNote(relPath, text, { expectedHash: origHash });
         }
-        baseMap[relPath] = text === origText ? origHash : sha256Text(text, rpc);
+        setBaseEntry(relPath, text === origText ? origHash : sha256Text(text, rpc));
         if (configStore) configStore.clearTombstone(nbKeyVal, relPath);
         pulled += 1;
         if (isConflict) {
@@ -3338,11 +3385,11 @@ export function createWebDAVSyncEngine({
       skips.each(plan.conflicts, ([relPath, conflictRel, remoteText]) => {
         const localText = localNotes[relPath];
         const savedConflictText = rewriteNoteAssetLinks(conflictRel, remoteText, assetCopyMap);
-        local.writeNote(conflictRel, savedConflictText, { nbRoot });
+        guardLocalWrite(() => local.writeNote(conflictRel, savedConflictText, { nbRoot, expectedRootIdentity: expectedRootId }));
         writeRemoteNote(conflictRel, savedConflictText, { createOnly: true });
         writeRemoteNote(relPath, localText, { expectedHash: remoteHashes[relPath] || sha256Text(remoteText, rpc) });
-        baseMap[relPath] = localHashes[relPath] || sha256Text(localText, rpc);
-        baseMap[conflictRel] = sha256Text(savedConflictText, rpc);
+        setBaseEntry(relPath, localHashes[relPath] || sha256Text(localText, rpc));
+        setBaseEntry(conflictRel, sha256Text(savedConflictText, rpc));
         if (configStore) {
           configStore.clearTombstone(nbKeyVal, relPath);
           configStore.clearTombstone(nbKeyVal, conflictRel);
@@ -3360,7 +3407,7 @@ export function createWebDAVSyncEngine({
       // 3. Complete deferred remote original-asset overwrites.
       skips.each(deferredAssetOverwrites, (rel) => {
         uploadLocalAsset(rel, { expectedHash: remoteAssets[rel] });
-        baseMap[`asset:${rel}`] = localAssets[rel];
+        setBaseEntry(`asset:${rel}`, localAssets[rel]);
       });
 
       // 4. Propagate recoverable deletions.
@@ -3384,9 +3431,10 @@ export function createWebDAVSyncEngine({
         Boolean(startIdCheck && startIdCheck.identity_ok === true) &&
         Boolean(preDeleteIdCheck && preDeleteIdCheck.identity_ok === true);
       const midSyncIdentityLost =
+        rootMismatchAborted ||
         (plan.identity_verified === true && !preDeleteIdentityOk) ||
         (plan.live_identity_verified === true && plan.identity_reason === 'missing_baseline_identity' && !liveMissingPinOk);
-      if (forceSkipDeletions || !preDeleteIdentityOk) {
+      if (forceSkipDeletions || !preDeleteIdentityOk || rootMismatchAborted) {
         if (midSyncIdentityLost || (deletions.length > 0 && !preDeleteIdentityOk)) {
           plan._deletions_aborted = true;
         }
@@ -3408,7 +3456,9 @@ export function createWebDAVSyncEngine({
           );
         }
       } else {
+        let abortedOnMismatch = false;
         skips.each(deletions, ([side, rel, isAsset]) => {
+          if (abortedOnMismatch) return;
           const key = isAsset ? `asset:${rel}` : rel;
           const expect =
             deleteExpectedHashes[key] ||
@@ -3418,9 +3468,12 @@ export function createWebDAVSyncEngine({
           let errText = '';
           try {
             if (side === 'remote') {
+              const curCheck = verifyPlanLiveIdentity(rpc, configStore, plan);
               const hasPlaceholder = typeof local.isCloudPlaceholder === 'function' && local.isCloudPlaceholder(nbRoot, rel);
               const stillPresentOnDisk = nbRoot ? !isConfirmedAbsentOnRoot(rpc, nbRoot, rel) : false;
-              if (hasPlaceholder || stillPresentOnDisk) {
+              if (!curCheck || curCheck.identity_ok !== true) {
+                outcome = 'root_mismatch';
+              } else if (hasPlaceholder || stillPresentOnDisk) {
                 outcome = 'changed';
               } else {
                 const matchesFn = isAsset
@@ -3433,18 +3486,39 @@ export function createWebDAVSyncEngine({
               const revision = isAsset
                 ? localAssets[rel] || expect || ''
                 : (localHashes[rel] || sha256Text(localNotes[rel], rpc));
-              outcome = local.trashFile(rel, revision, { nbRoot });
+              outcome = local.trashFile(rel, revision, { nbRoot, expectedRootIdentity: expectedRootId });
             }
           } catch (exc) {
-            if (['file_limit', 'fs_error', 'quota_full'].includes(classifySyncError(exc))) throw exc;
-            outcome = 'failed';
-            errText = errorDetail(loc, exc);
+            if (isNotebookRootMismatchError(exc)) {
+              outcome = 'root_mismatch';
+            } else {
+              if (['file_limit', 'fs_error', 'quota_full'].includes(classifySyncError(exc))) throw exc;
+              outcome = 'failed';
+              errText = errorDetail(loc, exc);
+            }
+          }
+
+          if (outcome === 'root_mismatch') {
+            abortedOnMismatch = true;
+            plan._deletions_aborted = true;
+            appendLog(
+              state,
+              tr(loc, `${prefix}删除时笔记本根身份已变化，已中止本轮剩余删除并降级为仅合并`, `${prefix}Notebook root identity changed during delete; aborted remaining deletions and downgraded to merge-only`),
+              '已跳过',
+              {
+                tone: 'warning',
+                tooltip: tr(loc, '已中止本轮剩余删除以保护数据', 'Aborted remaining deletions to protect data'),
+                logKey: 'deletions_aborted',
+                logArgs: { prefix, reason: 'root_mismatch' },
+              }
+            );
+            return;
           }
 
           const shown = `${prefix}${rel}`;
           const where = side === 'remote' ? 'WebDAV' : tr(loc, '本地', 'local');
           if (outcome === 'deleted' || outcome === 'missing') {
-            delete baseMap[key];
+            delBaseEntry(key);
             if (expect && configStore) {
               configStore.recordTombstone(nbKeyVal, key, expect);
             }
@@ -3488,26 +3562,18 @@ export function createWebDAVSyncEngine({
         plan._deleted_count = deletedCount;
       }
     } catch (exc) {
-      restoreSkippedBase(baseMap, originalBaseMap, skips);
-      if (configStore && plan.identity_verified === true && !plan._deletions_aborted) {
-        const commitRoot = String(plan.live_root_identity || plan.root_identity || '').trim();
-        if (commitRoot && typeof configStore.commitNotebookBaseline === 'function') {
-          configStore.commitNotebookBaseline(plan.meta_key, baseMap, {
-            rootIdentity: commitRoot,
-            verified: true,
-            nbKeyVal: plan.nb_key,
-            nbRoot: plan.nb_root,
-            markInitialized: false,
-          });
-        } else if (commitRoot) {
-          configStore.state.syncMeta[plan.meta_key] = baseMap;
-        }
-      }
+      restoreBase();
+      commitPlanBaseline(
+        configStore,
+        plan,
+        { baseMap, partialBaseMap, deletedKeys: [...deletedKeys] },
+        { markInitialized: false, completedFullSync: false }
+      );
       throw exc;
     }
 
-    restoreSkippedBase(baseMap, originalBaseMap, skips);
-    return { pushed, pulled, conflictCount, assetCount, baseMap };
+    restoreBase();
+    return { pushed, pulled, conflictCount, assetCount, baseMap, partialBaseMap, deletedKeys: [...deletedKeys] };
   };
 
   const computeBatchPlan = ({
@@ -3648,30 +3714,7 @@ export function createWebDAVSyncEngine({
       totalDeleted += Number(plan._deleted_count || 0);
       const risks = planRiskMetrics(plan);
       reportedConflicts += risks.conflicts + risks.pull_conflict + risks.push_conflict;
-      if (configStore) {
-        const commitRoot = String(plan.live_root_identity || plan.root_identity || '').trim();
-        const canCommit =
-          !plan._deletions_aborted &&
-          Boolean(commitRoot) &&
-          (plan.identity_verified === true ||
-            (plan.live_identity_verified === true && plan.identity_reason === 'missing_baseline_identity'));
-        if (canCommit) {
-          if (typeof configStore.commitNotebookBaseline === 'function') {
-            configStore.commitNotebookBaseline(plan.meta_key, res.baseMap, {
-              rootIdentity: commitRoot,
-              verified: true,
-              nbKeyVal: plan.nb_key,
-              nbRoot: plan.nb_root,
-              markInitialized: true,
-            });
-          } else {
-            configStore.state.syncMeta[plan.meta_key] = res.baseMap;
-            const initMap = { ...(configStore.state.syncMeta[INITIALIZED_META_KEY] || {}) };
-            initMap[plan.meta_key] = true;
-            configStore.state.syncMeta[INITIALIZED_META_KEY] = initMap;
-          }
-        }
-      }
+      commitPlanBaseline(configStore, plan, res, { markInitialized: true });
     }
 
     if (configStore) {

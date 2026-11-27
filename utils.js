@@ -784,6 +784,22 @@ export function restoreSkippedBase(baseMap, originalBaseMap, skips) {
   }
 }
 
+export function pruneSkippedPatchEntries(partialBase, deletedKeys, skips) {
+  if (!skips) return;
+  for (const key of Object.keys(partialBase || {})) {
+    if (skips.has(key.startsWith('asset:') ? key.slice(6) : key)) {
+      delete partialBase[key];
+    }
+  }
+  if (deletedKeys && typeof deletedKeys.delete === 'function') {
+    for (const key of [...deletedKeys]) {
+      if (skips.has(key.startsWith('asset:') ? key.slice(6) : key)) {
+        deletedKeys.delete(key);
+      }
+    }
+  }
+}
+
 export function collectSkippedItems(plans) {
   return plans.flatMap((plan) => (plan.skipped_items || []).map((item) => ({
     ...item,
@@ -1901,12 +1917,25 @@ export function isDeterministicErrorClass(failClass) {
   return DETERMINISTIC_ERROR_CLASSES.has(String(failClass || ''));
 }
 
+export function isNotebookRootMismatchError(exc) {
+  if (!exc) return false;
+  if (typeof exc === 'object' && Number(exc.code) === -32008) return true;
+  const raw = exc && typeof exc === 'object' && 'message' in exc ? exc.message : exc;
+  const lower = String(raw ?? '').toLowerCase();
+  return (
+    lower.includes('-32008') ||
+    lower.includes('notebook root identity changed') ||
+    lower.includes('root identity mismatch')
+  );
+}
+
 export function classifySyncError(msg) {
   const raw = msg && typeof msg === 'object' && 'message' in msg ? msg.message : msg;
   const lower = String(raw ?? '').toLowerCase();
   const code = msg?.status ?? msg?.code;
   if (code === 413 || code === 'file_limit' || /exceeds (?:the )?(?:size limit|maximum (?:write )?size)|exceeds max_response_bytes|response body (?:too large|exceeds)|in-memory transfer limit|payload too large|gh001|(?:http |status |\()413\b|超过大小上限/.test(lower)) return 'file_limit';
   if (code === 507 || code === 'quota_full' || /\benospc\b|no space left|insufficient storage|(?:http |status |\()507\b/.test(lower)) return 'quota_full';
+  if (code === -32008 || isNotebookRootMismatchError(msg)) return 'fs_error';
   if (!lower) return 'other';
   if (SCOPE_ERROR_TOKENS.some((tok) => lower.includes(tok)) || /cannot modify .+ directly/.test(lower)) return 'scope';
   if ((code === 401 || code === 403 || AUTH_ERROR_TOKENS.some((tok) => lower.includes(tok))) && !lower.includes('missing permission:')) return 'auth';

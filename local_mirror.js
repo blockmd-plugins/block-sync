@@ -50,6 +50,8 @@ import {
   isSyncAssetCandidate,
   checkSyncBufferSize,
   restoreSkippedBase,
+  pruneSkippedPatchEntries,
+  isNotebookRootMismatchError,
   isMissingSyncFile,
   checkMissingSyncPath,
   hashSyncFile,
@@ -224,26 +226,30 @@ export function fsReadText(callHost, path) {
 }
 
 /** Write raw bytes via host.fs.write. */
-export function fsWriteBytes(callHost, path, data, { atomic = false, mkdirParents = false } = {}) {
+export function fsWriteBytes(callHost, path, data, { atomic = false, mkdirParents = false, expectedRootIdentity = '' } = {}) {
   const rpc = resolveCallHost(callHost);
   const view = data instanceof Uint8Array ? data : new Uint8Array(data || 0);
-  return rpc('host.fs.write', {
+  const params = {
     path: String(path ?? ''),
     content_base64: bytesToBase64(view),
     atomic: Boolean(atomic),
     mkdir_parents: Boolean(mkdirParents),
-  });
+  };
+  if (expectedRootIdentity) params.expected_root_identity = String(expectedRootIdentity);
+  return rpc('host.fs.write', params);
 }
 
 /** Write UTF-8 text via host.fs.write. */
-export function fsWriteText(callHost, path, content, { atomic = false, mkdirParents = false } = {}) {
+export function fsWriteText(callHost, path, content, { atomic = false, mkdirParents = false, expectedRootIdentity = '' } = {}) {
   const rpc = resolveCallHost(callHost);
-  return rpc('host.fs.write', {
+  const params = {
     path: String(path ?? ''),
     content: String(content ?? ''),
     atomic: Boolean(atomic),
     mkdir_parents: Boolean(mkdirParents),
-  });
+  };
+  if (expectedRootIdentity) params.expected_root_identity = String(expectedRootIdentity);
+  return rpc('host.fs.write', params);
 }
 
 /** Create a directory via host.fs.mkdir. */
@@ -257,12 +263,14 @@ export function fsMkdir(callHost, path, recursive = true) {
 }
 
 /** Delete a file or directory via host.fs.delete. */
-export function fsDelete(callHost, path, recursive = false) {
+export function fsDelete(callHost, path, recursive = false, { expectedRootIdentity = '' } = {}) {
   const rpc = resolveCallHost(callHost);
-  return rpc('host.fs.delete', {
+  const params = {
     path: String(path ?? ''),
     recursive: Boolean(recursive),
-  });
+  };
+  if (expectedRootIdentity) params.expected_root_identity = String(expectedRootIdentity);
+  return rpc('host.fs.delete', params);
 }
 
 /** Delete a path strictly inside plugin data_dir via host.fs.delete_data (never follows symlinks). */
@@ -396,25 +404,29 @@ export function deleteDataPath(callHost, targetPath, { recursive = false, baseDi
 }
 
 /** Rename/move a path via host.fs.rename. */
-export function fsRename(callHost, from, to, { overwrite = false, mkdirParents = false } = {}) {
+export function fsRename(callHost, from, to, { overwrite = false, mkdirParents = false, expectedRootIdentity = '' } = {}) {
   const rpc = resolveCallHost(callHost);
-  return rpc('host.fs.rename', {
+  const params = {
     from: String(from ?? ''),
     to: String(to ?? ''),
     overwrite: Boolean(overwrite),
     mkdir_parents: Boolean(mkdirParents),
-  });
+  };
+  if (expectedRootIdentity) params.expected_root_identity = String(expectedRootIdentity);
+  return rpc('host.fs.rename', params);
 }
 
 /** Stream-copy a regular file on the host via host.fs.copy (avoids Wasm memory). */
-export function fsCopy(callHost, from, to, { overwrite = false, mkdirParents = false } = {}) {
+export function fsCopy(callHost, from, to, { overwrite = false, mkdirParents = false, expectedRootIdentity = '' } = {}) {
   const rpc = resolveCallHost(callHost);
-  return rpc('host.fs.copy', {
+  const params = {
     from: String(from ?? ''),
     to: String(to ?? ''),
     overwrite: Boolean(overwrite),
     mkdir_parents: Boolean(mkdirParents),
-  });
+  };
+  if (expectedRootIdentity) params.expected_root_identity = String(expectedRootIdentity);
+  return rpc('host.fs.copy', params);
 }
 
 function isHostMethodUnsupported(exc) {
@@ -430,12 +442,14 @@ function isHostMethodUnsupported(exc) {
 }
 
 /** Atomically swap two files in the same directory via host.fs.atomic_swap. */
-export function fsAtomicSwap(callHost, pathA, pathB) {
+export function fsAtomicSwap(callHost, pathA, pathB, { expectedRootIdentity = '' } = {}) {
   const rpc = resolveCallHost(callHost);
-  return rpc('host.fs.atomic_swap', {
+  const params = {
     path_a: String(pathA ?? ''),
     path_b: String(pathB ?? ''),
-  });
+  };
+  if (expectedRootIdentity) params.expected_root_identity = String(expectedRootIdentity);
+  return rpc('host.fs.atomic_swap', params);
 }
 
 // ============================================================================
@@ -1293,6 +1307,8 @@ function pruneStashDir(callHost, stashDir, keepName, nowMs, { dataDir = '' } = {
     for (const entry of entries) {
       if (!entry || entry.is_dir || entry.is_symlink) continue;
       const name = String(entry.name || posixBasename(entry.path || ''));
+      // Source cannot be distinguished for legacy-renamed recovery entries; these originate only
+      // inside this plugin's own stash directory under data_dir, so pruning them is low-risk and accepted.
       if (!name || !isRecognizedStashFileName(name)) continue;
       const entryPath = posixJoin(stashDir, name);
       if (!isVerifiedRegularStashFile(callHost, entryPath, name)) continue;
@@ -1732,6 +1748,7 @@ export function writeMirrorPayload(
     readFallback = null,
     expectedHash = null,
     createOnly = false,
+    expectedRootIdentity = '',
     excludedSubdirs = new Set(),
     verifyTarget = null,
     changeErr = '',
@@ -1743,6 +1760,7 @@ export function writeMirrorPayload(
 ) {
   const rpc = resolveCallHost(callHost);
   if (typeof verifyTarget === 'function') verifyTarget();
+  const rootIdOpt = expectedRootIdentity ? { expectedRootIdentity } : {};
   const cleanMirror = trimTrailingSlash(mirrorDir);
   const dest = isText
     ? safeMirrorDest(cleanMirror, relPath, excludedSubdirs, locale)
@@ -1786,12 +1804,12 @@ export function writeMirrorPayload(
   let tmpAlive = false;
   try {
     if (sourcePath) {
-      fsRename(rpc, sourcePath, tmpPath, { overwrite: false });
+      fsRename(rpc, sourcePath, tmpPath, { overwrite: false, ...rootIdOpt });
       tmpAlive = true;
     } else if (copyFromPath) {
       let copied = false;
       try {
-        fsCopy(rpc, copyFromPath, tmpPath, { overwrite: false, mkdirParents: false });
+        fsCopy(rpc, copyFromPath, tmpPath, { overwrite: false, mkdirParents: false, ...rootIdOpt });
         copied = true;
       } catch (exc) {
         if (!isHostMethodUnsupported(exc) || typeof readFallback !== 'function') throw exc;
@@ -1805,14 +1823,14 @@ export function writeMirrorPayload(
         }
       } else {
         const fallbackBytes = readFallback();
-        fsWriteBytes(rpc, tmpPath, fallbackBytes, { atomic: false, mkdirParents: false });
+        fsWriteBytes(rpc, tmpPath, fallbackBytes, { atomic: false, mkdirParents: false, ...rootIdOpt });
         tmpAlive = true;
       }
     } else if (isRawString) {
-      fsWriteText(rpc, tmpPath, rawBytes, { atomic: false, mkdirParents: false });
+      fsWriteText(rpc, tmpPath, rawBytes, { atomic: false, mkdirParents: false, ...rootIdOpt });
       tmpAlive = true;
     } else {
-      fsWriteBytes(rpc, tmpPath, bytes, { atomic: false, mkdirParents: false });
+      fsWriteBytes(rpc, tmpPath, bytes, { atomic: false, mkdirParents: false, ...rootIdOpt });
       tmpAlive = true;
     }
 
@@ -1823,7 +1841,7 @@ export function writeMirrorPayload(
         throw new Error(errMsg);
       }
       try {
-        fsRename(rpc, tmpPath, dest, { overwrite: false });
+        fsRename(rpc, tmpPath, dest, { overwrite: false, ...rootIdOpt });
         tmpAlive = false;
         return;
       } catch (exc) {
@@ -1839,7 +1857,7 @@ export function writeMirrorPayload(
       const curHash = hashAt(dest);
       if (curHash !== expectedHash && curHash !== contentHash) throw new Error(errMsg);
 
-      fsAtomicSwap(rpc, tmpPath, dest);
+      fsAtomicSwap(rpc, tmpPath, dest, rootIdOpt);
       // The temporary path now owns the old contents. It must survive a failed verification or recovery.
       tmpAlive = false;
       let swappedHash;
@@ -1848,7 +1866,7 @@ export function writeMirrorPayload(
         if (swappedHash !== expectedHash && swappedHash !== contentHash) throw new Error(errMsg);
       } catch (exc) {
         try {
-          fsAtomicSwap(rpc, tmpPath, dest);
+          fsAtomicSwap(rpc, tmpPath, dest, rootIdOpt);
           tmpAlive = !preserveExternalConflictCopy(rpc, tmpPath, dest, contentHash, isText ? '.md' : '');
         } catch (_rollbackErr) {
           const moved = moveToRecoveryStash(rpc, tmpPath, cleanMirror, relPath, nowMsFn, dataDir);
@@ -1896,12 +1914,12 @@ export function writeMirrorPayload(
       return;
     }
 
-    fsRename(rpc, tmpPath, dest, { overwrite: true });
+    fsRename(rpc, tmpPath, dest, { overwrite: true, ...rootIdOpt });
     tmpAlive = false;
   } finally {
     if (tmpAlive) {
       try {
-        fsDelete(rpc, tmpPath);
+        fsDelete(rpc, tmpPath, false, rootIdOpt);
       } catch (_delErr) {
         // Ignore cleanup errors.
       }
@@ -3160,6 +3178,7 @@ export function computeThreeWaySyncPlan({
     skipped_items: skips.items,
     skips,
     is_first_sync: isFirstSync,
+    is_partial_sync: Boolean((onlyPath !== null && onlyPath !== undefined && onlyPath !== '') || (scope && scope !== 'all')),
     identity_verified: identityVerified,
     live_identity_verified: Boolean(idCheck && idCheck.verified === true),
     root_identity: idCheck.recorded_root_identity || idCheck.root_identity || '',
@@ -3450,6 +3469,70 @@ export function verifyPlanLiveIdentity(callHost, configStore, plan) {
   };
 }
 
+/** Commit or merge a plan's baseline updates safely (never replace whole baseline on partial sync). */
+export function commitPlanBaseline(
+  configStore,
+  plan,
+  { baseMap = {}, partialBaseMap = null, deletedKeys = [] } = {},
+  { markInitialized = true, completedFullSync = true } = {}
+) {
+  if (!configStore || !plan || !plan.meta_key || plan._deletions_aborted) return false;
+  const canCommit =
+    plan.identity_verified === true ||
+    (plan.live_identity_verified === true && plan.identity_reason === 'missing_baseline_identity');
+  if (!canCommit) return false;
+
+  // Merge entry-by-entry without writing root_identity unless an entire full sync completed.
+  if (plan.is_partial_sync || !completedFullSync) {
+    const patch = partialBaseMap && typeof partialBaseMap === 'object' ? partialBaseMap : baseMap;
+    if (typeof configStore.commitNotebookBaseline === 'function') {
+      return configStore.commitNotebookBaseline(plan.meta_key, patch, {
+        rootIdentity: '',
+        verified: true,
+        nbKeyVal: plan.nb_key,
+        nbRoot: plan.nb_root,
+        markInitialized: false,
+        partial: true,
+        deletedKeys,
+      });
+    }
+    const existing =
+      configStore.state.syncMeta[plan.meta_key] &&
+      typeof configStore.state.syncMeta[plan.meta_key] === 'object' &&
+      !Array.isArray(configStore.state.syncMeta[plan.meta_key])
+        ? { ...configStore.state.syncMeta[plan.meta_key] }
+        : {};
+    for (const [k, v] of Object.entries(patch || {})) {
+      if (typeof v === 'string' && v) existing[k] = v;
+    }
+    for (const dk of Array.isArray(deletedKeys) ? deletedKeys : []) {
+      delete existing[dk];
+    }
+    configStore.state.syncMeta[plan.meta_key] = existing;
+    return true;
+  }
+
+  const commitRoot = String(plan.live_root_identity || plan.root_identity || '').trim();
+  if (!commitRoot) return false;
+  if (typeof configStore.commitNotebookBaseline === 'function') {
+    return configStore.commitNotebookBaseline(plan.meta_key, baseMap, {
+      rootIdentity: commitRoot,
+      verified: true,
+      nbKeyVal: plan.nb_key,
+      nbRoot: plan.nb_root,
+      markInitialized: Boolean(markInitialized),
+      partial: false,
+    });
+  }
+  configStore.state.syncMeta[plan.meta_key] = baseMap;
+  if (markInitialized) {
+    const initMap = { ...(configStore.state.syncMeta[INITIALIZED_META_KEY] || {}) };
+    initMap[plan.meta_key] = true;
+    configStore.state.syncMeta[INITIALIZED_META_KEY] = initMap;
+  }
+  return true;
+}
+
 /** Shared notebook plan applicator used by both local_mirror and git engines. */
 export function applyMirrorOrGitNotebookPlan(
   plan,
@@ -3481,9 +3564,25 @@ export function applyMirrorOrGitNotebookPlan(
   const excludedSubdirs = plan.excluded_subdirs || new Set();
   const baseMap = { ...(plan.base_map || {}) };
   const originalBaseMap = plan.identity_verified === true ? (plan.original_base_map || plan.base_map || {}) : (plan.base_map || {});
+  const expectedRootId = String((plan.identity_verified === true ? plan.root_identity : '') || plan.live_root_identity || '').trim();
+  const partialBaseMap = {};
+  const deletedKeys = new Set();
+  const setBaseEntry = (k, h) => {
+    baseMap[k] = h;
+    partialBaseMap[k] = h;
+    deletedKeys.delete(k);
+  };
+  const delBaseEntry = (k) => {
+    delete baseMap[k];
+    delete partialBaseMap[k];
+    deletedKeys.add(k);
+  };
   const skips = plan.skips || createSyncSkips(cfg, locale);
   plan.skipped_items = skips.items;
-  const restoreBase = () => restoreSkippedBase(baseMap, originalBaseMap, skips);
+  const restoreBase = () => {
+    restoreSkippedBase(baseMap, originalBaseMap, skips);
+    pruneSkippedPatchEntries(partialBaseMap, deletedKeys, skips);
+  };
   const localNotes = plan.local_notes || {};
   const remoteNotes = plan.remote_notes || {};
   const localHashes = plan.local_hashes || {};
@@ -3691,11 +3790,23 @@ export function applyMirrorOrGitNotebookPlan(
     }
 
     const startIdCheck = verifyPlanLiveIdentity(rpc, configStore, plan);
-    const forceSkipDeletions =
+    let forceSkipDeletions =
       plan.identity_verified !== true ||
       plan.is_first_sync === true ||
       !startIdCheck ||
       startIdCheck.identity_ok !== true;
+    let rootMismatchAborted = false;
+    const guardLocalWrite = (fn) => {
+      try {
+        return fn();
+      } catch (exc) {
+        if (isNotebookRootMismatchError(exc)) {
+          rootMismatchAborted = true;
+          plan._deletions_aborted = true;
+        }
+        throw exc;
+      }
+    };
     const unverifiedAtStart = Boolean(
       plan.identity_degraded ||
         (plan.identity_verified !== true && plan.identity_reason !== 'missing_baseline_identity') ||
@@ -3719,7 +3830,7 @@ export function applyMirrorOrGitNotebookPlan(
 
     // 1. Sync attachments first.
     skips.each(plan.assets_synced, (rel) => {
-      baseMap[`asset:${rel}`] = localAssets[rel];
+      setBaseEntry(`asset:${rel}`, localAssets[rel]);
       if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${rel}`);
     });
 
@@ -3732,7 +3843,7 @@ export function applyMirrorOrGitNotebookPlan(
         copyFromPath: localAssetPath(rel),
         readFallback: () => readLocalAsset(rel),
       });
-      baseMap[`asset:${rel}`] = localAssets[rel];
+      setBaseEntry(`asset:${rel}`, localAssets[rel]);
       if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${rel}`);
       assetCount += 1;
       stepProgress();
@@ -3744,7 +3855,7 @@ export function applyMirrorOrGitNotebookPlan(
         copyFromPath: localAssetPath(rel),
         readFallback: () => readLocalAsset(rel),
       });
-      baseMap[`asset:${rel}`] = localAssets[rel];
+      setBaseEntry(`asset:${rel}`, localAssets[rel]);
       if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${rel}`);
       assetCount += 1;
       stepProgress();
@@ -3756,26 +3867,32 @@ export function applyMirrorOrGitNotebookPlan(
         stepProgress();
         return;
       }
-      localAdapter.writeAsset(nbRoot, rel, null, {
-        createOnly: true,
-        copyFromPath: remoteAssetPath(rel),
-        sourceHash: rhash,
-        readFallback: () => readRemoteAsset(rel),
-      });
-      baseMap[`asset:${rel}`] = rhash;
+      guardLocalWrite(() =>
+        localAdapter.writeAsset(nbRoot, rel, null, {
+          createOnly: true,
+          expectedRootIdentity: expectedRootId,
+          copyFromPath: remoteAssetPath(rel),
+          sourceHash: rhash,
+          readFallback: () => readRemoteAsset(rel),
+        })
+      );
+      setBaseEntry(`asset:${rel}`, rhash);
       if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${rel}`);
       assetCount += 1;
       stepProgress();
     });
 
     skips.each(plan.assets_to_pull_overwrite, ([rel]) => {
-      localAdapter.writeAsset(nbRoot, rel, null, {
-        expectedHash: localAssets[rel],
-        copyFromPath: remoteAssetPath(rel),
-        sourceHash: remoteAssets[rel],
-        readFallback: () => readRemoteAsset(rel),
-      });
-      baseMap[`asset:${rel}`] = remoteAssets[rel];
+      guardLocalWrite(() =>
+        localAdapter.writeAsset(nbRoot, rel, null, {
+          expectedHash: localAssets[rel],
+          expectedRootIdentity: expectedRootId,
+          copyFromPath: remoteAssetPath(rel),
+          sourceHash: remoteAssets[rel],
+          readFallback: () => readRemoteAsset(rel),
+        })
+      );
+      setBaseEntry(`asset:${rel}`, remoteAssets[rel]);
       if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${rel}`);
       assetCount += 1;
       stepProgress();
@@ -3786,18 +3903,21 @@ export function applyMirrorOrGitNotebookPlan(
       const rhash = remoteAssets[rel];
       const srcPath = remoteAssetPath(rel);
       const readRdata = () => readRemoteAsset(rel);
-      localAdapter.writeAsset(nbRoot, copyRel, null, {
-        createOnly: true,
-        copyFromPath: srcPath,
-        sourceHash: rhash,
-        readFallback: readRdata,
-      });
+      guardLocalWrite(() =>
+        localAdapter.writeAsset(nbRoot, copyRel, null, {
+          createOnly: true,
+          expectedRootIdentity: expectedRootId,
+          copyFromPath: srcPath,
+          sourceHash: rhash,
+          readFallback: readRdata,
+        })
+      );
       writeRemoteAsset(copyRel, null, rhash, {
         createOnly: true,
         copyFromPath: srcPath,
         readFallback: readRdata,
       });
-      baseMap[`asset:${copyRel}`] = rhash;
+      setBaseEntry(`asset:${copyRel}`, rhash);
       if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${copyRel}`);
       assetCopyMap[rel] = copyRel;
       deferredAssetOverwrites.push(rel);
@@ -3815,14 +3935,14 @@ export function applyMirrorOrGitNotebookPlan(
 
     // 2. Sync notes.
     skips.each(plan.synced, (relPath) => {
-      baseMap[relPath] = getLocalHash(relPath);
+      setBaseEntry(relPath, getLocalHash(relPath));
       if (configStore) configStore.clearTombstone(nbKeyVal, relPath);
     });
 
     skips.each(plan.to_push_new, (relPath) => {
       const text = getVerifiedLocalText(relPath);
       writeRemoteNote(relPath, text, { createOnly: true });
-      baseMap[relPath] = getLocalHash(relPath) || sha256Text(text, rpc);
+      setBaseEntry(relPath, getLocalHash(relPath) || sha256Text(text, rpc));
       if (configStore) configStore.clearTombstone(nbKeyVal, relPath);
       pushed += 1;
       appendLog(tr(locale, `推送 ${prefix}${relPath}`, `Push ${prefix}${relPath}`), '成功', {
@@ -3839,7 +3959,7 @@ export function applyMirrorOrGitNotebookPlan(
       const remoteHash = getRemoteHash(relPath);
       const isConflict = baseMap[relPath] !== remoteHash;
       writeRemoteNote(relPath, text, { expectedHash: remoteHash });
-      baseMap[relPath] = getLocalHash(relPath) || sha256Text(text, rpc);
+      setBaseEntry(relPath, getLocalHash(relPath) || sha256Text(text, rpc));
       if (configStore) configStore.clearTombstone(nbKeyVal, relPath);
       pushed += 1;
       appendLog(
@@ -3867,11 +3987,11 @@ export function applyMirrorOrGitNotebookPlan(
         return;
       }
       const text = rewriteNoteAssetLinks(relPath, origText, assetCopyMap);
-      localAdapter.writeNote(relPath, text, { nbRoot });
+      guardLocalWrite(() => localAdapter.writeNote(relPath, text, { nbRoot, expectedRootIdentity: expectedRootId }));
       if (text !== origText) {
         writeRemoteNote(relPath, text, { expectedHash: origHash });
       }
-      baseMap[relPath] = text === origText ? origHash : sha256Text(text, rpc);
+      setBaseEntry(relPath, text === origText ? origHash : sha256Text(text, rpc));
       if (configStore) configStore.clearTombstone(nbKeyVal, relPath);
       pulled += 1;
       appendLog(tr(locale, `拉取 ${prefix}${relPath}`, `Pull ${prefix}${relPath}`), '成功', {
@@ -3889,11 +4009,13 @@ export function applyMirrorOrGitNotebookPlan(
       const text = rewriteNoteAssetLinks(relPath, origText, assetCopyMap);
       const localHash = getLocalHash(relPath);
       const isConflict = baseMap[relPath] !== localHash;
-      localAdapter.writeNote(relPath, text, { nbRoot, expectedRevision: localHash });
+      guardLocalWrite(() =>
+        localAdapter.writeNote(relPath, text, { nbRoot, expectedRevision: localHash, expectedRootIdentity: expectedRootId })
+      );
       if (text !== origText) {
         writeRemoteNote(relPath, text, { expectedHash: origHash });
       }
-      baseMap[relPath] = text === origText ? origHash : sha256Text(text, rpc);
+      setBaseEntry(relPath, text === origText ? origHash : sha256Text(text, rpc));
       if (configStore) configStore.clearTombstone(nbKeyVal, relPath);
       pulled += 1;
       appendLog(
@@ -3918,11 +4040,11 @@ export function applyMirrorOrGitNotebookPlan(
       verifyPlannedText(relPath, remoteText, remoteHashes);
       const localText = getVerifiedLocalText(relPath);
       const savedConflictText = rewriteNoteAssetLinks(conflictRel, remoteText, assetCopyMap);
-      localAdapter.writeNote(conflictRel, savedConflictText, { nbRoot });
+      guardLocalWrite(() => localAdapter.writeNote(conflictRel, savedConflictText, { nbRoot, expectedRootIdentity: expectedRootId }));
       writeRemoteNote(conflictRel, savedConflictText, { createOnly: true });
       writeRemoteNote(relPath, localText, { expectedHash: getRemoteHash(relPath) || sha256Text(remoteText, rpc) });
-      baseMap[relPath] = getLocalHash(relPath) || sha256Text(localText, rpc);
-      baseMap[conflictRel] = sha256Text(savedConflictText, rpc);
+      setBaseEntry(relPath, getLocalHash(relPath) || sha256Text(localText, rpc));
+      setBaseEntry(conflictRel, sha256Text(savedConflictText, rpc));
       if (configStore) {
         configStore.clearTombstone(nbKeyVal, relPath);
         configStore.clearTombstone(nbKeyVal, conflictRel);
@@ -3944,9 +4066,9 @@ export function applyMirrorOrGitNotebookPlan(
         stepProgress();
         return;
       }
-      localAdapter.writeNote(conflictRel, savedConflictText, { nbRoot });
+      guardLocalWrite(() => localAdapter.writeNote(conflictRel, savedConflictText, { nbRoot, expectedRootIdentity: expectedRootId }));
       writeRemoteNote(conflictRel, savedConflictText, { createOnly: true });
-      baseMap[conflictRel] = sha256Text(savedConflictText, rpc);
+      setBaseEntry(conflictRel, sha256Text(savedConflictText, rpc));
       if (configStore) configStore.clearTombstone(nbKeyVal, conflictRel);
       conflictCount += 1;
       appendLog(tr(locale, `冲突保留 ${prefix}${relPath}`, `Keep conflict copy: ${prefix}${relPath}`), '冲突副本', {
@@ -3965,7 +4087,7 @@ export function applyMirrorOrGitNotebookPlan(
         copyFromPath: localAssetPath(rel),
         readFallback: () => readLocalAsset(rel),
       });
-      baseMap[`asset:${rel}`] = localAssets[rel];
+      setBaseEntry(`asset:${rel}`, localAssets[rel]);
     });
 
     // 4. Propagate recoverable deletions.
@@ -3990,9 +4112,10 @@ export function applyMirrorOrGitNotebookPlan(
       Boolean(startIdCheck && startIdCheck.identity_ok === true) &&
       Boolean(preDeleteIdCheck && preDeleteIdCheck.identity_ok === true);
     const midSyncIdentityLost =
+      rootMismatchAborted ||
       (plan.identity_verified === true && !preDeleteIdentityOk) ||
       (plan.live_identity_verified === true && plan.identity_reason === 'missing_baseline_identity' && !liveMissingPinOk);
-    if (forceSkipDeletions || !preDeleteIdentityOk) {
+    if (forceSkipDeletions || !preDeleteIdentityOk || rootMismatchAborted) {
       if (midSyncIdentityLost || (deletions.length > 0 && !preDeleteIdentityOk)) {
         plan._deletions_aborted = true;
       }
@@ -4016,7 +4139,9 @@ export function applyMirrorOrGitNotebookPlan(
       return;
     }
 
+    let abortedOnMismatch = false;
     skips.each(deletions, ([side, rel, isAsset]) => {
+      if (abortedOnMismatch) return;
       const key = isAsset ? `asset:${rel}` : rel;
       const expect =
         deleteExpectedHashes[key] ||
@@ -4028,7 +4153,10 @@ export function applyMirrorOrGitNotebookPlan(
         if (side === 'remote') {
           const targetRel = (isAsset ? remoteAssetPathMap : remotePathMap)[rel] || rel;
           verifyTarget();
-          if (!isConfirmedAbsentOnRoot(rpc, nbRoot, rel)) {
+          const curCheck = verifyPlanLiveIdentity(rpc, configStore, plan);
+          if (!curCheck || curCheck.identity_ok !== true) {
+            outcome = 'root_mismatch';
+          } else if (!isConfirmedAbsentOnRoot(rpc, nbRoot, rel)) {
             outcome = 'changed';
           } else {
             const matchesFn = isAsset
@@ -4057,21 +4185,41 @@ export function applyMirrorOrGitNotebookPlan(
             const revision = isAsset
               ? localAssets[rel] || expect || ''
               : (getLocalHash(rel) || expect || '');
-            outcome = localAdapter.trashFile(rel, revision, { nbRoot });
+            outcome = localAdapter.trashFile(rel, revision, { nbRoot, expectedRootIdentity: expectedRootId });
           }
         }
       } catch (exc) {
-        if (['file_limit', 'fs_error', 'quota_full'].includes(classifySyncError(exc))) throw exc;
-        outcome = 'failed';
-        errText = errorDetail(locale, exc);
+        if (isNotebookRootMismatchError(exc)) {
+          outcome = 'root_mismatch';
+        } else {
+          if (['file_limit', 'fs_error', 'quota_full'].includes(classifySyncError(exc))) throw exc;
+          outcome = 'failed';
+          errText = errorDetail(locale, exc);
+        }
+      }
+
+      if (outcome === 'root_mismatch') {
+        abortedOnMismatch = true;
+        plan._deletions_aborted = true;
+        appendLog(
+          tr(locale, `${prefix}删除时笔记本根身份已变化，已中止本轮剩余删除并降级为仅合并`, `${prefix}Notebook root identity changed during delete; aborted remaining deletions and downgraded to merge-only`),
+          '已跳过',
+          {
+            tone: 'warning',
+            tooltip: tr(locale, '已中止本轮剩余删除以保护数据', 'Aborted remaining deletions to protect data'),
+            logKey: 'deletions_aborted',
+            logArgs: { prefix, reason: 'root_mismatch' },
+          }
+        );
+        return;
       }
 
       const shown = `${prefix}${rel}`;
       const where = side === 'remote' ? protoLbl : tr(locale, '本地', 'local');
       if (outcome === 'deleted' || outcome === 'missing') {
-        delete baseMap[key];
+        delBaseEntry(key);
         for (const aliasKey of baseKeyAliases[key] || []) {
-          if (!skips.has(isAsset ? aliasKey.slice(6) : aliasKey)) delete baseMap[aliasKey];
+          if (!skips.has(isAsset ? aliasKey.slice(6) : aliasKey)) delBaseEntry(aliasKey);
         }
         if (expect && configStore) {
           configStore.recordTombstone(nbKeyVal, key, expect);
@@ -4128,38 +4276,32 @@ export function applyMirrorOrGitNotebookPlan(
     }
   } catch (exc) {
     restoreBase();
-    if (protocol !== 'git' && configStore && plan.identity_verified === true && !plan._deletions_aborted) {
-      const commitRoot = String(plan.live_root_identity || plan.root_identity || '').trim();
-      if (commitRoot && typeof configStore.commitNotebookBaseline === 'function') {
-        configStore.commitNotebookBaseline(plan.meta_key, baseMap, {
-          rootIdentity: commitRoot,
-          verified: true,
-          nbKeyVal: plan.nb_key,
-          nbRoot: plan.nb_root,
-          markInitialized: false,
-        });
-      } else if (commitRoot) {
-        configStore.state.syncMeta[plan.meta_key] = baseMap;
-      }
+    if (protocol !== 'git') {
+      commitPlanBaseline(
+        configStore,
+        plan,
+        { baseMap, partialBaseMap, deletedKeys: [...deletedKeys] },
+        { markInitialized: false, completedFullSync: false }
+      );
     }
     throw exc;
   }
 
   for (const [lp, rp] of Object.entries(remotePathMap)) {
     if (rp !== lp && !skips.has(lp) && !skips.has(rp) && Object.hasOwn(baseMap, lp) && !hasLocalNote(rp)) {
-      delete baseMap[rp];
+      delBaseEntry(rp);
     }
   }
   for (const [lp, rp] of Object.entries(remoteAssetPathMap)) {
     if (rp !== lp && !skips.has(lp) && !skips.has(rp) && Object.hasOwn(baseMap, `asset:${lp}`) && !Object.hasOwn(localAssets, rp)) {
-      delete baseMap[`asset:${rp}`];
+      delBaseEntry(`asset:${rp}`);
     }
   }
   const relativeKey = (key) => key.startsWith('asset:') ? key.slice(6) : key;
   for (const [key, aliases] of Object.entries(plan.base_key_aliases || {})) {
     if (!skips.has(relativeKey(key)) && Object.hasOwn(baseMap, key)) {
       for (const aliasKey of aliases) {
-        if (aliasKey !== key && !skips.has(relativeKey(aliasKey))) delete baseMap[aliasKey];
+        if (aliasKey !== key && !skips.has(relativeKey(aliasKey))) delBaseEntry(aliasKey);
       }
     }
   }
@@ -4202,6 +4344,8 @@ export function applyMirrorOrGitNotebookPlan(
     conflictCount,
     assetCount,
     baseMap,
+    partialBaseMap,
+    deletedKeys: [...deletedKeys],
     writtenRemotePaths,
     syncedRepoPaths,
     plannedGitBlobs,
@@ -4602,30 +4746,7 @@ export function createLocalMirrorSyncEngine({
       totalDeleted += Number(plan._deleted_count || 0);
       const risks = planRiskMetrics(rpc, plan);
       reportedConflicts += risks.conflicts + risks.pull_conflict + risks.push_conflict;
-      if (configStore) {
-        const commitRoot = String(plan.live_root_identity || plan.root_identity || '').trim();
-        const canCommit =
-          !plan._deletions_aborted &&
-          Boolean(commitRoot) &&
-          (plan.identity_verified === true ||
-            (plan.live_identity_verified === true && plan.identity_reason === 'missing_baseline_identity'));
-        if (canCommit) {
-          if (typeof configStore.commitNotebookBaseline === 'function') {
-            configStore.commitNotebookBaseline(plan.meta_key, res.baseMap, {
-              rootIdentity: commitRoot,
-              verified: true,
-              nbKeyVal: plan.nb_key,
-              nbRoot: plan.nb_root,
-              markInitialized: true,
-            });
-          } else {
-            configStore.state.syncMeta[plan.meta_key] = res.baseMap;
-            const initMap = { ...(configStore.state.syncMeta[INITIALIZED_META_KEY] || {}) };
-            initMap[plan.meta_key] = true;
-            configStore.state.syncMeta[INITIALIZED_META_KEY] = initMap;
-          }
-        }
-      }
+      commitPlanBaseline(configStore, plan, res, { markInitialized: true });
     }
 
     if (configStore) {
