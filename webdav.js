@@ -10,6 +10,7 @@ import {
   errorDetail,
   protocolLabel,
   formatReasonItem,
+  formatSkippedCount,
 } from './i18n.js';
 import {
   resolveCallHost,
@@ -18,7 +19,6 @@ import {
   textToBytes,
   bytesToText,
   decodeNoteBytes,
-  bytesEqual,
   bytesToBase64,
   base64ToBytes,
   textToBase64,
@@ -50,6 +50,20 @@ import {
   noteAssetPaths,
   rewriteNoteAssetLinks,
   makeUniqueConflictPath,
+  MAX_SYNC_FILE_BYTES,
+  assertCompleteListing,
+  createSyncSkips,
+  checkSyncFileSize,
+  checkSyncFilename,
+  isMissingSyncFile,
+  isSyncAssetCandidate,
+  classifySyncError,
+  hashSyncFile,
+  readPlannedAsset,
+  collectSkippedItems,
+  checkSyncBufferSize,
+  restoreSkippedBase,
+  checkMissingSyncPath,
 } from './utils.js';
 import {
   DELETE_GUARD_THRESHOLD,
@@ -65,6 +79,7 @@ import {
   notebookKey,
   notebookLabel,
 } from './config.js';
+import { entryRelPath, fsStat, fsReadBytes, fsDelete, writeMirrorBytes } from './local_mirror.js';
 
 // ============================================================================
 // Pure-JS Lightweight XML Parser (WebDAV multistatus & LOCK responses)
@@ -499,7 +514,7 @@ export function createWebDAVClient({
 } = {}) {
   const getRpc = () => resolveCallHost(callHost);
 
-  const sendSingleHttp = (method, url, headers, body, timeoutMs) => {
+  const sendSingleHttp = (method, url, headers, body, timeoutMs, { saveToPath, bodyFilePath }) => {
     let currentMethod = method;
     let currentUrl = url;
     let currentBody = body;
@@ -509,10 +524,16 @@ export function createWebDAVClient({
         method: currentMethod,
         url: currentUrl,
         headers,
-        response_encoding: 'base64',
+        response_encoding: saveToPath ? 'none' : 'base64',
         timeout_ms: timeoutMs,
         follow_redirects: false,
       };
+      if (currentMethod === 'GET') {
+        reqParams.max_response_bytes = MAX_SYNC_FILE_BYTES;
+        if (saveToPath) reqParams.save_to_path = saveToPath;
+        else if (globalThis.BlockSDK) reqParams.max_response_bytes = 2 * 1024 * 1024;
+      }
+      if (bodyFilePath && currentMethod === method) reqParams.body_file_path = bodyFilePath;
       if (currentBody !== null && currentBody !== undefined) {
         if (currentBody instanceof Uint8Array) {
           reqParams.body_base64 = bytesToBase64(currentBody);
@@ -550,16 +571,22 @@ export function createWebDAVClient({
       }
 
       if (status >= 400 || status === 0) {
+        const path = percentDecode(parseUrl(currentUrl)?.path || '/');
+        const messages = {
+          413: tr(locale, `文件超过服务器大小上限 (HTTP 413)：${path}`, `File exceeds the server size limit (HTTP 413): ${path}`),
+          507: tr(locale, `服务器存储空间不足 (HTTP 507)：${path}`, `Server has insufficient storage (HTTP 507): ${path}`),
+          423: tr(locale, `服务器上的文件已锁定 (HTTP 423)：${path}`, `File is locked on the server (HTTP 423): ${path}`),
+        };
         throw new WebDAVHttpError(
           currentUrl,
           status || 500,
-          res?.error || res?.status_text || `HTTP ${status}`,
+          messages[status] || res?.error || res?.status_text || `HTTP ${status}`,
           respHeaders,
           bodyBytes
         );
       }
 
-      return { status, bodyBytes, headers: respHeaders };
+      return { status, bodyBytes, headers: respHeaders, savedPath: res?.saved_path, size: res?.bytes };
     }
 
     throw new WebDAVHttpError(currentUrl, 403, 'Too many WebDAV redirects');
@@ -575,6 +602,8 @@ export function createWebDAVClient({
       cfg = null,
       retries = null,
       deadlineMs = 0,
+      saveToPath = '',
+      bodyFilePath = '',
     } = {}
   ) => {
     const upper = String(method || 'GET').toUpperCase();
@@ -602,7 +631,7 @@ export function createWebDAVClient({
       }
 
       try {
-        return sendSingleHttp(upper, url, hdrs, body, effectiveTimeout);
+        return sendSingleHttp(upper, url, hdrs, body, effectiveTimeout, { saveToPath, bodyFilePath });
       } catch (exc) {
         if (exc instanceof WebDAVHttpError) {
           if (attempt < maxRetries && [429, 502, 503, 504].includes(exc.status)) {
@@ -611,7 +640,7 @@ export function createWebDAVClient({
           }
           throw exc;
         }
-        if (attempt < maxRetries) {
+        if (attempt < maxRetries && classifySyncError(exc) === 'network') {
           sleepMs(computeBackoffMs(attempt), sleepFn);
           continue;
         }
@@ -714,6 +743,7 @@ export function createWebDAVClient({
             ),
           ];
         }
+        if ([413, 423, 507].includes(exc.status)) return [false, errorDetail(locale, exc)];
         return [
           false,
           tr(locale, `WebDAV 请求失败 (HTTP ${exc.status})`, `WebDAV request failed (HTTP ${exc.status})`),
@@ -729,16 +759,20 @@ export function createWebDAVClient({
 
   const getBytesWithEtag = (
     fileUrl,
-    { cfg = null, timeoutMs = 6000, treat405AsAbsent = false, deadlineMs = 0 } = {}
+    { cfg = null, timeoutMs = 6000, treat405AsAbsent = false, deadlineMs = 0, saveToPath = '' } = {}
   ) => {
     try {
-      const { status, bodyBytes, headers } = requestFull('GET', fileUrl, {
+      const { status, bodyBytes, headers, savedPath, size } = requestFull('GET', fileUrl, {
         timeoutMs,
         cfg,
         deadlineMs,
+        saveToPath,
       });
       if (status >= 200 && status < 300) {
-        return { found: true, bytes: bodyBytes, etag: String(headers.etag || '').trim() };
+        if (saveToPath && !savedPath) throw new Error('Host did not save the WebDAV attachment');
+        const result = { found: true, bytes: bodyBytes, etag: String(headers.etag || '').trim() };
+        if (saveToPath) Object.assign(result, { savedPath, size });
+        return result;
       }
       return { found: false, bytes: new Uint8Array(0), etag: '' };
     } catch (exc) {
@@ -819,6 +853,7 @@ export function createWebDAVClient({
       excludedSubdirs = new Set(),
       skipAssets = false,
       deadlineMs = 0,
+      metadata = null,
     } = {}
   ) => {
     const rootParsed = parseUrl(baseUrl);
@@ -904,6 +939,7 @@ export function createWebDAVClient({
           }
         } else if (filterFn(rel)) {
           items.push(rel);
+          if (metadata) metadata.set(rel, entry);
         }
       }
     }
@@ -953,6 +989,7 @@ export function createWebDAVClient({
       skipAssets = false,
       normalize = false,
       deadlineMs = 0,
+      metadata = null,
     } = {}
   ) => {
     const sc = String(scope || 'all').trim().replace(/^\/+|\/+$/g, '');
@@ -963,6 +1000,7 @@ export function createWebDAVClient({
         excludedSubdirs,
         skipAssets,
         deadlineMs,
+        metadata,
       });
     }
     const scParts = sc.split('/').filter(Boolean);
@@ -981,17 +1019,20 @@ export function createWebDAVClient({
       const scActual = parts.join('/');
       const scopePrefix = parts.map((p) => percentEncodeSegment(p)).join('/');
       const scopeUrl = `${baseUrl}${scopePrefix}/`;
+      const subMetadata = metadata && new Map();
       const subItems = listFiles(scopeUrl, (rel) => filterFn(`${scActual}/${rel}`), {
         cfg,
         timeoutMs,
         skipAssets,
         deadlineMs,
+        metadata: subMetadata,
       });
       for (const rel of subItems) {
         const fullRel = `${scActual}/${rel}`;
         if (!seen.has(fullRel) && !inSyncSubdir(fullRel, excludedSubdirs)) {
           seen.add(fullRel);
           out.push(fullRel);
+          if (metadata) metadata.set(fullRel, subMetadata.get(rel));
         }
       }
     }
@@ -1098,24 +1139,24 @@ export function createWebDAVClient({
   const deletePlaceholder = (
     fileUrl,
     lockToken,
-    { cfg = null, timeoutMs = 6000, deadlineMs = 0 } = {}
+    { cfg = null, timeoutMs = 6000, deadlineMs = 0, readState = getBytesWithEtag } = {}
   ) => {
     if (!lockToken) return [true, ''];
     let found = false;
-    let curBytes = new Uint8Array(0);
+    let size = 0;
     try {
-      const res = getBytesWithEtag(fileUrl, {
+      const res = readState(fileUrl, {
         cfg,
         timeoutMs,
         treat405AsAbsent: true,
         deadlineMs,
       });
       found = res.found;
-      curBytes = res.bytes;
+      size = res.size ?? res.bytes?.length ?? 0;
     } catch (exc) {
       return [false, errorDetail(locale, exc)];
     }
-    if (found && curBytes.length > 0) {
+    if (found && size > 0) {
       return [true, ''];
     }
     try {
@@ -1161,12 +1202,17 @@ export function createWebDAVClient({
       expectedEtag = null,
       createOnly = false,
       deadlineMs = 0,
+      bodyFilePath = '',
+      sourceHash = '',
+      readState = (url, opts) => {
+        const result = getBytesWithEtag(url, opts);
+        return { ...result, size: result.bytes.length, hash: result.found ? sha256Bytes(result.bytes, getRpc()) : null };
+      },
     } = {}
   ) => {
     ensureParents(baseUrl, relPath, cfg, deadlineMs);
     const fileUrl = encodeWebdavRelUrl(baseUrl, relPath);
-    const rpc = getRpc();
-    const contentHash = sha256Bytes(payloadBytes, rpc);
+    const contentHash = bodyFilePath ? sourceHash : sha256Bytes(payloadBytes, getRpc());
     const changeErr = tr(
       locale,
       `WebDAV 远端文件已变更，已中止覆盖以避免数据丢失：${relPath}`,
@@ -1186,9 +1232,9 @@ export function createWebDAVClient({
 
     try {
       if (createOnly) {
-        const { found, bytes } = getBytesWithEtag(fileUrl, { cfg, deadlineMs });
+        const { found, hash } = readState(fileUrl, { cfg, deadlineMs });
         if (found) {
-          if (sha256Bytes(bytes, rpc) === contentHash) return;
+          if (hash === contentHash) return;
           throw new Error(changeErr);
         }
         const [tok, lockStatus] = lock(fileUrl, { cfg, deadlineMs });
@@ -1198,13 +1244,13 @@ export function createWebDAVClient({
           if (lockStatus === 201) {
             createdLockPlaceholder = true;
           } else {
-            const check2 = getBytesWithEtag(fileUrl, {
+            const check2 = readState(fileUrl, {
               cfg,
               treat405AsAbsent: true,
               deadlineMs,
             });
             if (check2.found) {
-              if (sha256Bytes(check2.bytes, rpc) === contentHash) return;
+              if (check2.hash === contentHash) return;
               throw new Error(changeErr);
             }
             createdLockPlaceholder = true;
@@ -1215,6 +1261,7 @@ export function createWebDAVClient({
         try {
           requestFull('PUT', fileUrl, {
             body: payloadBytes,
+            bodyFilePath,
             extraHeaders: headers,
             cfg,
             deadlineMs,
@@ -1227,16 +1274,16 @@ export function createWebDAVClient({
               putOutcomeUnknown = true;
             }
             try {
-              const after = getBytesWithEtag(fileUrl, {
+              const after = readState(fileUrl, {
                 cfg,
                 treat405AsAbsent: true,
                 deadlineMs,
               });
-              if (after.found && sha256Bytes(after.bytes, rpc) === contentHash) {
+              if (after.found && after.hash === contentHash) {
                 createdLockPlaceholder = false;
                 return;
               }
-              if (putOutcomeUnknown && after.found && after.bytes.length > 0) {
+              if (putOutcomeUnknown && after.found && after.size > 0) {
                 createdLockPlaceholder = false;
               }
             } catch (_verifyErr) {
@@ -1262,7 +1309,7 @@ export function createWebDAVClient({
               throw new Error(changeErr);
             }
             headers.If = `(${lockToken})`;
-            const cur = getBytesWithEtag(fileUrl, {
+            const cur = readState(fileUrl, {
               cfg,
               treat405AsAbsent: true,
               deadlineMs,
@@ -1271,17 +1318,12 @@ export function createWebDAVClient({
               createdLockPlaceholder = true;
               throw new Error(changeErr);
             }
-            const curHash = sha256Bytes(cur.bytes, rpc);
-            if (curHash !== expectedHash && curHash !== contentHash) {
+            if (cur.hash !== expectedHash && cur.hash !== contentHash) {
               throw new Error(changeErr);
             }
           } else {
-            const cur = getBytesWithEtag(fileUrl, { cfg, deadlineMs });
-            if (!cur.found) {
-              throw new Error(changeErr);
-            }
-            const curHash = sha256Bytes(cur.bytes, rpc);
-            if (curHash !== expectedHash && curHash !== contentHash) {
+            const cur = readState(fileUrl, { cfg, deadlineMs });
+            if (!cur.found || (cur.hash !== expectedHash && cur.hash !== contentHash)) {
               throw new Error(changeErr);
             }
             if (!isStrongEtag(cur.etag)) {
@@ -1293,6 +1335,7 @@ export function createWebDAVClient({
         try {
           requestFull('PUT', fileUrl, {
             body: payloadBytes,
+            bodyFilePath,
             extraHeaders: headers,
             cfg,
             deadlineMs,
@@ -1300,12 +1343,12 @@ export function createWebDAVClient({
         } catch (putExc) {
           if (lockToken && !(putExc instanceof WebDAVHttpError)) {
             try {
-              const after = getBytesWithEtag(fileUrl, {
+              const after = readState(fileUrl, {
                 cfg,
                 treat405AsAbsent: true,
                 deadlineMs,
               });
-              if (after.found && sha256Bytes(after.bytes, rpc) === contentHash) {
+              if (after.found && after.hash === contentHash) {
                 return;
               }
             } catch (_verifyErr) {
@@ -1318,14 +1361,11 @@ export function createWebDAVClient({
     } catch (exc) {
       if (exc instanceof WebDAVHttpError) {
         if (exc.status === 412) {
-          const cur = getBytesWithEtag(fileUrl, { cfg, deadlineMs });
-          if (cur.found && sha256Bytes(cur.bytes, rpc) === contentHash) {
+          const cur = readState(fileUrl, { cfg, deadlineMs });
+          if (cur.found && cur.hash === contentHash) {
             createdLockPlaceholder = false;
             return;
           }
-          throw new Error(changeErr);
-        }
-        if (exc.status === 423) {
           throw new Error(changeErr);
         }
       }
@@ -1338,6 +1378,7 @@ export function createWebDAVClient({
             cfg,
             timeoutMs: deadlineMs > 0 ? 2000 : 6000,
             deadlineMs: cleanupDeadline,
+            readState,
           });
           if (!okDel) {
             cleanupErr = delDetail;
@@ -1366,11 +1407,24 @@ export function createWebDAVClient({
     putConditional(baseUrl, relPath, view, 'application/octet-stream', opts);
   };
 
-  const trashFile = (baseUrl, relPath, matchesFn, cfg = null, deadlineMs = 0) => {
+  const putAssetFile = (baseUrl, relPath, bodyFilePath, opts) => {
+    putConditional(baseUrl, relPath, null, 'application/octet-stream', { ...opts, bodyFilePath });
+  };
+
+  const trashFile = (baseUrl, relPath, matchesFn, cfg = null, deadlineMs = 0, assetCheck = null) => {
     const fileUrl = encodeWebdavRelUrl(baseUrl, relPath);
-    const { found, bytes, etag } = getBytesWithEtag(fileUrl, { cfg, deadlineMs });
-    if (!found) return 'missing';
-    if (!matchesFn(bytes)) return 'changed';
+    let etag;
+    if (assetCheck) {
+      const state = assetCheck.readState(fileUrl, { cfg, deadlineMs });
+      if (!state.found) return 'missing';
+      if (state.hash !== assetCheck.hash) return 'changed';
+      etag = state.etag;
+    } else {
+      const state = getBytesWithEtag(fileUrl, { cfg, deadlineMs });
+      if (!state.found) return 'missing';
+      if (!matchesFn(state.bytes)) return 'changed';
+      etag = state.etag;
+    }
 
     const cond = isStrongEtag(etag) ? { 'If-Match': etag } : {};
     const digest = sha256Text(relPath, getRpc()).slice(0, 8);
@@ -1430,6 +1484,7 @@ export function createWebDAVClient({
     putConditional,
     putText,
     putBytes,
+    putAssetFile,
     trashFile,
   };
 }
@@ -1441,52 +1496,63 @@ export function createWebDAVClient({
 export function createHostLocalAdapter({ callHost = null, supportsMultiNotebook = true } = {}) {
   const getRpc = () => resolveCallHost(callHost);
 
-  const listNotePaths = (nbRoot = null) => {
-    const params = {};
+  const listNotePaths = (nbRoot = null, { cfg = null, locale = 'zh', scope = 'all', skips = createSyncSkips(cfg, locale) } = {}) => {
+    const params = nbRoot && supportsMultiNotebook ? { notebook_root: nbRoot } : {};
+    let listed = null;
     if (nbRoot && supportsMultiNotebook) {
-      params.notebook_root = nbRoot;
+      try {
+        const result = getRpc()('host.fs.list', { path: nbRoot, recursive: true });
+        assertCompleteListing(result, nbRoot, locale);
+        listed = result?.entries ?? result?.files ?? null;
+      } catch (exc) {
+        if (!String(exc?.message || exc).includes('unknown host method')) throw exc;
+      }
     }
-    const res = getRpc()('host.notes.list', params);
-    const listed = Array.isArray(res?.notes) ? res.notes : [];
+    if (!Array.isArray(listed)) {
+      const result = getRpc()('host.notes.list', params);
+      assertCompleteListing(result, nbRoot || '.', locale);
+      listed = result?.notes || [];
+    }
     const paths = [];
     for (const item of listed) {
-      const rel = String(item?.path || '').replace(/\\/g, '/');
-      if (isSafeRelMd(rel) && !isSafeRelAsset(rel)) {
+      if (item?.is_dir) continue;
+      const rel = entryRelPath(item, nbRoot) || String(item?.path || '');
+      if (isSafeRelMd(rel) && !isSyncAssetCandidate(rel) && matchesScope(rel, scope) && skips.check(rel, item)) {
         paths.push(rel);
       }
     }
     return [...new Set(paths)].sort();
   };
 
-  const readNotes = ({ onlyPath = null, scope = 'all', paths = null, nbRoot = null } = {}) => {
+  const readNotes = ({
+    onlyPath = null, scope = 'all', paths = null, nbRoot = null,
+    cfg = null, locale = 'zh', skips = createSyncSkips(cfg, locale),
+  } = {}) => {
     const rpc = getRpc();
-    const notes = {};
-    if (onlyPath !== null && onlyPath !== undefined) {
-      if (!isSafeRelMd(onlyPath) || isSafeRelAsset(onlyPath)) return notes;
-      const params = { path: onlyPath };
-      if (nbRoot && supportsMultiNotebook) params.notebook_root = nbRoot;
-      try {
-        const res = rpc('host.notes.read', params);
-        if (res && typeof res === 'object' && res.found !== false && Object.hasOwn(res, 'content')) {
-          notes[onlyPath] = String(res.content ?? '');
-        }
-      } catch (exc) {
-        const low = String(exc?.message || exc).toLowerCase();
-        if (['not found', 'no such file', 'does not exist', 'missing'].some((tok) => low.includes(tok))) {
-          return notes;
-        }
-        throw exc;
-      }
-      return notes;
-    }
-
-    const allPaths = paths !== null ? paths : listNotePaths(nbRoot);
+    const notes = Object.create(null);
+    const targeted = onlyPath !== null && onlyPath !== undefined;
+    const allPaths = targeted ? [onlyPath] : paths ?? listNotePaths(nbRoot, { cfg, locale, scope, skips });
     for (const relPath of allPaths) {
-      if (!isSafeRelMd(relPath) || !matchesScope(relPath, scope)) continue;
-      const params = { path: relPath };
-      if (nbRoot && supportsMultiNotebook) params.notebook_root = nbRoot;
-      const res = rpc('host.notes.read', params);
-      notes[relPath] = String(res?.content ?? '');
+      if (!isSafeRelMd(relPath) || isSyncAssetCandidate(relPath) || (!targeted && !matchesScope(relPath, scope))) continue;
+      skips.run(relPath, () => {
+        const params = { path: relPath };
+        if (nbRoot && supportsMultiNotebook) params.notebook_root = nbRoot;
+        try {
+          if (nbRoot && (targeted || globalThis.BlockSDK)) {
+            const entry = fsStat(rpc, posixJoin(nbRoot, relPath));
+            if (!skips.check(relPath, entry)) return;
+            checkSyncBufferSize(entry.size, locale);
+          }
+          const res = rpc('host.notes.read', params);
+          if (res?.found !== false && typeof res?.content === 'string') {
+            notes[relPath] = res.content;
+            return;
+          }
+        } catch (exc) {
+          if (!isMissingSyncFile(exc)) throw exc;
+        }
+        if (!targeted) throw new Error('Note changed while opening');
+      });
     }
     return notes;
   };
@@ -1547,7 +1613,9 @@ export function createHostLocalAdapter({ callHost = null, supportsMultiNotebook 
     }
   };
 
-  const listAssets = (nbRoot, excludedSubdirs = new Set()) => {
+  const listAssets = (nbRoot, excludedSubdirs = new Set(), {
+    cfg = null, locale = 'zh', skips = createSyncSkips(cfg, locale), metadata = new Map(),
+  } = {}) => {
     if (!nbRoot) return new Set();
     const cleanRoot = String(nbRoot).replace(/\\/g, '/').replace(/\/+$/, '');
     try {
@@ -1555,22 +1623,15 @@ export function createHostLocalAdapter({ callHost = null, supportsMultiNotebook 
         path: cleanRoot,
         recursive: true,
       });
+      assertCompleteListing(res, cleanRoot, locale);
       const rawEntries = Array.isArray(res?.entries) ? res.entries : Array.isArray(res?.files) ? res.files : [];
       const out = new Set();
       for (const item of rawEntries) {
-        if (item && typeof item === 'object') {
-          if (item.is_dir || item.is_icloud_placeholder) continue;
-        }
-        let rel = String(
-          typeof item === 'string'
-            ? item
-            : item?.rel_path || item?.path || ''
-        ).replace(/\\/g, '/');
-        if (rel.startsWith(`${cleanRoot}/`)) {
-          rel = rel.slice(cleanRoot.length + 1);
-        }
-        if (isSafeRelAsset(rel) && !inSyncSubdir(rel, excludedSubdirs)) {
+        if (!item || item.is_dir) continue;
+        const rel = entryRelPath(item, cleanRoot);
+        if (isSyncAssetCandidate(rel) && !inSyncSubdir(rel, excludedSubdirs) && skips.check(rel, item)) {
           out.add(rel);
+          metadata.set(rel, item);
         }
       }
       return out;
@@ -1586,9 +1647,11 @@ export function createHostLocalAdapter({ callHost = null, supportsMultiNotebook 
     if (isCloudPlaceholder(nbRoot, relPath)) return null;
     const fullPath = posixJoin(String(nbRoot).replace(/\\/g, '/').replace(/\/+$/, ''), relPath);
     try {
+      if (globalThis.BlockSDK) checkSyncBufferSize(fsStat(getRpc(), fullPath).size);
       const res = getRpc()('host.fs.read', {
         path: fullPath,
         encoding: 'base64',
+        max_bytes: MAX_SYNC_FILE_BYTES,
       });
       if (!res || res.found === false) return null;
       if (typeof res.content_base64 === 'string') return base64ToBytes(res.content_base64);
@@ -1597,41 +1660,86 @@ export function createHostLocalAdapter({ callHost = null, supportsMultiNotebook 
       if (typeof res.content === 'string') return textToBytes(res.content);
       return null;
     } catch (exc) {
-      const low = String(exc?.message || exc).toLowerCase();
-      if (['not found', 'no such file', 'does not exist', 'missing'].some((tok) => low.includes(tok))) {
-        return null;
-      }
+      if (isMissingSyncFile(exc)) return null;
       throw exc;
     }
   };
 
-  const writeAsset = (nbRoot, relPath, data, { createOnly = false, expectedHash = null } = {}) => {
+  const hashAsset = (nbRoot, relPath, { cfg = null, locale = 'zh', skips = createSyncSkips(cfg, locale), entry = null } = {}) => {
+    if (!nbRoot || !isSafeRelAsset(relPath) || isCloudPlaceholder(nbRoot, relPath)) return null;
     const rpc = getRpc();
-    const view = data instanceof Uint8Array ? data : new Uint8Array(data || 0);
+    const fullPath = posixJoin(nbRoot, relPath);
+    const metadata = entry || fsStat(rpc, fullPath);
+    if (metadata.exists === false || !skips.check(relPath, metadata)) return null;
+    const hash = hashSyncFile(fullPath, rpc, () => {
+      const bytes = readAsset(nbRoot, relPath);
+      if (bytes !== null) checkSyncFileSize(bytes.length, cfg, locale);
+      return bytes;
+    });
+    if (hash === null) throw new Error('Attachment changed while opening');
+    return hash;
+  };
+
+  const writeAsset = (
+    nbRoot,
+    relPath,
+    data,
+    { createOnly = false, expectedHash = null, copyFromPath = '', sourceHash = '', readFallback = null } = {}
+  ) => {
+    const rpc = getRpc();
     const cleanRoot = String(nbRoot || '').replace(/\\/g, '/').replace(/\/+$/, '');
     const fullPath = posixJoin(cleanRoot, relPath);
-    if (createOnly) {
-      let existing = null;
-      try {
-        existing = readAsset(cleanRoot, relPath);
-      } catch (_err) {
-        existing = null;
-      }
-      if (existing !== null) {
-        if (sha256Bytes(existing, rpc) === sha256Bytes(view, rpc)) {
-          return { ok: true, skipped: true };
+    if (copyFromPath) {
+      const expectedNextHash = sourceHash || hashSyncFile(copyFromPath, rpc, () => (typeof readFallback === 'function' ? readFallback() : null));
+      if (createOnly || expectedHash != null) {
+        const curHash = hashSyncFile(fullPath, rpc, () => readAsset(cleanRoot, relPath));
+        if (curHash !== null || !createOnly) {
+          if (expectedNextHash && curHash === expectedNextHash) return { ok: true, skipped: true };
+          if (curHash === null || curHash !== expectedHash || createOnly) {
+            throw new Error(`Attachment changed during sync; aborted overwrite: ${relPath}`);
+          }
         }
-        throw new Error(`Attachment changed during sync; aborted overwrite: ${relPath}`);
       }
-    } else if (expectedHash !== null && expectedHash !== undefined) {
-      const existing = readAsset(cleanRoot, relPath);
-      if (existing === null) {
-        throw new Error(`Attachment disappeared during sync; aborted overwrite: ${relPath}`);
+      if (sourceHash) {
+        const preCopyHash = hashSyncFile(copyFromPath, rpc, () => null);
+        if (preCopyHash !== null && preCopyHash !== sourceHash) {
+          const err = new Error('Attachment changed after scanning');
+          err.code = 'fs_error';
+          throw err;
+        }
       }
-      const curHash = sha256Bytes(existing, rpc);
-      const nextHash = sha256Bytes(view, rpc);
-      if (curHash !== String(expectedHash) && curHash !== nextHash) {
-        throw new Error(`Attachment changed during sync; aborted overwrite: ${relPath}`);
+      try {
+        const copyRes = rpc('host.fs.copy', {
+          from: String(copyFromPath),
+          to: fullPath,
+          overwrite: !createOnly,
+          mkdir_parents: true,
+        });
+        if (sourceHash) {
+          const postHash = hashSyncFile(fullPath, rpc, () => null);
+          if (postHash !== null && postHash !== sourceHash) {
+            const err = new Error('Attachment changed after scanning');
+            err.code = 'fs_error';
+            throw err;
+          }
+        }
+        return copyRes;
+      } catch (exc) {
+        const low = String(exc?.message || exc || '').toLowerCase();
+        const unsupported = exc?.code === -32601 || low.includes('unknown host method') || low.includes('-32601');
+        if (!unsupported || typeof readFallback !== 'function') throw exc;
+        data = readFallback();
+      }
+    }
+    const view = data instanceof Uint8Array ? data : new Uint8Array(data || 0);
+    if (createOnly || expectedHash != null) {
+      const curHash = hashSyncFile(fullPath, rpc, () => readAsset(cleanRoot, relPath));
+      if (curHash !== null || !createOnly) {
+        const nextHash = sha256Bytes(view, rpc);
+        if (curHash === nextHash) return { ok: true, skipped: true };
+        if (curHash === null || curHash !== expectedHash || createOnly) {
+          throw new Error(`Attachment changed during sync; aborted overwrite: ${relPath}`);
+        }
       }
     }
     return rpc('host.fs.write', {
@@ -1649,6 +1757,7 @@ export function createHostLocalAdapter({ callHost = null, supportsMultiNotebook 
     trashFile,
     isCloudPlaceholder,
     listAssets,
+    hashAsset,
     readAsset,
     writeAsset,
   };
@@ -1667,6 +1776,7 @@ export function createWebDAVSyncEngine({
   locale = 'zh',
   sleepFn = null,
   nowMsFn = () => Date.now(),
+  dataDir = '',
 } = {}) {
   const getRpc = () => resolveCallHost(callHost);
   const davClient = client || createWebDAVClient({ callHost, locale, sleepFn, nowMsFn });
@@ -1675,8 +1785,37 @@ export function createWebDAVSyncEngine({
     supportsMultiNotebook: configStore ? configStore.state.supportsMultiNotebook : true,
   });
   const previewCache = new Map();
+  const remoteAssetCache = new Map();
+  let assetCacheUser;
+  let assetCachePassword;
 
   const getLocale = () => (configStore ? configStore.state.locale : locale);
+  const streamAssets = Boolean(dataDir && !client && !localAdapter);
+  let assetTempSequence = 0;
+  const withRemoteAsset = (url, options, use) => {
+    const rpc = getRpc();
+    const saveToPath = streamAssets ? posixJoin(dataDir, `.webdav-asset-${nowMsFn()}-${++assetTempSequence}.tmp`) : '';
+    try {
+      const res = davClient.getBytesWithEtag(url, { ...options, saveToPath });
+      if (!res.found) return use(res);
+      const size = saveToPath ? res.size ?? fsStat(rpc, saveToPath).size : res.bytes.length;
+      checkSyncFileSize(size, options.cfg, getLocale());
+      const hash = saveToPath
+        ? hashSyncFile(saveToPath, rpc, () => fsReadBytes(rpc, saveToPath))
+        : sha256Bytes(res.bytes, rpc);
+      if (!hash) throw new Error('Attachment changed while opening');
+      return use({ ...res, size, hash, filePath: saveToPath });
+    } finally {
+      if (saveToPath) {
+        try {
+          fsDelete(rpc, saveToPath);
+        } catch (_exc) {
+          // The file may already have been moved into its destination.
+        }
+      }
+    }
+  };
+  const readRemoteAssetState = (url, options) => withRemoteAsset(url, options, ({ found, etag, size, hash }) => ({ found, etag, size, hash }));
 
   const emitProgress = (params) => {
     if (!params || Object.keys(params).length === 0) return;
@@ -1729,6 +1868,7 @@ export function createWebDAVSyncEngine({
       subdir = '',
       excludedSubdirs = new Set(),
       deadlineMs = 0,
+      skips = createSyncSkips(cfg, getLocale()),
     } = {}
   ) => {
     const loc = getLocale();
@@ -1744,7 +1884,7 @@ export function createWebDAVSyncEngine({
     }
 
     const exKey = [...excludedSubdirs].sort().join('\u0000');
-    const cacheKey = `${baseUrl}\u0000${scope}\u0000${onlyPath || ''}\u0000${exKey}`;
+    const cacheKey = JSON.stringify([baseUrl, scope, onlyPath, exKey, cfg.max_file_size_mb, cfg.ignore_patterns]);
     if (!forceRefresh && onlyPath === null && previewCache.has(cacheKey)) {
       const cached = previewCache.get(cacheKey);
       if (nowMsFn() - cached.ts < 15000) {
@@ -1758,6 +1898,8 @@ export function createWebDAVSyncEngine({
     }
 
     try {
+      const metadata = new Map();
+      const before = skips.items.length;
       const remotePaths = onlyPath
         ? [onlyPath]
         : davClient.listScoped(baseUrl, isSafeRelMd, {
@@ -1767,28 +1909,35 @@ export function createWebDAVSyncEngine({
             excludedSubdirs,
             skipAssets: true,
             deadlineMs,
+            metadata,
           });
 
-      const remoteNotes = {};
-      const remoteEtags = {};
-      for (const relPath of remotePaths) {
-        if (!isSafeRelMd(relPath) || isSafeRelAsset(relPath) || inSyncSubdir(relPath, excludedSubdirs)) {
-          continue;
-        }
-        const fileUrl = encodeWebdavRelUrl(baseUrl, relPath);
-        const { found, bytes, etag } = davClient.getBytesWithEtag(fileUrl, {
-          cfg,
-          timeoutMs,
-          deadlineMs,
-        });
-        if (found) {
+      const remoteNotes = Object.create(null);
+      const remoteEtags = Object.create(null);
+      const readRemoteNote = (relPath, listed) => {
+        const entry = metadata.get(relPath);
+        if (!skips.check(relPath, { size: entry?.contentLength })) return;
+        skips.run(relPath, () => {
+          const fileUrl = encodeWebdavRelUrl(baseUrl, relPath);
+          const { found, bytes, etag } = davClient.getBytesWithEtag(fileUrl, { cfg, timeoutMs, deadlineMs });
+          if (!found) {
+            if (listed) throw new Error('Note changed while opening');
+            return;
+          }
+          checkSyncFileSize(bytes.length, cfg, loc);
           remoteNotes[relPath] = decodeNoteBytes(bytes, relPath);
           if (etag) remoteEtags[relPath] = etag;
+        });
+      };
+      for (const relPath of remotePaths) {
+        if (isSafeRelMd(relPath) && !isSyncAssetCandidate(relPath) && !inSyncSubdir(relPath, excludedSubdirs)) {
+          readRemoteNote(relPath, !onlyPath);
         }
       }
 
       if (
         onlyPath &&
+        !skips.has(onlyPath) &&
         Object.keys(remoteNotes).length === 0 &&
         isSafeRelMd(onlyPath) &&
         !isSafeRelAsset(onlyPath) &&
@@ -1800,21 +1949,10 @@ export function createWebDAVSyncEngine({
           excludedSubdirs,
           deadlineMs,
         });
-        for (const altRel of alts) {
-          const altUrl = encodeWebdavRelUrl(baseUrl, altRel);
-          const { found, bytes, etag } = davClient.getBytesWithEtag(altUrl, {
-            cfg,
-            timeoutMs,
-            deadlineMs,
-          });
-          if (found) {
-            remoteNotes[altRel] = decodeNoteBytes(bytes, altRel);
-            if (etag) remoteEtags[altRel] = etag;
-          }
-        }
+        for (const altRel of alts) readRemoteNote(altRel, true);
       }
 
-      if (onlyPath === null) {
+      if (onlyPath === null && skips.items.length === before) {
         previewCache.set(cacheKey, {
           ts: nowMsFn(),
           notes: { ...remoteNotes },
@@ -1824,14 +1962,7 @@ export function createWebDAVSyncEngine({
 
       return { ok: true, notes: remoteNotes, etags: remoteEtags, error: null };
     } catch (exc) {
-      const msg = exc?.message && String(exc.message).startsWith('Note is not valid UTF-8')
-        ? String(exc.message)
-        : tr(
-            loc,
-            `WebDAV 连接不可达: ${errorDetail(loc, exc)}`,
-            `WebDAV server is unreachable: ${errorDetail(loc, exc)}`
-          );
-      return { ok: false, notes: {}, etags: {}, error: msg };
+      return { ok: false, notes: {}, etags: {}, error: errorDetail(loc, exc) };
     }
   };
 
@@ -1883,11 +2014,14 @@ export function createWebDAVSyncEngine({
     isFirstSync = false,
     nbKey = 'default',
     deadlineMs = 0,
+    skips = createSyncSkips(cfg, getLocale()),
   }) => {
     const rpc = getRpc();
+    const loc = getLocale();
     const empty = {
-      local_assets: {},
-      remote_assets: {},
+      skipped_items: skips.items,
+      local_asset_hashes: {},
+      remote_asset_hashes: {},
       remote_asset_etags: {},
       remote_asset_path_map: {},
       assets_to_push_new: [],
@@ -1917,7 +2051,10 @@ export function createWebDAVSyncEngine({
       if (explicitPaths.size === 0) return empty;
     }
 
-    const localCandidates = explicitPaths !== null ? new Set(explicitPaths) : local.listAssets(nbRoot, excludedSubdirs);
+    const localMetadata = new Map();
+    const remoteMetadata = new Map();
+    const localCandidates = explicitPaths !== null ? new Set(explicitPaths)
+      : local.listAssets(nbRoot, excludedSubdirs, { cfg, locale: loc, skips, metadata: localMetadata });
     for (const rel of localCandidates) {
       if (inSyncSubdir(rel, excludedSubdirs)) {
         throw new Error(
@@ -1932,7 +2069,7 @@ export function createWebDAVSyncEngine({
 
     const remoteCandidates = explicitPaths !== null
       ? new Set(explicitPaths)
-      : new Set(davClient.listScoped(baseUrl, isSafeRelAsset, { scope, cfg, excludedSubdirs, deadlineMs }));
+      : new Set(davClient.listScoped(baseUrl, isSyncAssetCandidate, { scope, cfg, excludedSubdirs, deadlineMs, metadata: remoteMetadata }));
 
     const referenced = new Set();
     let candidates = new Set([...localCandidates, ...remoteCandidates]);
@@ -1949,42 +2086,77 @@ export function createWebDAVSyncEngine({
       candidates = new Set([...candidates].filter((p) => !inSyncSubdir(p, excludedSubdirs)));
     }
 
-    const localAssets = {};
-    const remoteAssets = {};
-    const remoteAssetEtags = {};
+    const localAssets = Object.create(null);
+    const remoteAssets = Object.create(null);
+    const remoteAssetEtags = Object.create(null);
     const remoteAssetPathMap = {};
+    if (assetCacheUser !== cfg.webdav_user || assetCachePassword !== cfg.webdav_pass) {
+      remoteAssetCache.clear();
+      assetCacheUser = cfg.webdav_user;
+      assetCachePassword = cfg.webdav_pass;
+    }
+    const hashLocalAsset = (rel) => {
+      if (!isSafeRelAsset(rel)) return null;
+      if (typeof local.hashAsset === 'function') {
+        return local.hashAsset(nbRoot, rel, { cfg, locale: loc, skips, entry: localMetadata.get(rel) });
+      }
+      const data = local.readAsset(nbRoot, rel);
+      if (data === null) return null;
+      checkSyncFileSize(data.length, cfg, loc);
+      return sha256Bytes(data, rpc);
+    };
+    const hashRemoteAsset = (rel, listed = false) => {
+      const entry = remoteMetadata.get(rel);
+      if (!skips.check(rel, { size: entry?.contentLength })) return null;
+      const url = encodeWebdavRelUrl(baseUrl, rel);
+      const cached = remoteAssetCache.get(url);
+      if (cached && isStrongEtag(entry?.etag) && entry.etag === cached.etag) {
+        if (!skips.check(rel, { size: cached.size })) return null;
+        remoteAssetEtags[rel] = cached.etag;
+        return cached.hash;
+      }
+      const { found, etag, hash, size } = readRemoteAssetState(url, { cfg, deadlineMs });
+      if (!found) {
+        if (listed) throw new Error('Attachment changed while opening');
+        return null;
+      }
+      if (etag) remoteAssetEtags[rel] = etag;
+      if (isStrongEtag(etag)) {
+        remoteAssetCache.delete(url);
+        remoteAssetCache.set(url, { etag, hash, size });
+        if (remoteAssetCache.size > 4096) remoteAssetCache.delete(remoteAssetCache.keys().next().value);
+      }
+      return hash;
+    };
 
     for (const rel of [...candidates].sort()) {
-      if (excludedSubdirs.size > 0 && inSyncSubdir(rel, excludedSubdirs)) continue;
-      if (localCandidates.has(rel) || referenced.has(rel)) {
-        const ldata = local.readAsset(nbRoot, rel);
-        if (ldata !== null) localAssets[rel] = ldata;
-      }
-      if (explicitPaths === null && !remoteCandidates.has(rel) && !referenced.has(rel)) {
-        continue;
-      }
-      const fileUrl = encodeWebdavRelUrl(baseUrl, rel);
-      const { found, bytes, etag } = davClient.getBytesWithEtag(fileUrl, { cfg, deadlineMs });
-      if (found) {
-        remoteAssets[rel] = bytes;
-        if (etag) remoteAssetEtags[rel] = etag;
-      } else if (explicitPaths !== null || referenced.has(rel)) {
-        const alts = davClient.findCaseVariants(baseUrl, rel, {
-          cfg,
-          excludedSubdirs,
-          filterFn: isSafeRelAsset,
-          deadlineMs,
-        });
-        for (const altRel of alts) {
-          const altUrl = encodeWebdavRelUrl(baseUrl, altRel);
-          const altRes = davClient.getBytesWithEtag(altUrl, { cfg, deadlineMs });
-          if (altRes.found) {
-            remoteAssets[altRel] = altRes.bytes;
-            if (altRes.etag) remoteAssetEtags[altRel] = altRes.etag;
-            break;
+      if (inSyncSubdir(rel, excludedSubdirs)) continue;
+      const listed = explicitPaths === null && remoteCandidates.has(rel);
+      if (!skips.check(rel, { size: remoteMetadata.get(rel)?.contentLength })) continue;
+      skips.run(rel, () => {
+        const lhash = hashLocalAsset(rel);
+        if (skips.has(rel)) return;
+        if (lhash !== null) localAssets[rel] = lhash;
+        if (explicitPaths === null && !listed && !referenced.has(rel)) return;
+        const rhash = hashRemoteAsset(rel, listed);
+        if (rhash !== null) {
+          remoteAssets[rel] = rhash;
+        } else if (!skips.has(rel) && (explicitPaths !== null || referenced.has(rel))) {
+          const alts = davClient.findCaseVariants(baseUrl, rel, {
+            cfg, excludedSubdirs, filterFn: isSafeRelAsset, deadlineMs,
+          });
+          for (const altRel of alts) {
+            const altHash = hashRemoteAsset(altRel, true);
+            if (altHash !== null) {
+              remoteAssets[altRel] = altHash;
+              break;
+            }
           }
         }
-      }
+      });
+    }
+    for (const paths of [localAssets, remoteAssets]) {
+      for (const rel of Object.keys(paths)) if (skips.has(rel)) delete paths[rel];
     }
 
     const pushNew = [];
@@ -2003,18 +2175,17 @@ export function createWebDAVSyncEngine({
 
     const allAssetPaths = [...new Set([...Object.keys(localAssets), ...Object.keys(remoteAssets)])].sort();
     for (const rel of allAssetPaths) {
-      const ldata = localAssets[rel] ?? null;
-      const rdata = remoteAssets[rel] ?? null;
-      if (ldata === null && rdata === null) continue;
-      if (ldata !== null && rdata !== null && bytesEqual(ldata, rdata)) {
+      const lhash = localAssets[rel] ?? null;
+      const rhash = remoteAssets[rel] ?? null;
+      if (skips.has(rel)) continue;
+      if (lhash === rhash) {
         synced.push(rel);
         continue;
       }
-      if (ldata === null) {
+      if (lhash === null) {
         if (typeof local.isCloudPlaceholder === 'function' && local.isCloudPlaceholder(nbRoot, rel)) {
           continue;
         }
-        const rhash = sha256Bytes(rdata, rpc);
         const assetKey = `asset:${rel}`;
         let matchedDelHash = null;
         if (allowDeleteRemote) {
@@ -2038,9 +2209,9 @@ export function createWebDAVSyncEngine({
         }
         continue;
       }
-      if (rdata === null) {
+      if (rhash === null) {
         const baseDel = allowDeleteLocal ? baseMap[`asset:${rel}`] : undefined;
-        if (baseDel !== undefined && sha256Bytes(ldata, rpc) === baseDel) {
+        if (baseDel !== undefined && lhash === baseDel) {
           deleteLocal.push(rel);
           assetDeleteExpectedHashes[`asset:${rel}`] = baseDel;
         } else {
@@ -2051,8 +2222,6 @@ export function createWebDAVSyncEngine({
 
       const baseKey = `asset:${rel}`;
       const baseHash = baseMap[baseKey];
-      const lhash = sha256Bytes(ldata, rpc);
-      const rhash = sha256Bytes(rdata, rpc);
 
       if (baseHash !== undefined && lhash === baseHash && rhash !== baseHash) {
         pullOw.push([rel, false]);
@@ -2063,38 +2232,34 @@ export function createWebDAVSyncEngine({
       } else if (policy === 'local_first') {
         pushOw.push([rel, true]);
       } else {
-        const [stem, ext] = splitExt(rel);
-        const fingerprint = rhash.slice(0, 16);
-        let attempt = 1;
-        let copyRel = '';
-        while (true) {
-          const suffix = attempt === 1 ? '' : `-${attempt}`;
-          copyRel = `${stem}.conflict-${fingerprint}${suffix}${ext}`;
-          if (!reservedCopies.has(copyRel)) {
-            let lcopy = localAssets[copyRel] ?? null;
-            if (lcopy === null) lcopy = local.readAsset(nbRoot, copyRel);
-            let rcopy = remoteAssets[copyRel] ?? null;
-            if (rcopy === null) {
-              const copyUrl = encodeWebdavRelUrl(baseUrl, copyRel);
-              const rc = davClient.getBytesWithEtag(copyUrl, { cfg, deadlineMs });
-              rcopy = rc.found ? rc.bytes : null;
+        skips.run(rel, () => {
+          const [stem, ext] = splitExt(rel);
+          const fingerprint = rhash.slice(0, 16);
+          for (let attempt = 1; ; attempt += 1) {
+            const suffix = attempt === 1 ? '' : `-${attempt}`;
+            const copyRel = `${stem}.conflict-${fingerprint}${suffix}${ext}`;
+            if (checkSyncFilename(copyRel, loc)) throw new Error('Conflict copy file name too long');
+            if (reservedCopies.has(copyRel) || skips.has(copyRel)) continue;
+            if (!skips.check(copyRel)) {
+              skips.add(rel, 'conflict_copy', tr(loc, `无法同步冲突副本：${copyRel}`, `Cannot sync conflict copy: ${copyRel}`));
+              return;
             }
-            const lOk = lcopy === null || bytesEqual(lcopy, rdata);
-            const rOk = rcopy === null || bytesEqual(rcopy, rdata);
-            if (lOk && rOk) {
+            const lcopy = hashLocalAsset(copyRel);
+            const rcopy = hashRemoteAsset(copyRel);
+            if (!skips.has(copyRel) && (lcopy === null || lcopy === rhash) && (rcopy === null || rcopy === rhash)) {
               reservedCopies.add(copyRel);
+              conflicts.push([rel, copyRel]);
               break;
             }
           }
-          attempt += 1;
-        }
-        conflicts.push([rel, copyRel]);
+        });
       }
     }
 
     return {
-      local_assets: localAssets,
-      remote_assets: remoteAssets,
+      skipped_items: skips.items,
+      local_asset_hashes: localAssets,
+      remote_asset_hashes: remoteAssets,
       remote_asset_etags: remoteAssetEtags,
       remote_asset_path_map: remoteAssetPathMap,
       assets_to_push_new: pushNew,
@@ -2119,6 +2284,7 @@ export function createWebDAVSyncEngine({
     subdir = '',
     excludedSubdirs = new Set(),
     deadlineMs = 0,
+    skipRound,
   } = {}) => {
     const rpc = getRpc();
     const loc = getLocale();
@@ -2129,7 +2295,8 @@ export function createWebDAVSyncEngine({
     const scope = cfg.sync_scope || 'all';
     const policy = cfg.conflict_policy || 'keep_both';
 
-    const localNotes = local.readNotes({ onlyPath, scope, nbRoot: effectiveNbRoot });
+    const skips = createSyncSkips(cfg, loc, skipRound);
+    let localNotes = local.readNotes({ onlyPath, scope, nbRoot: effectiveNbRoot, cfg, locale: loc, skips });
     for (const relPath of Object.keys(localNotes)) {
       if (inSyncSubdir(relPath, excludedSubdirs)) {
         throw new Error(
@@ -2165,6 +2332,7 @@ export function createWebDAVSyncEngine({
         subdir,
         excludedSubdirs,
         deadlineMs,
+        skips,
       });
       if (fetched.ok) {
         remoteNotes = fetched.notes;
@@ -2175,7 +2343,7 @@ export function createWebDAVSyncEngine({
       }
     } else {
       const exKey = [...excludedSubdirs].sort().join('\u0000');
-      const cacheKey = `${baseUrl}\u0000${scope}\u0000${onlyPath || ''}\u0000${exKey}`;
+      const cacheKey = JSON.stringify([baseUrl, scope, onlyPath, exKey, cfg.max_file_size_mb, cfg.ignore_patterns]);
       if (previewCache.has(cacheKey)) {
         const cached = previewCache.get(cacheKey);
         remoteNotes = { ...cached.notes };
@@ -2185,6 +2353,8 @@ export function createWebDAVSyncEngine({
       }
     }
 
+    localNotes = Object.fromEntries(Object.entries(localNotes).filter(([path]) => skips.check(path)));
+    remoteNotes = Object.fromEntries(Object.entries(remoteNotes).filter(([path]) => skips.check(path)));
     const baseMap = configStore ? configStore.getBaseMap(metaKey, legacyKey) : {};
     const initMap = (configStore && configStore.state.syncMeta[INITIALIZED_META_KEY]) || {};
     const hasMeta = Boolean(
@@ -2213,21 +2383,26 @@ export function createWebDAVSyncEngine({
     const conflicts = [];
     const synced = [];
     const reservedConflictPaths = new Set([...Object.keys(localNotes), ...Object.keys(remoteNotes)]);
+    const checkLocalNote = onlyPath == null ? null : (cand) => {
+      const text = local.readNotes({ onlyPath: cand, scope, nbRoot: effectiveNbRoot, cfg, locale: loc, skips })[cand];
+      return skips.has(cand) ? false : text;
+    };
+    const checkRemoteNote = onlyPath == null ? null : (cand) => {
+      const text = skips.run(cand, () => {
+        const candUrl = encodeWebdavRelUrl(baseUrl, cand);
+        const { found, bytes } = davClient.getBytesWithEtag(candUrl, { cfg, deadlineMs });
+        if (!found) return null;
+        checkSyncFileSize(bytes.length, cfg, loc);
+        return decodeNoteBytes(bytes, cand);
+      });
+      return skips.has(cand) ? false : text;
+    };
 
     if (remoteInspected && !remoteError) {
-      let checkLocalNote = null;
-      let checkRemoteNote = null;
-      if (onlyPath !== null && onlyPath !== undefined) {
-        checkLocalNote = (cand) => local.readNotes({ onlyPath: cand, scope, nbRoot: effectiveNbRoot })[cand];
-        checkRemoteNote = (cand) => {
-          const candUrl = encodeWebdavRelUrl(baseUrl, cand);
-          const { found, bytes } = davClient.getBytesWithEtag(candUrl, { cfg, deadlineMs });
-          return found ? decodeNoteBytes(bytes, cand) : null;
-        };
-      }
 
       const allPaths = [...new Set([...Object.keys(localNotes), ...Object.keys(remoteNotes)])].sort();
       for (const relPath of allPaths) {
+        if (skips.has(relPath)) continue;
         const inLocal = Object.hasOwn(localNotes, relPath);
         const inRemote = Object.hasOwn(remoteNotes, relPath);
         if (inLocal && !inRemote) {
@@ -2253,6 +2428,7 @@ export function createWebDAVSyncEngine({
               reserved: reservedConflictPaths,
               checkLocal: checkLocalNote,
               checkRemote: checkRemoteNote,
+              checkPath: skips.check,
               callHost: rpc,
             });
             conflicts.push([relPath, conflictRel, remoteNotes[relPath]]);
@@ -2289,6 +2465,7 @@ export function createWebDAVSyncEngine({
             deletionHeld.add(relPath);
           } else {
             if (idx >= 0) toPullNew.splice(idx, 1);
+            if (!checkMissingSyncPath(effectiveNbRoot, relPath, (path) => fsStat(rpc, path), skips)) continue;
             toDeleteRemote.push(relPath);
             deleteExpectedHashes[relPath] = matchedDeletedHash;
           }
@@ -2310,8 +2487,8 @@ export function createWebDAVSyncEngine({
     }
 
     let assetPlan = {
-      local_assets: {},
-      remote_assets: {},
+      local_asset_hashes: {},
+      remote_asset_hashes: {},
       remote_asset_etags: {},
       remote_asset_path_map: {},
       assets_to_push_new: [],
@@ -2342,6 +2519,7 @@ export function createWebDAVSyncEngine({
           isFirstSync,
           nbKey: nbKeyVal,
           deadlineMs,
+          skips,
         });
       } catch (exc) {
         remoteInspected = false;
@@ -2358,16 +2536,6 @@ export function createWebDAVSyncEngine({
     const assetViewCopies = [];
     if (remoteInspected && !remoteError && policy === 'keep_both' && assetPlan.asset_conflicts.length > 0) {
       const plannedAssetCopyMap = Object.fromEntries(assetPlan.asset_conflicts);
-      let checkLocalNote = null;
-      let checkRemoteNote = null;
-      if (onlyPath !== null && onlyPath !== undefined) {
-        checkLocalNote = (cand) => local.readNotes({ onlyPath: cand, scope, nbRoot: effectiveNbRoot })[cand];
-        checkRemoteNote = (cand) => {
-          const candUrl = encodeWebdavRelUrl(baseUrl, cand);
-          const { found, bytes } = davClient.getBytesWithEtag(candUrl, { cfg, deadlineMs });
-          return found ? decodeNoteBytes(bytes, cand) : null;
-        };
-      }
       for (const relPath of synced) {
         const rtext = remoteNotes[relPath];
         if (rtext === undefined) continue;
@@ -2379,9 +2547,10 @@ export function createWebDAVSyncEngine({
             reserved: reservedConflictPaths,
             checkLocal: checkLocalNote,
             checkRemote: checkRemoteNote,
+            checkPath: skips.check,
             callHost: rpc,
           });
-          assetViewCopies.push([relPath, conflictRel, rewritten]);
+          assetViewCopies.push([relPath, conflictRel, rtext]);
         }
       }
     }
@@ -2409,8 +2578,8 @@ export function createWebDAVSyncEngine({
       scope,
       local: Object.entries(localNotes).sort().map(([p, t]) => [p, sha256Text(t, rpc)]),
       remote: Object.entries(remoteNotes).sort().map(([p, t]) => [p, sha256Text(t, rpc)]),
-      local_assets: Object.entries(assetPlan.local_assets).sort().map(([p, b]) => [p, sha256Bytes(b, rpc)]),
-      remote_assets: Object.entries(assetPlan.remote_assets).sort().map(([p, b]) => [p, sha256Bytes(b, rpc)]),
+      local_assets: Object.entries(assetPlan.local_asset_hashes).sort(),
+      remote_assets: Object.entries(assetPlan.remote_asset_hashes).sort(),
       base: Object.entries(baseMap).sort(),
       del_remote: [...toDeleteRemote].sort(),
       del_local: [...toDeleteLocal].sort(),
@@ -2430,6 +2599,8 @@ export function createWebDAVSyncEngine({
       base_url: baseUrl,
       meta_key: metaKey,
       base_map: baseMap,
+      skipped_items: skips.items,
+      skips,
       is_first_sync: isFirstSync,
       remote_nonempty_on_first_sync: remoteNonemptyOnFirstSync,
       local_notes: localNotes,
@@ -2670,13 +2841,30 @@ export function createWebDAVSyncEngine({
     const nbKeyVal = plan.nb_key;
     const subdir = plan.subdir || '';
     const baseMap = { ...(plan.base_map || {}) };
+    const skips = plan.skips || createSyncSkips(cfg, loc);
+    plan.skipped_items = skips.items;
     const localNotes = plan.local_notes || {};
     const remoteNotes = plan.remote_notes || {};
     const remoteEtags = plan.remote_etags || {};
-    const localAssets = plan.local_assets || {};
-    const remoteAssets = plan.remote_assets || {};
+    const localAssets = plan.local_asset_hashes || {};
+    const remoteAssets = plan.remote_asset_hashes || {};
     const remoteAssetEtags = plan.remote_asset_etags || {};
     const baseUrl = plan.base_url;
+    const readLocalAsset = (rel) => readPlannedAsset(
+      () => local.readAsset(nbRoot, rel), localAssets[rel], cfg, rpc, loc
+    );
+    const useRemoteAsset = (rel, use) => withRemoteAsset(
+      encodeWebdavRelUrl(baseUrl, rel), { cfg, deadlineMs }, (asset) => {
+        if (!asset.found || asset.hash !== remoteAssets[rel]) throw new Error('Attachment changed during sync');
+        return use(asset);
+      }
+    );
+    const writeLocalAsset = (rel, asset, options) => {
+      if (!asset.filePath) return local.writeAsset(nbRoot, rel, asset.bytes, options);
+      return writeMirrorBytes(rpc, nbRoot, rel, null, {
+        ...options, locale: loc, dataDir, nowMsFn, sourcePath: asset.filePath, sourceHash: asset.hash,
+      });
+    };
 
     const rootUrl = webdavRootUrl(cfg);
     const subDir = resolveWebdavDir(cfg).replace(/^\/+|\/+$/g, '');
@@ -2695,14 +2883,27 @@ export function createWebDAVSyncEngine({
       });
     };
 
-    const writeRemoteAsset = (rel, data, { expectedHash = null, createOnly = false } = {}) => {
-      davClient.putBytes(baseUrl, rel, data, {
-        cfg,
-        expectedHash,
-        expectedEtag: remoteAssetEtags[rel],
-        createOnly,
-        deadlineMs,
-      });
+    const writeRemoteAsset = (rel, asset, { expectedHash = null, createOnly = false } = {}) => {
+      const options = { cfg, expectedHash, expectedEtag: remoteAssetEtags[rel], createOnly, deadlineMs };
+      if (asset.filePath) {
+        davClient.putAssetFile(baseUrl, rel, asset.filePath, { ...options, sourceHash: asset.hash, readState: readRemoteAssetState });
+      } else {
+        davClient.putBytes(baseUrl, rel, asset.bytes, options);
+      }
+    };
+    const uploadLocalAsset = (rel, options) => {
+      if (!streamAssets) return writeRemoteAsset(rel, { bytes: readLocalAsset(rel) }, options);
+      const filePath = posixJoin(nbRoot, rel);
+      checkSyncFileSize(fsStat(rpc, filePath).size, cfg, loc);
+      const hash = localAssets[rel];
+      const verify = () => {
+        if (hashSyncFile(filePath, rpc, () => local.readAsset(nbRoot, rel)) !== hash) {
+          throw new Error('Attachment changed during sync');
+        }
+      };
+      verify();
+      writeRemoteAsset(rel, { filePath, hash }, options);
+      verify();
     };
 
     let pushed = 0;
@@ -2728,70 +2929,62 @@ export function createWebDAVSyncEngine({
 
     try {
       // 1. Sync attachments.
-      for (const rel of plan.assets_synced || []) {
-        if (Object.hasOwn(localAssets, rel)) {
-          baseMap[`asset:${rel}`] = sha256Bytes(localAssets[rel], rpc);
-        }
+      skips.each(plan.assets_synced, (rel) => {
+        baseMap[`asset:${rel}`] = localAssets[rel];
         if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${rel}`);
-      }
+      });
 
-      for (const rel of plan.assets_to_push_new || []) {
-        const data = localAssets[rel];
-        writeRemoteAsset(rel, data, { createOnly: true });
-        baseMap[`asset:${rel}`] = sha256Bytes(data, rpc);
+      skips.each(plan.assets_to_push_new, (rel) => {
+        uploadLocalAsset(rel, { createOnly: true });
+        baseMap[`asset:${rel}`] = localAssets[rel];
         if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${rel}`);
         assetCount += 1;
         stepProgress();
-      }
+      });
 
-      for (const [rel] of plan.assets_to_push_overwrite || []) {
-        const data = localAssets[rel];
-        const expHash = Object.hasOwn(remoteAssets, rel) ? sha256Bytes(remoteAssets[rel], rpc) : null;
-        writeRemoteAsset(rel, data, { expectedHash: expHash });
-        baseMap[`asset:${rel}`] = sha256Bytes(data, rpc);
+      skips.each(plan.assets_to_push_overwrite, ([rel]) => {
+        uploadLocalAsset(rel, { expectedHash: remoteAssets[rel] });
+        baseMap[`asset:${rel}`] = localAssets[rel];
         if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${rel}`);
         assetCount += 1;
         stepProgress();
-      }
+      });
 
-      for (const rel of plan.assets_to_pull_new || []) {
-        const data = remoteAssets[rel];
-        const rhash = sha256Bytes(data, rpc);
+      skips.each(plan.assets_to_pull_new, (rel) => {
+        const rhash = remoteAssets[rel];
         if (!plan.is_first_sync && configStore && configStore.lookupTombstoneHash(nbKeyVal, `asset:${rel}`) === rhash) {
           stepProgress();
-          continue;
+          return;
         }
-        local.writeAsset(nbRoot, rel, data, { createOnly: true });
+        useRemoteAsset(rel, (asset) => writeLocalAsset(rel, asset, { createOnly: true }));
         baseMap[`asset:${rel}`] = rhash;
         if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${rel}`);
         assetCount += 1;
         stepProgress();
-      }
+      });
 
-      for (const [rel] of plan.assets_to_pull_overwrite || []) {
-        const data = remoteAssets[rel];
-        const expHash = Object.hasOwn(localAssets, rel) ? sha256Bytes(localAssets[rel], rpc) : null;
-        local.writeAsset(nbRoot, rel, data, { expectedHash: expHash });
-        baseMap[`asset:${rel}`] = sha256Bytes(data, rpc);
+      skips.each(plan.assets_to_pull_overwrite, ([rel]) => {
+        useRemoteAsset(rel, (asset) => writeLocalAsset(rel, asset, { expectedHash: localAssets[rel] }));
+        baseMap[`asset:${rel}`] = remoteAssets[rel];
         if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${rel}`);
         assetCount += 1;
         stepProgress();
-      }
+      });
 
       const deferredAssetOverwrites = [];
-      for (const [rel, copyRel] of plan.asset_conflicts || []) {
-        const ldata = localAssets[rel];
-        const rdata = remoteAssets[rel];
-        const rhash = sha256Bytes(rdata, rpc);
-        local.writeAsset(nbRoot, copyRel, rdata, { createOnly: true });
-        writeRemoteAsset(copyRel, rdata, { createOnly: true });
+      skips.each(plan.asset_conflicts, ([rel, copyRel]) => {
+        const rhash = remoteAssets[rel];
+        useRemoteAsset(rel, (asset) => {
+          writeRemoteAsset(copyRel, asset, { createOnly: true });
+          writeLocalAsset(copyRel, asset, { createOnly: true });
+        });
         baseMap[`asset:${copyRel}`] = rhash;
         if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${copyRel}`);
         assetCopyMap[rel] = copyRel;
-        deferredAssetOverwrites.push([rel, ldata, rhash]);
+        deferredAssetOverwrites.push(rel);
         assetCount += 1;
         stepProgress();
-      }
+      }, (paths) => paths);
 
       if (assetCount > 0) {
         appendLog(state, tr(loc, `${prefix}同步 ${assetCount} 个附件`, `${prefix}Synced attachments: ${assetCount}`), '成功', {
@@ -2802,12 +2995,18 @@ export function createWebDAVSyncEngine({
       }
 
       // 2. Sync notes.
-      for (const relPath of plan.synced || []) {
+      skips.each(plan.synced, (relPath) => {
         baseMap[relPath] = sha256Text(localNotes[relPath], rpc);
         if (configStore) configStore.clearTombstone(nbKeyVal, relPath);
-      }
+      });
 
-      for (const [relPath, conflictRel, rewrittenRemoteText] of plan.asset_view_copies || []) {
+      const conflictPaths = ([relPath, conflictRel]) => [relPath, conflictRel];
+      skips.each(plan.asset_view_copies, ([relPath, conflictRel, remoteText]) => {
+        const rewrittenRemoteText = rewriteNoteAssetLinks(conflictRel, remoteText, assetCopyMap);
+        if (rewrittenRemoteText === remoteText) {
+          stepProgress();
+          return;
+        }
         local.writeNote(conflictRel, rewrittenRemoteText, { nbRoot });
         writeRemoteNote(conflictRel, rewrittenRemoteText, { createOnly: true });
         baseMap[conflictRel] = sha256Text(rewrittenRemoteText, rpc);
@@ -2820,9 +3019,9 @@ export function createWebDAVSyncEngine({
           logArgs: { path: `${prefix}${relPath}`, copy: conflictRel },
         });
         stepProgress();
-      }
+      }, conflictPaths);
 
-      for (const relPath of plan.to_push_new || []) {
+      skips.each(plan.to_push_new, (relPath) => {
         const text = localNotes[relPath];
         writeRemoteNote(relPath, text, { createOnly: true });
         baseMap[relPath] = sha256Text(text, rpc);
@@ -2835,9 +3034,9 @@ export function createWebDAVSyncEngine({
           logArgs: { path: `${prefix}${relPath}` },
         });
         stepProgress();
-      }
+      });
 
-      for (const relPath of plan.to_push_overwrite || []) {
+      skips.each(plan.to_push_overwrite, (relPath) => {
         const text = localNotes[relPath];
         const remoteHash = sha256Text(remoteNotes[relPath], rpc);
         const isConflict = baseMap[relPath] !== remoteHash;
@@ -2861,14 +3060,14 @@ export function createWebDAVSyncEngine({
           });
         }
         stepProgress();
-      }
+      });
 
-      for (const relPath of plan.to_pull_new || []) {
+      skips.each(plan.to_pull_new, (relPath) => {
         const origText = remoteNotes[relPath];
         const origHash = sha256Text(origText, rpc);
         if (!plan.is_first_sync && configStore && configStore.lookupTombstoneHash(nbKeyVal, relPath) === origHash) {
           stepProgress();
-          continue;
+          return;
         }
         const text = rewriteNoteAssetLinks(relPath, origText, assetCopyMap);
         local.writeNote(relPath, text, { nbRoot });
@@ -2885,9 +3084,9 @@ export function createWebDAVSyncEngine({
           logArgs: { path: `${prefix}${relPath}` },
         });
         stepProgress();
-      }
+      });
 
-      for (const relPath of plan.to_pull_overwrite || []) {
+      skips.each(plan.to_pull_overwrite, (relPath) => {
         const origText = remoteNotes[relPath];
         const text = rewriteNoteAssetLinks(relPath, origText, assetCopyMap);
         const localHash = sha256Text(localNotes[relPath], rpc);
@@ -2915,9 +3114,9 @@ export function createWebDAVSyncEngine({
           });
         }
         stepProgress();
-      }
+      });
 
-      for (const [relPath, conflictRel, remoteText] of plan.conflicts || []) {
+      skips.each(plan.conflicts, ([relPath, conflictRel, remoteText]) => {
         const localText = localNotes[relPath];
         const savedConflictText = rewriteNoteAssetLinks(conflictRel, remoteText, assetCopyMap);
         local.writeNote(conflictRel, savedConflictText, { nbRoot });
@@ -2937,13 +3136,13 @@ export function createWebDAVSyncEngine({
           logArgs: { path: `${prefix}${relPath}`, copy: conflictRel },
         });
         stepProgress();
-      }
+      }, conflictPaths);
 
       // 3. Complete deferred remote original-asset overwrites.
-      for (const [rel, ldata, rhash] of deferredAssetOverwrites) {
-        writeRemoteAsset(rel, ldata, { expectedHash: rhash });
-        baseMap[`asset:${rel}`] = sha256Bytes(ldata, rpc);
-      }
+      skips.each(deferredAssetOverwrites, (rel) => {
+        uploadLocalAsset(rel, { expectedHash: remoteAssets[rel] });
+        baseMap[`asset:${rel}`] = localAssets[rel];
+      });
 
       // 4. Propagate recoverable deletions.
       let deletedCount = 0;
@@ -2955,7 +3154,7 @@ export function createWebDAVSyncEngine({
       ];
       const deleteExpectedHashes = plan.delete_expected_hashes || {};
 
-      for (const [side, rel, isAsset] of deletions) {
+      skips.each(deletions, ([side, rel, isAsset]) => {
         const key = isAsset ? `asset:${rel}` : rel;
         const expect =
           deleteExpectedHashes[key] ||
@@ -2968,14 +3167,16 @@ export function createWebDAVSyncEngine({
             const matchesFn = isAsset
               ? (raw) => sha256Bytes(raw, rpc) === expect
               : (raw) => sha256Text(decodeNoteBytes(raw, rel), rpc) === expect;
-            outcome = davClient.trashFile(baseUrl, rel, matchesFn, cfg, deadlineMs);
+            const assetCheck = isAsset && streamAssets ? { hash: expect, readState: readRemoteAssetState } : null;
+            outcome = davClient.trashFile(baseUrl, rel, matchesFn, cfg, deadlineMs, assetCheck);
           } else {
             const revision = isAsset
-              ? sha256Bytes(localAssets[rel], rpc)
+              ? localAssets[rel] || expect || ''
               : sha256Text(localNotes[rel], rpc);
             outcome = local.trashFile(rel, revision, { nbRoot });
           }
         } catch (exc) {
+          if (['file_limit', 'fs_error', 'quota_full'].includes(classifySyncError(exc))) throw exc;
           outcome = 'failed';
           errText = errorDetail(loc, exc);
         }
@@ -3023,15 +3224,17 @@ export function createWebDAVSyncEngine({
           });
         }
         stepProgress();
-      }
+      }, ([, rel]) => [rel]);
       plan._deleted_count = deletedCount;
     } catch (exc) {
+      restoreSkippedBase(baseMap, plan.base_map || {}, skips);
       if (configStore) {
         configStore.state.syncMeta[plan.meta_key] = baseMap;
       }
       throw exc;
     }
 
+    restoreSkippedBase(baseMap, plan.base_map || {}, skips);
     return { pushed, pulled, conflictCount, assetCount, baseMap };
   };
 
@@ -3083,6 +3286,7 @@ export function createWebDAVSyncEngine({
     }
 
     const plans = [];
+    const skipRound = { consecutive: 0 };
     for (const nb of notebooks) {
       const sub = bindings[nb] || '';
       const plan = computeSyncPlan({
@@ -3094,6 +3298,7 @@ export function createWebDAVSyncEngine({
         subdir: sub,
         excludedSubdirs: sub ? new Set() : reservedSubdirs,
         deadlineMs,
+        skipRound,
       });
       if (plan.remote_error) {
         return {
@@ -3188,11 +3393,14 @@ export function createWebDAVSyncEngine({
 
     previewCache.clear();
 
+    const skippedItems = collectSkippedItems(batch.plans);
+    const skippedSummary = skippedItems.length ? formatSkippedCount(loc, skippedItems.length) : '';
     const totalNotes = totalPushed + totalPulled + totalConflicts;
     if (totalNotes === 0 && totalAssets === 0 && totalDeleted === 0) {
       return {
         status: '无变更',
-        summary: tr(loc, '已是最新', 'Up to date'),
+        summary: skippedSummary || tr(loc, '已是最新', 'Up to date'),
+        skipped_items: skippedItems,
         pushed: 0,
         pulled: 0,
         conflicts: 0,
@@ -3213,9 +3421,11 @@ export function createWebDAVSyncEngine({
       summary += tr(loc, ` · 删除 ${totalDeleted} 项`, ` · Deleted: ${totalDeleted}`);
     }
 
+    if (skippedSummary) summary += ` · ${skippedSummary}`;
     return {
       status: '成功',
       summary,
+      skipped_items: skippedItems,
       pushed: totalPushed,
       pulled: totalPulled,
       conflicts: reportedConflicts,

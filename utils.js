@@ -5,6 +5,11 @@
  * deterministic conflict copy naming, and host.crypto.hash wrappers.
  */
 
+import { tr, sanitizeErrorText } from './i18n.js';
+
+export const MAX_SYNC_FILE_BYTES = 64 * 1024 * 1024;
+export const DEFAULT_MAX_FILE_SIZE_MB = '50';
+
 export const NOTE_EXTENSIONS = new Set([
   '.md',
   '.markdown',
@@ -252,6 +257,7 @@ export function bytesToBase64(bytes) {
       ? new Uint8Array(bytes)
       : textToBytes(String(bytes ?? ''));
   if (arr.length === 0) return '';
+  const chunks = [];
   const parts = [];
   for (let i = 0; i < arr.length; i += 3) {
     const b0 = arr[i];
@@ -266,8 +272,13 @@ export function bytesToBase64(bytes) {
       has1 ? B64_ALPHA[(triplet >> 6) & 0x3f] : '=',
       has2 ? B64_ALPHA[triplet & 0x3f] : '='
     );
+    if (parts.length === 16384) {
+      chunks.push(parts.join(''));
+      parts.length = 0;
+    }
   }
-  return parts.join('');
+  chunks.push(parts.join(''));
+  return chunks.join('');
 }
 
 export function base64ToBytes(b64) {
@@ -546,6 +557,196 @@ export function isSafeRelAsset(relPath) {
   if (relPath.includes('\\') || !isSafeRelPath(relPath)) return false;
   const parts = relPath.split('/');
   return parts.slice(0, -1).includes('assets');
+}
+
+export function normalizeMaxFileSizeMb(value) {
+  const input = String(value ?? '').trim();
+  const size = Number(input);
+  return /^\d+$/.test(input) && size >= 1 && size <= 64
+    ? String(size) : DEFAULT_MAX_FILE_SIZE_MB;
+}
+
+export function checkSyncFilename(relPath, locale = 'zh') {
+  const path = String(relPath ?? '');
+  if (path.length > 259 || textToBytes(path).length > 4095) {
+    return tr(locale, '路径过长', 'Path is too long');
+  }
+  for (const part of path.split('/')) {
+    if (!part || /[<>:"\\|?*\u0000-\u001f\u007f-\u009f\ufffd]/.test(part)) {
+      return tr(locale, '文件名含非法字符', 'Filename contains invalid characters');
+    }
+    if (/[ .]$/.test(part)) {
+      return tr(locale, '文件名末尾是空格或点号', 'Filename ends in a space or period');
+    }
+    if (/^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\s*\.|$)/i.test(part)) {
+      return tr(locale, '文件名使用了 Windows 保留设备名', 'Filename uses a reserved Windows device name');
+    }
+    if (textToBytes(part).length > 255) {
+      return tr(locale, '文件名超过 255 字节', 'Filename exceeds 255 bytes');
+    }
+  }
+  return '';
+}
+
+export function isTemporarySyncFile(path) {
+  return /^(?:~\$|\.DS_Store$|Thumbs\.db$)|\.(?:swp|tmp|icloud)$/i.test(posixBasename(path));
+}
+
+export function assertCompleteListing(result, path, locale = 'zh') {
+  if (result?.truncated === true) {
+    throw new Error(tr(locale, `目录列表已截断，已中止同步：${path}`, `Directory listing was truncated; sync aborted: ${path}`));
+  }
+}
+
+export function checkSyncFileSize(size, cfg, locale = 'zh') {
+  const limit = normalizeMaxFileSizeMb(cfg?.max_file_size_mb);
+  if (typeof size === 'number' && size > Number(limit) * 1024 * 1024) {
+    const err = new Error(tr(locale, `文件超过大小上限（${limit} MiB）`, `File exceeds size limit (${limit} MiB)`));
+    err.code = 'file_limit';
+    throw err;
+  }
+}
+
+export function checkSyncBufferSize(size, locale = 'en') {
+  // Block's QuickJS heap is 16 MiB. Inline RPC temporarily holds both JSON and decoded bytes.
+  if (!globalThis.BlockSDK || typeof size !== 'number' || size <= 2 * 1024 * 1024) return;
+  const err = new Error(tr(locale, '文件超过当前宿主的 2 MiB 内存传输上限', 'File exceeds the current host’s 2 MiB in-memory transfer limit'));
+  err.code = 'file_limit';
+  throw err;
+}
+
+export function isMissingSyncFile(exc) {
+  return /(?:\bENOENT\b|\bnot found\b|no such file|does not exist)/i.test(String(exc?.message || exc));
+}
+
+export function hashSyncFile(path, rpc, read) {
+  try {
+    return sha256File(path, rpc);
+  } catch (exc) {
+    if (isMissingSyncFile(exc)) return null;
+    const bytes = read();
+    return bytes === null ? null : sha256Bytes(bytes, rpc);
+  }
+}
+
+export function readPlannedAsset(read, hash, cfg, rpc, locale) {
+  const bytes = read();
+  if (bytes !== null) checkSyncFileSize(bytes.length, cfg, locale);
+  if (bytes === null || sha256Bytes(bytes, rpc) !== hash) {
+    const err = new Error(tr(locale, '附件在扫描后发生变化', 'Attachment changed after scanning'));
+    err.code = 'fs_error';
+    throw err;
+  }
+  return bytes;
+}
+
+export function createSyncSkips(cfg, locale = 'zh', round = { consecutive: 0 }) {
+  const items = [];
+  const blocked = new Set();
+  const patterns = String(cfg?.ignore_patterns || '').split(/\r?\n|\\n/).map((rule) => rule.trim().replace(/^\/+|\/+$/g, '')).filter(Boolean);
+  const globs = patterns.filter((rule) => rule.includes('*')).map((rule) => new RegExp(
+    `^${rule.split('*').map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('[\\s\\S]*')}$`
+  ));
+  const prefixes = patterns.filter((rule) => !rule.includes('*'));
+  const key = (path) => foldSyncPath(path, { caseInsensitive: true, normalize: true });
+  const has = (path) => blocked.has(key(path));
+  const add = (path, code, reason) => {
+    if (has(path)) return;
+    blocked.add(key(path));
+    const placeholder = /^(.*\/)?\.(.+)\.icloud$/i.exec(path);
+    if (code === 'temporary_file' && placeholder) blocked.add(key(`${placeholder[1] || ''}${placeholder[2]}`));
+    items.push({ path, code, reason });
+  };
+  const recordError = (path, exc, related = []) => {
+    const code = classifySyncError(exc);
+    if (!['file_limit', 'fs_error'].includes(code)) {
+      const err = new Error(`${sanitizeErrorText(exc)} (${path})`);
+      err.code = code;
+      throw err;
+    }
+    for (const rel of [path, ...related]) add(rel, code, sanitizeErrorText(exc));
+    round.consecutive += 1;
+    if (round.consecutive >= 20) {
+      throw new Error(tr(locale, `连续 20 个文件处理失败，已中止同步：${path}`, `Sync aborted after 20 consecutive file failures: ${path}`));
+    }
+  };
+  const check = (path, entry = null) => {
+    if (has(path)) return false;
+    if (entry?.is_icloud_placeholder || isTemporarySyncFile(path)) {
+      add(path, 'temporary_file', tr(locale, '临时文件、系统文件或 iCloud 占位文件', 'Temporary file, system file, or iCloud placeholder'));
+    } else if (prefixes.some((prefix) => path === prefix || path.startsWith(`${prefix}/`)) || globs.some((glob) => glob.test(path))) {
+      add(path, 'ignored', tr(locale, '命中忽略规则', 'Matches an ignore rule'));
+    } else {
+      const invalidName = checkSyncFilename(path, locale);
+      if (invalidName) add(path, 'invalid_filename', invalidName);
+      else if (entry?.is_regular === false || entry?.is_dir) {
+        add(path, 'fs_error', tr(locale, '必须是普通文件', 'Must be a regular file'));
+      } else {
+        try {
+          checkSyncFileSize(entry?.size, cfg, locale);
+        } catch (exc) {
+          add(path, exc.code, exc.message);
+        }
+      }
+    }
+    return !has(path);
+  };
+  const succeeded = () => { round.consecutive = 0; };
+  const run = (path, action, related = []) => {
+    if (!check(path)) return undefined;
+    for (const rel of related) {
+      if (!check(rel)) {
+        add(path, 'related_file', tr(locale, `关联文件已跳过：${rel}`, `Related file was skipped: ${rel}`));
+        return undefined;
+      }
+    }
+    try {
+      const value = action();
+      succeeded();
+      return value;
+    } catch (exc) {
+      recordError(path, exc, related);
+      return undefined;
+    }
+  };
+  const each = (entries, action, paths = (entry) => [Array.isArray(entry) ? entry[0] : entry]) => {
+    for (const entry of entries || []) {
+      const [path, ...related] = paths(entry);
+      run(path, () => action(entry), related);
+    }
+  };
+  return { items, has, add, check, run, each, recordError, succeeded };
+}
+
+export function checkMissingSyncPath(root, path, stat, skips) {
+  if (!root) return true;
+  return skips.run(path, () => {
+    if (stat(posixJoin(root, path)).exists) throw new Error('File changed during sync or was omitted from the directory listing');
+    return true;
+  }) === true;
+}
+
+export function restoreSkippedBase(baseMap, originalBaseMap, skips) {
+  const keys = new Set([...Object.keys(baseMap), ...Object.keys(originalBaseMap)]);
+  for (const key of keys) {
+    if (!skips.has(key.startsWith('asset:') ? key.slice(6) : key)) continue;
+    if (Object.hasOwn(originalBaseMap, key)) baseMap[key] = originalBaseMap[key];
+    else delete baseMap[key];
+  }
+}
+
+export function collectSkippedItems(plans) {
+  return plans.flatMap((plan) => (plan.skipped_items || []).map((item) => ({
+    ...item,
+    path: plans.length > 1 ? `${plan.nb_label}/${item.path}` : item.path,
+  })));
+}
+
+export function isSyncAssetCandidate(relPath) {
+  const path = String(relPath ?? '').replace(/\\/g, '/');
+  const parent = posixDirname(path);
+  return isSafeRelAsset(path) || (isSafeRelPath(parent) &&
+    (parent === 'assets' || isSafeRelAsset(`${parent}/file`)) && isTemporarySyncFile(path));
 }
 
 export function syncDirKey(name) {
@@ -1408,6 +1609,7 @@ export function makeUniqueConflictPath(
     reserved = null,
     checkLocal = null,
     checkRemote = null,
+    checkPath = null,
     callHost = null,
     hashFn = null,
   } = {}
@@ -1425,6 +1627,7 @@ export function makeUniqueConflictPath(
   while (true) {
     const suffix = attempt === 1 ? '' : `-${attempt}`;
     const candidate = `${stem}.conflict-${fingerprint}${suffix}${finalExt}`;
+    if (checkPath && !checkPath(candidate)) return candidate;
     if (!used.has(candidate)) {
       let locCur = Object.hasOwn(localMap, candidate) ? localMap[candidate] : undefined;
       if (locCur === undefined && typeof checkLocal === 'function') {
@@ -1584,12 +1787,15 @@ const TRANSIENT_NETWORK_TOKENS = [
   'reached the background deadline',
 ];
 
-/** Classify a sync error message into 'network' | 'auth' | 'conflict' | 'config' | 'other'. */
 export function classifySyncError(msg) {
   const raw = msg && typeof msg === 'object' && 'message' in msg ? msg.message : msg;
   const lower = String(raw ?? '').toLowerCase();
+  const code = msg?.status ?? msg?.code;
+  if (code === 413 || code === 'file_limit' || /exceeds (?:the )?(?:size limit|maximum (?:write )?size)|exceeds max_response_bytes|response body (?:too large|exceeds)|in-memory transfer limit|payload too large|gh001|(?:http |status |\()413\b|超过大小上限/.test(lower)) return 'file_limit';
+  if (code === 507 || code === 'quota_full' || /\benospc\b|no space left|insufficient storage|(?:http |status |\()507\b/.test(lower)) return 'quota_full';
   if (!lower) return 'other';
-  if (AUTH_ERROR_TOKENS.some((tok) => lower.includes(tok))) return 'auth';
+  if ((code === 401 || code === 403 || AUTH_ERROR_TOKENS.some((tok) => lower.includes(tok))) && !lower.includes('missing permission:')) return 'auth';
+  if (code === 423 || code === 'fs_error' || /\b(?:eacces|eperm|ebusy|eilseq|enametoolong)\b|permission denied|operation not permitted|device or resource busy|illegal byte sequence|file name too long|regular file|not valid utf-8|changed while opening|changed during sync|disappeared during sync|(?:http |status |\()423\b|已中止覆盖/.test(lower)) return 'fs_error';
   if (CONFLICT_ERROR_TOKENS.some((tok) => lower.includes(tok))) return 'conflict';
   if (CONFIG_ERROR_TOKENS.some((tok) => lower.includes(tok))) return 'config';
   if (TRANSIENT_NETWORK_TOKENS.some((tok) => lower.includes(tok))) return 'network';

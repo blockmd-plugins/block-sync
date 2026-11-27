@@ -10,6 +10,7 @@ import {
   errorDetail,
   protocolLabel,
   formatReasonItem,
+  formatSkippedCount,
 } from './i18n.js';
 import {
   resolveCallHost,
@@ -18,7 +19,6 @@ import {
   textToBytes,
   bytesToText,
   decodeNoteBytes,
-  bytesEqual,
   bytesToBase64,
   base64ToBytes,
   nowHms,
@@ -40,6 +40,20 @@ import {
   noteAssetPaths,
   rewriteNoteAssetLinks,
   makeUniqueConflictPath,
+  MAX_SYNC_FILE_BYTES,
+  assertCompleteListing,
+  createSyncSkips,
+  classifySyncError,
+  checkSyncFileSize,
+  checkSyncFilename,
+  isSyncAssetCandidate,
+  checkSyncBufferSize,
+  restoreSkippedBase,
+  isMissingSyncFile,
+  checkMissingSyncPath,
+  hashSyncFile,
+  readPlannedAsset,
+  collectSkippedItems,
 } from './utils.js';
 import {
   DELETE_GUARD_THRESHOLD,
@@ -64,10 +78,7 @@ function trimTrailingSlash(p) {
 }
 
 function isNotFoundError(exc) {
-  const low = String(exc?.message || exc || '').toLowerCase();
-  return ['not found', 'no such file', 'does not exist', 'missing', 'enoent'].some((tok) =>
-    low.includes(tok)
-  );
+  return isMissingSyncFile(exc);
 }
 
 function isAlreadyExistsError(exc) {
@@ -87,22 +98,25 @@ export function fsStat(callHost, path) {
 }
 
 /** List directory entries through host.fs.list. */
-export function fsList(callHost, path, recursive = false) {
+export function fsList(callHost, path, recursive = false, locale = 'zh') {
   const rpc = resolveCallHost(callHost);
   const res = rpc('host.fs.list', {
     path: String(path ?? ''),
     recursive: Boolean(recursive),
   });
-  return Array.isArray(res?.entries) ? res.entries : [];
+  assertCompleteListing(res, path, locale);
+  return Array.isArray(res?.entries) ? res.entries : Array.isArray(res?.files) ? res.files : [];
 }
 
 /** Read raw file bytes via host.fs.read (encoding: base64); returns null if missing. */
 export function fsReadBytes(callHost, path) {
   const rpc = resolveCallHost(callHost);
   try {
+    if (globalThis.BlockSDK) checkSyncBufferSize(fsStat(rpc, path).size);
     const res = rpc('host.fs.read', {
       path: String(path ?? ''),
       encoding: 'base64',
+      max_bytes: MAX_SYNC_FILE_BYTES,
     });
     if (!res || res.found === false) return null;
     if (typeof res.content_base64 === 'string') return base64ToBytes(res.content_base64);
@@ -187,6 +201,24 @@ export function fsRename(callHost, from, to, { overwrite = false, mkdirParents =
   });
 }
 
+/** Stream-copy a regular file on the host via host.fs.copy (avoids Wasm memory). */
+export function fsCopy(callHost, from, to, { overwrite = false, mkdirParents = false } = {}) {
+  const rpc = resolveCallHost(callHost);
+  return rpc('host.fs.copy', {
+    from: String(from ?? ''),
+    to: String(to ?? ''),
+    overwrite: Boolean(overwrite),
+    mkdir_parents: Boolean(mkdirParents),
+  });
+}
+
+function isHostMethodUnsupported(exc) {
+  if (!exc) return false;
+  if (typeof exc === 'object' && exc.code === -32601) return true;
+  const low = String(exc?.message || exc || '').toLowerCase();
+  return low.includes('unknown host method') || low.includes('-32601');
+}
+
 /** Atomically swap two files in the same directory via host.fs.atomic_swap. */
 export function fsAtomicSwap(callHost, pathA, pathB) {
   const rpc = resolveCallHost(callHost);
@@ -245,7 +277,7 @@ export function safeAssetDest(mirrorDir, relPath, excludedSubdirs = new Set(), l
 }
 
 /** Resolve actual on-disk casing of relPath under baseDir using host.fs.list. */
-export function resolveActualRelCasing(callHost, baseDir, relPath) {
+export function resolveActualRelCasing(callHost, baseDir, relPath, locale = 'zh') {
   const parts = String(relPath ?? '').replace(/\\/g, '/').split('/').filter(Boolean);
   if (parts.length === 0) return relPath;
   let curDir = trimTrailingSlash(baseDir);
@@ -253,9 +285,10 @@ export function resolveActualRelCasing(callHost, baseDir, relPath) {
   for (const part of parts) {
     let entries;
     try {
-      entries = fsList(callHost, curDir, false);
-    } catch (_err) {
-      return relPath;
+      entries = fsList(callHost, curDir, false, locale);
+    } catch (exc) {
+      if (isNotFoundError(exc)) return relPath;
+      throw exc;
     }
     const names = entries.map((e) => String(e?.name || '')).filter(Boolean);
     if (names.includes(part)) {
@@ -427,20 +460,13 @@ export function collapsedNameError(locale, pair) {
 // Scanning Mirror Notes & Assets via host.fs.*
 // ============================================================================
 
-function entryRelPath(entry, cleanRoot) {
-  if (entry && typeof entry === 'object') {
-    if (typeof entry.rel_path === 'string' && entry.rel_path) {
-      return entry.rel_path.replace(/\\/g, '/').replace(/^\/+/, '');
-    }
-    const rawPath = String(entry.path || '').replace(/\\/g, '/');
-    if (rawPath.startsWith(`${cleanRoot}/`)) {
-      return rawPath.slice(cleanRoot.length + 1);
-    }
-    if (typeof entry.name === 'string' && entry.name) {
-      return entry.name;
-    }
-  }
-  return '';
+export function entryRelPath(entry, cleanRoot) {
+  if (typeof entry?.rel_path === 'string' && entry.rel_path) return entry.rel_path;
+  const raw = typeof entry === 'string' ? entry : String(entry?.path || '');
+  const path = /^[a-z]:\//i.test(cleanRoot) ? raw.replace(/\\/g, '/') : raw;
+  const prefix = String(cleanRoot || '').replace(/\/$/, '') + '/';
+  if (path.startsWith(prefix)) return path.slice(prefix.length);
+  return path.startsWith('/') || /^[a-z]:\//i.test(path) ? String(entry?.name || '') : path;
 }
 
 function hasDotSegment(rel) {
@@ -460,9 +486,11 @@ export function scanMirrorFiles(
     scope = 'all',
     excludedSubdirs = new Set(),
     locale = 'zh',
+    cfg = null,
+    skips = createSyncSkips(cfg, locale),
   } = {}
 ) {
-  const remoteFiles = {};
+  const remoteFiles = Object.create(null);
   if (!mirrorDir) return remoteFiles;
   const cleanRoot = trimTrailingSlash(mirrorDir);
   const rootSt = fsStat(callHost, cleanRoot);
@@ -478,53 +506,55 @@ export function scanMirrorFiles(
     } catch (_err) {
       return remoteFiles;
     }
-    if (isCloudPlaceholder(callHost, cleanRoot, onlyPath)) {
-      return remoteFiles;
-    }
-    const candSt = fsStat(callHost, candidate);
-    if (candSt.exists && !candSt.is_dir && !candSt.is_icloud_placeholder) {
-      const actualRel = resolveActualRelCasing(callHost, cleanRoot, onlyPath);
+    if (!skips.check(onlyPath)) return remoteFiles;
+    skips.run(onlyPath, () => {
+      if (isCloudPlaceholder(callHost, cleanRoot, onlyPath)) return;
+      const entry = fsStat(callHost, candidate);
+      if (!entry.exists || !skips.check(onlyPath, entry)) return;
+      const actualRel = resolveActualRelCasing(callHost, cleanRoot, onlyPath, locale);
+      if (!skips.check(actualRel)) return;
       const rawBytes = fsReadBytes(callHost, posixJoin(cleanRoot, actualRel));
-      if (rawBytes !== null) {
-        remoteFiles[actualRel] = decodeNoteBytes(rawBytes, actualRel);
-      }
-    }
+      if (rawBytes !== null) remoteFiles[actualRel] = decodeNoteBytes(rawBytes, actualRel);
+      else throw new Error('Note changed while opening');
+    });
     return remoteFiles;
   }
 
   const mirrorCi = dirIsCaseInsensitive(callHost, cleanRoot);
   const mirrorNorm = dirIsNormalizationInsensitive(callHost, cleanRoot);
-  const entries = fsList(callHost, cleanRoot, true);
+  const entries = fsList(callHost, cleanRoot, true, locale);
   for (const entry of entries) {
-    if (!entry || entry.is_dir || entry.is_icloud_placeholder) continue;
+    if (!entry || entry.is_dir) continue;
     const rel = entryRelPath(entry, cleanRoot);
     if (!rel || hasDotSegment(rel) || hasAssetSegment(rel)) continue;
     if (!isSafeRelMd(rel) || inSyncSubdir(rel, excludedSubdirs)) continue;
-    if (!matchesScope(rel, scope, { caseInsensitive: mirrorCi, normalize: mirrorNorm })) continue;
-    const rawBytes = fsReadBytes(callHost, posixJoin(cleanRoot, rel));
-    if (rawBytes !== null) {
+    if (!matchesScope(rel, scope, { caseInsensitive: mirrorCi, normalize: mirrorNorm }) || !skips.check(rel, entry)) continue;
+    skips.run(rel, () => {
+      const rawBytes = fsReadBytes(callHost, posixJoin(cleanRoot, rel));
+      if (rawBytes === null) throw new Error('Note changed while opening');
       remoteFiles[rel] = decodeNoteBytes(rawBytes, rel);
-    }
+    });
   }
   return remoteFiles;
 }
 
-/** List attachment relative paths under rootDir via host.fs.list, skipping iCloud stubs & hidden paths. */
-export function listDirAssets(callHost, rootDir, excludedSubdirs = new Set()) {
+/** List attachments while preserving the Set of relative paths used by existing callers. */
+export function listDirAssets(callHost, rootDir, excludedSubdirs = new Set(), {
+  cfg = null, locale = 'zh', skips = createSyncSkips(cfg, locale), metadata = new Map(),
+} = {}) {
   const names = new Set();
   if (!rootDir) return names;
   const cleanRoot = trimTrailingSlash(rootDir);
   const rootSt = fsStat(callHost, cleanRoot);
   if (!rootSt.exists || !rootSt.is_dir) return names;
 
-  for (const entry of fsList(callHost, cleanRoot, true)) {
-    if (!entry || entry.is_dir || entry.is_icloud_placeholder) continue;
+  for (const entry of fsList(callHost, cleanRoot, true, locale)) {
+    if (!entry || entry.is_dir) continue;
     const rel = entryRelPath(entry, cleanRoot);
-    if (!rel || hasDotSegment(rel)) continue;
-    if (inSyncSubdir(rel, excludedSubdirs)) continue;
-    if (isSafeRelAsset(rel)) {
-      names.add(rel);
-    }
+    if (!isSyncAssetCandidate(rel) || inSyncSubdir(rel, excludedSubdirs)) continue;
+    if (!skips.check(rel, entry)) continue;
+    names.add(rel);
+    metadata.set(rel, entry);
   }
   return names;
 }
@@ -552,9 +582,9 @@ export function remoteHasAnyContent(callHost, cfg, targetDir, excludedSubdirs = 
   const cleanDir = trimTrailingSlash(targetDir);
   const st = fsStat(callHost, cleanDir);
   if (!st.exists || !st.is_dir) return false;
-  const notes = scanMirrorFiles(callHost, cleanDir, { excludedSubdirs, locale });
+  const notes = scanMirrorFiles(callHost, cleanDir, { excludedSubdirs, locale, cfg });
   if (Object.keys(notes).length > 0) return true;
-  if (cfg?.sync_assets !== false && listDirAssets(callHost, cleanDir, excludedSubdirs).size > 0) {
+  if (cfg?.sync_assets !== false && listDirAssets(callHost, cleanDir, excludedSubdirs, { cfg, locale }).size > 0) {
     return true;
   }
   return false;
@@ -1009,6 +1039,10 @@ export function writeMirrorPayload(
   rawBytes,
   {
     isText = false,
+    sourcePath = '',
+    copyFromPath = '',
+    sourceHash = '',
+    readFallback = null,
     expectedHash = null,
     createOnly = false,
     excludedSubdirs = new Set(),
@@ -1026,9 +1060,11 @@ export function writeMirrorPayload(
   const dest = isText
     ? safeMirrorDest(cleanMirror, relPath, excludedSubdirs, locale)
     : safeAssetDest(cleanMirror, relPath, excludedSubdirs, locale);
-  const defaultExt = isText ? '.md' : '';
-  const bytes = rawBytes instanceof Uint8Array ? rawBytes : textToBytes(String(rawBytes ?? ''));
-  const contentHash = sha256Bytes(bytes, rpc);
+  const bytes = sourcePath || copyFromPath
+    ? null
+    : (rawBytes instanceof Uint8Array ? rawBytes : textToBytes(String(rawBytes ?? '')));
+  const contentHash = sourcePath || copyFromPath ? sourceHash : sha256Bytes(bytes, rpc);
+  const hashAt = (path) => hashSyncFile(path, rpc, () => fsReadBytes(rpc, path));
   const errMsg =
     changeErr ||
     tr(
@@ -1057,15 +1093,38 @@ export function writeMirrorPayload(
 
   let tmpAlive = false;
   try {
-    fsWriteBytes(rpc, tmpPath, bytes, { atomic: false, mkdirParents: false });
-    tmpAlive = true;
+    if (sourcePath) {
+      fsRename(rpc, sourcePath, tmpPath, { overwrite: false });
+      tmpAlive = true;
+    } else if (copyFromPath) {
+      let copied = false;
+      try {
+        fsCopy(rpc, copyFromPath, tmpPath, { overwrite: false, mkdirParents: false });
+        copied = true;
+      } catch (exc) {
+        if (!isHostMethodUnsupported(exc) || typeof readFallback !== 'function') throw exc;
+      }
+      if (copied) {
+        tmpAlive = true;
+        if (contentHash && hashAt(tmpPath) !== contentHash) {
+          const err = new Error(tr(locale, '附件在扫描后发生变化', 'Attachment changed after scanning'));
+          err.code = 'fs_error';
+          throw err;
+        }
+      } else {
+        const fallbackBytes = readFallback();
+        fsWriteBytes(rpc, tmpPath, fallbackBytes, { atomic: false, mkdirParents: false });
+        tmpAlive = true;
+      }
+    } else {
+      fsWriteBytes(rpc, tmpPath, bytes, { atomic: false, mkdirParents: false });
+      tmpAlive = true;
+    }
 
     if (createOnly) {
-      const existing = fsReadBytes(rpc, dest);
-      if (existing !== null) {
-        if (sha256Bytes(existing, rpc) === contentHash) {
-          return;
-        }
+      const existingHash = hashAt(dest);
+      if (existingHash !== null) {
+        if (existingHash === contentHash) return;
         throw new Error(errMsg);
       }
       try {
@@ -1074,10 +1133,7 @@ export function writeMirrorPayload(
         return;
       } catch (exc) {
         if (isAlreadyExistsError(exc)) {
-          const cur = fsReadBytes(rpc, dest);
-          if (cur !== null && sha256Bytes(cur, rpc) === contentHash) {
-            return;
-          }
+          if (hashAt(dest) === contentHash) return;
           throw new Error(errMsg);
         }
         throw exc;
@@ -1085,29 +1141,25 @@ export function writeMirrorPayload(
     }
 
     if (expectedHash !== null && expectedHash !== undefined) {
-      const curBefore = fsReadBytes(rpc, dest);
-      if (curBefore === null) {
-        throw new Error(errMsg);
-      }
-      const curHash = sha256Bytes(curBefore, rpc);
-      if (curHash !== expectedHash && curHash !== contentHash) {
-        throw new Error(errMsg);
-      }
+      const curHash = hashAt(dest);
+      if (curHash !== expectedHash && curHash !== contentHash) throw new Error(errMsg);
 
       fsAtomicSwap(rpc, tmpPath, dest);
-      // tmpPath now holds the previous inode/contents of dest.
-      const swappedBytes = fsReadBytes(rpc, tmpPath);
-      const swappedHash = swappedBytes !== null ? sha256Bytes(swappedBytes, rpc) : '';
-      if (swappedHash !== expectedHash && swappedHash !== contentHash) {
-        // Concurrent external write happened right before swap: restore dest and keep external copy.
+      // The temporary path now owns the old contents. It must survive a failed verification or recovery.
+      tmpAlive = false;
+      let swappedHash;
+      try {
+        swappedHash = hashAt(tmpPath);
+        if (swappedHash !== expectedHash && swappedHash !== contentHash) throw new Error(errMsg);
+      } catch (exc) {
         try {
           fsAtomicSwap(rpc, tmpPath, dest);
-        } catch (_swapBackErr) {
-          // Best-effort swap back.
+          tmpAlive = !preserveExternalConflictCopy(rpc, tmpPath, dest, contentHash, isText ? '.md' : '');
+        } catch (_rollbackErr) {
+          const moved = moveToRecoveryStash(rpc, tmpPath, cleanMirror, relPath, nowMsFn, dataDir);
+          if (!moved) fsRename(rpc, tmpPath, `${tmpPath}.recovery`, { overwrite: false });
         }
-        const moved = preserveExternalConflictCopy(rpc, tmpPath, dest, swappedHash, defaultExt);
-        if (moved) tmpAlive = false;
-        throw new Error(errMsg);
+        throw exc;
       }
 
       const stashed = moveToRecoveryStash(rpc, tmpPath, cleanMirror, relPath, nowMsFn, dataDir);
@@ -1193,6 +1245,8 @@ export function deleteMirrorEntry(
     locale = 'zh',
     dataDir = '',
     nowMsFn = () => Date.now(),
+    expectedAssetHash = null,
+    cfg = null,
   } = {}
 ) {
   const rpc = resolveCallHost(callHost);
@@ -1202,12 +1256,18 @@ export function deleteMirrorEntry(
   const cleanTarget = trimTrailingSlash(targetDir);
   const full = posixJoin(cleanTarget, relPath);
   const st = fsStat(rpc, full);
-  if (!st.exists || st.is_dir) {
-    return 'missing';
+  if (!st.exists) return 'missing';
+  if (st.is_dir || st.is_regular === false) throw new Error('Must be a regular file');
+  checkSyncFileSize(st.size, cfg, locale);
+  if (expectedAssetHash !== null) {
+    const hash = hashSyncFile(full, rpc, () => fsReadBytes(rpc, full));
+    if (hash === null) return 'missing';
+    if (hash !== expectedAssetHash) return 'changed';
+  } else {
+    const raw = fsReadBytes(rpc, full);
+    if (raw === null) return 'missing';
+    if (!matchesFn(raw)) return 'changed';
   }
-  const raw = fsReadBytes(rpc, full);
-  if (raw === null) return 'missing';
-  if (!matchesFn(raw)) return 'changed';
 
   const stashed = moveToRecoveryStash(rpc, full, cleanTarget, relPath, nowMsFn, dataDir);
   if (!stashed) {
@@ -1396,11 +1456,13 @@ export function planNotebookAssets({
   isFirstSync = false,
   nbKey = 'default',
   locale = 'zh',
+  skips = createSyncSkips(cfg, locale),
 } = {}) {
   const rpc = resolveCallHost(callHost);
   const empty = {
-    local_assets: {},
-    remote_assets: {},
+    skipped_items: skips.items,
+    local_asset_hashes: {},
+    remote_asset_hashes: {},
     remote_asset_etags: {},
     remote_asset_path_map: {},
     assets_to_push_new: [],
@@ -1428,9 +1490,11 @@ export function planNotebookAssets({
     if (explicitPaths.size === 0) return empty;
   }
 
+  const localMetadata = new Map();
+  const remoteMetadata = new Map();
   const localCandidates = explicitPaths !== null
     ? new Set(explicitPaths)
-    : localAdapter.listAssets(nbRoot, excludedSubdirs);
+    : localAdapter.listAssets(nbRoot, excludedSubdirs, { cfg, locale, skips, metadata: localMetadata });
   for (const rel of localCandidates) {
     if (inSyncSubdir(rel, excludedSubdirs)) {
       throw new Error(
@@ -1447,7 +1511,7 @@ export function planNotebookAssets({
   if (explicitPaths !== null) {
     remoteCandidates = new Set(explicitPaths);
   } else if (targetDir) {
-    const listed = listDirAssets(rpc, targetDir, excludedSubdirs);
+    const listed = listDirAssets(rpc, targetDir, excludedSubdirs, { cfg, locale, skips, metadata: remoteMetadata });
     remoteCandidates = trackedRemotePaths !== null && trackedRemotePaths !== undefined
       ? new Set([...listed].filter((p) => trackedRemotePaths.has(p)))
       : listed;
@@ -1473,9 +1537,30 @@ export function planNotebookAssets({
     candidates = new Set([...candidates].filter((p) => !inSyncSubdir(p, excludedSubdirs)));
   }
 
-  const localAssets = {};
-  const remoteAssets = {};
-  const remoteAssetPathMap = {};
+  const localAssets = Object.create(null);
+  const remoteAssets = Object.create(null);
+  const remoteAssetPathMap = Object.create(null);
+  const hashLocalAsset = (rel) => {
+    const options = { cfg, locale, skips, entry: localMetadata.get(rel) };
+    if (typeof localAdapter.hashAsset === 'function') return localAdapter.hashAsset(nbRoot, rel, options);
+    const bytes = localAdapter.readAsset(nbRoot, rel);
+    if (bytes === null) return null;
+    checkSyncFileSize(bytes.length, cfg, locale);
+    return sha256Bytes(bytes, rpc);
+  };
+  const hashRemoteAsset = (rel) => {
+    if (!targetDir || isCloudPlaceholder(rpc, targetDir, rel)) return null;
+    const full = safeAssetDest(targetDir, rel, excludedSubdirs, locale);
+    const entry = remoteMetadata.get(rel) || fsStat(rpc, full);
+    if (entry.exists === false || !skips.check(rel, entry)) return null;
+    const hash = hashSyncFile(full, rpc, () => {
+      const bytes = fsReadBytes(rpc, full);
+      if (bytes !== null) checkSyncFileSize(bytes.length, cfg, locale);
+      return bytes;
+    });
+    if (hash === null) throw new Error('Attachment changed while opening');
+    return hash;
+  };
 
   const gitTrackedAssetsFolded = new Map();
   if (gitTreePaths) {
@@ -1490,15 +1575,13 @@ export function planNotebookAssets({
 
   for (const rel of [...candidates].sort()) {
     if (excludedSubdirs.size > 0 && inSyncSubdir(rel, excludedSubdirs)) continue;
-    if (localCandidates.has(rel) || referenced.has(rel)) {
-      const ldata = localAdapter.readAsset(nbRoot, rel);
-      if (ldata !== null) {
-        const actualLocalRel = resolveActualRelCasing(rpc, nbRoot, rel);
-        localAssets[actualLocalRel] = ldata;
+    skips.run(rel, () => {
+      const hash = hashLocalAsset(rel);
+      if (hash !== null) {
+        const actualRel = localMetadata.has(rel) ? rel : resolveActualRelCasing(rpc, nbRoot, rel, locale);
+        if (skips.check(actualRel)) localAssets[actualRel] = hash;
       }
-    }
-    if (explicitPaths === null && !remoteCandidates.has(rel) && !referenced.has(rel)) continue;
-    if (targetDir) {
+      if (!targetDir || skips.has(rel)) return;
       let actualRel = rel;
       if (gitTreePaths && !gitTreePaths.has(rel)) {
         const fk = foldSyncPath(rel, { caseInsensitive: true, normalize: true });
@@ -1510,14 +1593,17 @@ export function planNotebookAssets({
         }
         if (foldedHits.length === 1) actualRel = foldedHits[0];
       }
-      if (trackedRemotePaths === null || trackedRemotePaths === undefined || trackedRemotePaths.has(actualRel)) {
-        const rdata = readAssetFile(rpc, targetDir, actualRel, excludedSubdirs);
-        if (rdata !== null) {
-          const resolvedRel = actualRel === rel ? resolveActualRelCasing(rpc, targetDir, rel) : actualRel;
-          remoteAssets[resolvedRel] = rdata;
-        }
+      if (trackedRemotePaths != null && !trackedRemotePaths.has(actualRel)) return;
+      const rhash = hashRemoteAsset(actualRel);
+      if (rhash !== null) {
+        const resolvedRel = remoteMetadata.has(actualRel) || actualRel !== rel
+          ? actualRel : resolveActualRelCasing(rpc, targetDir, rel, locale);
+        if (skips.check(resolvedRel)) remoteAssets[resolvedRel] = rhash;
       }
-    }
+    });
+  }
+  for (const paths of [localAssets, remoteAssets]) {
+    for (const rel of Object.keys(paths)) if (skips.has(rel)) delete paths[rel];
   }
 
   const localFolded = new Map();
@@ -1563,7 +1649,7 @@ export function planNotebookAssets({
 
   const assetBaseAliases = {};
   const orphanBaseAssets = Object.keys(baseMap)
-    .filter((k) => k.startsWith('asset:') && !Object.hasOwn(localAssets, k.slice(6)) && !Object.hasOwn(remoteAssets, k.slice(6)))
+    .filter((k) => k.startsWith('asset:') && !skips.has(k.slice(6)) && !Object.hasOwn(localAssets, k.slice(6)) && !Object.hasOwn(remoteAssets, k.slice(6)))
     .map((k) => k.slice(6));
   const onlyLocalAssets = Object.keys(localAssets).filter(
     (lp) => !Object.hasOwn(remoteAssets, lp) && !Object.hasOwn(baseMap, `asset:${lp}`)
@@ -1596,16 +1682,15 @@ export function planNotebookAssets({
 
   const allAssetPaths = [...new Set([...Object.keys(localAssets), ...Object.keys(remoteAssets)])].sort();
   for (const rel of allAssetPaths) {
-    const ldata = localAssets[rel] ?? null;
-    const rdata = remoteAssets[rel] ?? null;
-    if (ldata === null && rdata === null) continue;
-    if (ldata !== null && rdata !== null && bytesEqual(ldata, rdata)) {
+    const lhash = localAssets[rel] ?? null;
+    const rhash = remoteAssets[rel] ?? null;
+    if (skips.has(rel)) continue;
+    if (lhash === rhash) {
       synced.push(rel);
       continue;
     }
-    if (ldata === null) {
+    if (lhash === null) {
       if (isCloudPlaceholder(rpc, nbRoot, rel)) continue;
-      const rhash = sha256Bytes(rdata, rpc);
       const assetKey = `asset:${rel}`;
       let matchedDelHash = null;
       if (allowDeleteRemote) {
@@ -1629,10 +1714,11 @@ export function planNotebookAssets({
       }
       continue;
     }
-    if (rdata === null) {
+    if (rhash === null) {
       if (targetDir && isCloudPlaceholder(rpc, targetDir, remoteAssetPathMap[rel] || rel)) continue;
       const baseDel = allowDeleteLocal ? baseMap[`asset:${rel}`] : undefined;
-      if (baseDel !== undefined && sha256Bytes(ldata, rpc) === baseDel) {
+      if (baseDel !== undefined && lhash === baseDel) {
+        if (!checkMissingSyncPath(targetDir, rel, (path) => fsStat(rpc, path), skips)) continue;
         deleteLocal.push(rel);
         assetDeleteExpectedHashes[`asset:${rel}`] = baseDel;
       } else {
@@ -1643,8 +1729,6 @@ export function planNotebookAssets({
 
     const baseKey = `asset:${rel}`;
     const baseHash = baseMap[baseKey];
-    const lhash = sha256Bytes(ldata, rpc);
-    const rhash = sha256Bytes(rdata, rpc);
     if (baseHash !== undefined && lhash === baseHash && rhash !== baseHash) {
       pullOw.push([rel, false]);
     } else if (baseHash !== undefined && rhash === baseHash && lhash !== baseHash) {
@@ -1654,32 +1738,34 @@ export function planNotebookAssets({
     } else if (policy === 'local_first') {
       pushOw.push([rel, true]);
     } else {
-      const [stem, ext] = splitExt(rel);
-      const fingerprint = rhash.slice(0, 16);
-      let attempt = 1;
-      let copyRel = '';
-      while (true) {
-        const suffix = attempt === 1 ? '' : `-${attempt}`;
-        copyRel = `${stem}.conflict-${fingerprint}${suffix}${ext}`;
-        if (!reservedCopies.has(copyRel)) {
-          const lcopy = localAssets[copyRel] ?? localAdapter.readAsset(nbRoot, copyRel);
-          const rcopy = remoteAssets[copyRel] ?? (targetDir ? readAssetFile(rpc, targetDir, copyRel, excludedSubdirs) : null);
-          const lOk = lcopy === null || bytesEqual(lcopy, rdata);
-          const rOk = rcopy === null || bytesEqual(rcopy, rdata);
-          if (lOk && rOk) {
+      skips.run(rel, () => {
+        const [stem, ext] = splitExt(rel);
+        const fingerprint = rhash.slice(0, 16);
+        for (let attempt = 1; ; attempt += 1) {
+          const suffix = attempt === 1 ? '' : `-${attempt}`;
+          const copyRel = `${stem}.conflict-${fingerprint}${suffix}${ext}`;
+          if (checkSyncFilename(copyRel, locale)) throw new Error('Conflict copy file name too long');
+          if (reservedCopies.has(copyRel) || skips.has(copyRel)) continue;
+          if (!skips.check(copyRel)) {
+            skips.add(rel, 'conflict_copy', tr(locale, `无法同步冲突副本：${copyRel}`, `Cannot sync conflict copy: ${copyRel}`));
+            return;
+          }
+          const lcopy = localAssets[copyRel] ?? hashLocalAsset(copyRel);
+          const rcopy = remoteAssets[copyRel] ?? hashRemoteAsset(copyRel);
+          if (!skips.has(copyRel) && (lcopy === null || lcopy === rhash) && (rcopy === null || rcopy === rhash)) {
             reservedCopies.add(copyRel);
+            conflicts.push([rel, copyRel]);
             break;
           }
         }
-        attempt += 1;
-      }
-      conflicts.push([rel, copyRel]);
+      });
     }
   }
 
   return {
-    local_assets: localAssets,
-    remote_assets: remoteAssets,
+    skipped_items: skips.items,
+    local_asset_hashes: localAssets,
+    remote_asset_hashes: remoteAssets,
     remote_asset_etags: {},
     remote_asset_path_map: remoteAssetPathMap,
     assets_to_push_new: pushNew,
@@ -1722,11 +1808,13 @@ export function computeThreeWaySyncPlan({
   gitTreePaths = null,
   onlyPath = null,
   locale = 'zh',
+  skips = createSyncSkips(cfg, locale),
 } = {}) {
   const rpc = resolveCallHost(callHost);
   const scope = cfg.sync_scope || 'all';
   const policy = cfg.conflict_policy || 'keep_both';
-  const baseMap = configStore ? configStore.getBaseMap(metaKey, ...aliases, legacyKey, ...legacyAliases) : {};
+  const originalBaseMap = configStore ? configStore.getBaseMap(metaKey, ...aliases, legacyKey, ...legacyAliases) : {};
+  const baseMap = { ...originalBaseMap };
   const initializedMap = configStore ? configStore.state.syncMeta[INITIALIZED_META_KEY] : null;
   const isInitialized = Boolean(
     (initializedMap && typeof initializedMap === 'object' && [metaKey, ...aliases].some((k) => Boolean(initializedMap[k]))) ||
@@ -1734,12 +1822,15 @@ export function computeThreeWaySyncPlan({
   );
   const isFirstSync = !isInitialized;
 
+  let inspected = remoteInspected;
+  let errText = remoteError;
   let remoteNonemptyOnFirstSync = false;
   if (remoteInspected && !remoteError && isFirstSync && onlyPath !== null && onlyPath !== undefined) {
     try {
       remoteNonemptyOnFirstSync = remoteHasAnyContent(rpc, cfg, targetDir, excludedSubdirs, locale);
-    } catch (_err) {
-      remoteNonemptyOnFirstSync = true;
+    } catch (exc) {
+      inspected = false;
+      errText = errorDetail(locale, exc);
     }
   }
 
@@ -1753,10 +1844,9 @@ export function computeThreeWaySyncPlan({
   const remotePathMap = {};
   const baseKeyAliases = {};
 
-  let inspected = remoteInspected;
-  let errText = remoteError;
-
   if (inspected && !errText) {
+    localNotes = Object.fromEntries(Object.entries(localNotes).filter(([path]) => skips.check(path)));
+    remoteNotes = Object.fromEntries(Object.entries(remoteNotes).filter(([path]) => skips.check(path)));
     const localFolded = new Map();
     for (const lp of Object.keys(localNotes).sort()) {
       const fk = foldSyncPath(lp, { caseInsensitive: true, normalize: true });
@@ -1805,7 +1895,7 @@ export function computeThreeWaySyncPlan({
       }
 
       const orphanBaseNotes = Object.keys(baseMap).filter(
-        (bp) => isSafeRelMd(bp) && !Object.hasOwn(localNotes, bp) && !Object.hasOwn(remoteNotes, bp)
+        (bp) => isSafeRelMd(bp) && !skips.has(bp) && !Object.hasOwn(localNotes, bp) && !Object.hasOwn(remoteNotes, bp)
       );
       const onlyLocalNotes = Object.keys(localNotes).filter(
         (lp) => !Object.hasOwn(remoteNotes, lp) && !Object.hasOwn(baseMap, lp)
@@ -1822,10 +1912,14 @@ export function computeThreeWaySyncPlan({
   let checkRemoteNote = null;
   if (inspected && !errText) {
     if (onlyPath !== null && onlyPath !== undefined) {
-      checkLocalNote = (cand) => localAdapter.readNotes({ onlyPath: cand, scope, nbRoot })[cand];
+      checkLocalNote = (cand) => {
+        const found = localAdapter.readNotes({ onlyPath: cand, scope, nbRoot, cfg, locale, skips })[cand];
+        return skips.has(cand) ? false : found;
+      };
       checkRemoteNote = (cand) => {
         if (!targetDir) return null;
-        const foundMap = scanMirrorFiles(rpc, targetDir, { onlyPath: cand, scope, excludedSubdirs, locale });
+        const foundMap = scanMirrorFiles(rpc, targetDir, { onlyPath: cand, scope, excludedSubdirs, locale, cfg, skips });
+        if (skips.has(cand)) return false;
         if (Object.hasOwn(foundMap, cand)) return foundMap[cand];
         const firstVal = Object.values(foundMap)[0];
         return firstVal !== undefined ? firstVal : null;
@@ -1834,6 +1928,7 @@ export function computeThreeWaySyncPlan({
 
     const allPaths = [...new Set([...Object.keys(localNotes), ...Object.keys(remoteNotes)])].sort();
     for (const relPath of allPaths) {
+      if (skips.has(relPath)) continue;
       const inLocal = Object.hasOwn(localNotes, relPath);
       const inRemote = Object.hasOwn(remoteNotes, relPath);
       if (inLocal && !inRemote) {
@@ -1860,6 +1955,7 @@ export function computeThreeWaySyncPlan({
             reserved: reservedConflictPaths,
             checkLocal: checkLocalNote,
             checkRemote: checkRemoteNote,
+            checkPath: skips.check,
             callHost: rpc,
           });
           conflicts.push([relPath, conflictRel, remoteNotes[relPath]]);
@@ -1900,6 +1996,7 @@ export function computeThreeWaySyncPlan({
       } else if (localDirOk && matchedDelHash) {
         const idx = toPullNew.indexOf(relPath);
         if (idx >= 0) toPullNew.splice(idx, 1);
+        if (!checkMissingSyncPath(nbRoot, relPath, (path) => fsStat(rpc, path), skips)) continue;
         toDeleteRemote.push(relPath);
         deleteExpectedHashes[relPath] = matchedDelHash;
       }
@@ -1920,6 +2017,7 @@ export function computeThreeWaySyncPlan({
       ) {
         const idx = toPushNew.indexOf(relPath);
         if (idx >= 0) toPushNew.splice(idx, 1);
+        if (!checkMissingSyncPath(targetDir, relPath, (path) => fsStat(rpc, path), skips)) continue;
         toDeleteLocal.push(relPath);
         deleteExpectedHashes[relPath] = bhash;
       }
@@ -1927,8 +2025,8 @@ export function computeThreeWaySyncPlan({
   }
 
   let assetPlan = {
-    local_assets: {},
-    remote_assets: {},
+    local_asset_hashes: {},
+    remote_asset_hashes: {},
     remote_asset_etags: {},
     remote_asset_path_map: {},
     assets_to_push_new: [],
@@ -1965,6 +2063,7 @@ export function computeThreeWaySyncPlan({
         isFirstSync,
         nbKey: nbKeyVal,
         locale,
+        skips,
       });
     } catch (exc) {
       inspected = false;
@@ -1998,6 +2097,7 @@ export function computeThreeWaySyncPlan({
           reserved: reservedConflictPaths,
           checkLocal: checkLocalNote,
           checkRemote: checkRemoteNote,
+          checkPath: skips.check,
           callHost: rpc,
         });
         assetViewCopies.push([relPath, conflictRel, rtext]);
@@ -2021,6 +2121,8 @@ export function computeThreeWaySyncPlan({
     }
   }
 
+  remoteMissing = remoteMissing.filter((p) => !skips.has(p));
+  localMissing = localMissing.filter((p) => !skips.has(p));
   if (deletionHeld.size > 0) {
     remoteMissing = remoteMissing.filter((p) => !deletionHeld.has(p));
     localMissing = localMissing.filter((p) => !deletionHeld.has(p));
@@ -2037,12 +2139,8 @@ export function computeThreeWaySyncPlan({
   const remoteHashes = Object.fromEntries(
     Object.keys(remoteNotes).sort().map((p) => [p, sha256Text(remoteNotes[p], rpc)])
   );
-  const localAssetHashes = Object.fromEntries(
-    Object.keys(assetPlan.local_assets).sort().map((p) => [p, sha256Bytes(assetPlan.local_assets[p], rpc)])
-  );
-  const remoteAssetHashes = Object.fromEntries(
-    Object.keys(assetPlan.remote_assets).sort().map((p) => [p, sha256Bytes(assetPlan.remote_assets[p], rpc)])
-  );
+  const localAssetHashes = Object.fromEntries(Object.entries(assetPlan.local_asset_hashes).sort());
+  const remoteAssetHashes = Object.fromEntries(Object.entries(assetPlan.remote_asset_hashes).sort());
   const baseHashes = Object.fromEntries(
     Object.keys(baseMap)
       .sort()
@@ -2051,8 +2149,7 @@ export function computeThreeWaySyncPlan({
           Object.hasOwn(localNotes, p) ||
           Object.hasOwn(remoteNotes, p) ||
           (p.startsWith('asset:') &&
-            (Object.hasOwn(assetPlan.local_assets, p.slice(6)) ||
-              Object.hasOwn(assetPlan.remote_assets, p.slice(6))))
+            (Object.hasOwn(localAssetHashes, p.slice(6)) || Object.hasOwn(remoteAssetHashes, p.slice(6))))
       )
       .map((p) => [p, baseMap[p]])
   );
@@ -2105,6 +2202,9 @@ export function computeThreeWaySyncPlan({
     base_url: '',
     meta_key: metaKey,
     base_map: baseMap,
+    original_base_map: originalBaseMap,
+    skipped_items: skips.items,
+    skips,
     is_first_sync: isFirstSync,
     remote_nonempty_on_first_sync: remoteNonemptyOnFirstSync,
     local_notes: localNotes,
@@ -2377,12 +2477,23 @@ export function applyMirrorOrGitNotebookPlan(
   const targetDir = plan.target_dir;
   const excludedSubdirs = plan.excluded_subdirs || new Set();
   const baseMap = { ...(plan.base_map || {}) };
+  const originalBaseMap = plan.original_base_map || plan.base_map || {};
+  const skips = plan.skips || createSyncSkips(cfg, locale);
+  plan.skipped_items = skips.items;
+  const restoreBase = () => restoreSkippedBase(baseMap, originalBaseMap, skips);
   const localNotes = plan.local_notes || {};
   const remoteNotes = plan.remote_notes || {};
-  const localAssets = plan.local_assets || {};
-  const remoteAssets = plan.remote_assets || {};
+  const localAssets = plan.local_asset_hashes || {};
+  const remoteAssets = plan.remote_asset_hashes || {};
   const remotePathMap = plan.remote_path_map || {};
   const remoteAssetPathMap = plan.remote_asset_path_map || {};
+  const readLocalAsset = (rel) => readPlannedAsset(
+    () => localAdapter.readAsset(nbRoot, rel), localAssets[rel], cfg, rpc, locale
+  );
+  const readRemoteAsset = (rel) => readPlannedAsset(
+    () => readAssetFile(rpc, targetDir, remoteAssetPathMap[rel] || rel, excludedSubdirs),
+    remoteAssets[rel], cfg, rpc, locale
+  );
   const batchBaseRoot = plan.batch_base_root || (protocol === 'local_mirror' ? resolveMirrorDir(cfg) : plan.repo_root || '');
   const batchBindings = plan.batch_bindings || {};
   const targetIdentities = { ...(plan.target_identities || {}) };
@@ -2445,13 +2556,11 @@ export function applyMirrorOrGitNotebookPlan(
     }
   };
 
-  const recordRemotePath = (rel, rawBytes = null) => {
+  const recordRemotePath = (rel, blob) => {
     const subTrim = subdir.replace(/^\/+|\/+$/g, '');
     const repoRel = subTrim ? `${subTrim}/${rel}` : rel;
     writtenRemotePaths.push(repoRel);
-    if (rawBytes !== null && rawBytes !== undefined) {
-      plannedGitBlobs[repoRel] = rawBytes instanceof Uint8Array ? rawBytes : textToBytes(String(rawBytes));
-    }
+    if (protocol === 'git') plannedGitBlobs[repoRel] = blob;
   };
 
   const writeRemoteNote = (rel, text, { expectedHash = null, createOnly = false } = {}) => {
@@ -2469,11 +2578,19 @@ export function applyMirrorOrGitNotebookPlan(
     recordRemotePath(targetRel, textToBytes(text));
   };
 
-  const writeRemoteAsset = (rel, data, { expectedHash = null, createOnly = false } = {}) => {
+  const writeRemoteAsset = (
+    rel,
+    data,
+    hash,
+    { expectedHash = null, createOnly = false, copyFromPath = '', readFallback = null } = {}
+  ) => {
     const targetRel = remoteAssetPathMap[rel] || rel;
     writeMirrorBytes(rpc, targetDir, targetRel, data, {
       expectedHash,
       createOnly,
+      copyFromPath,
+      sourceHash: hash,
+      readFallback,
       excludedSubdirs,
       verifyTarget,
       locale,
@@ -2481,7 +2598,7 @@ export function applyMirrorOrGitNotebookPlan(
       pid,
       nowMsFn,
     });
-    recordRemotePath(targetRel, data);
+    recordRemotePath(targetRel, { file_path: posixJoin(targetDir, targetRel), hash });
   };
 
   let pushed = 0;
@@ -2514,70 +2631,92 @@ export function applyMirrorOrGitNotebookPlan(
     }
 
     // 1. Sync attachments first.
-    for (const rel of plan.assets_synced || []) {
-      if (Object.hasOwn(localAssets, rel)) {
-        baseMap[`asset:${rel}`] = sha256Bytes(localAssets[rel], rpc);
-      }
+    skips.each(plan.assets_synced, (rel) => {
+      baseMap[`asset:${rel}`] = localAssets[rel];
       if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${rel}`);
-    }
+    });
 
-    for (const rel of plan.assets_to_push_new || []) {
-      const data = localAssets[rel];
-      writeRemoteAsset(rel, data, { createOnly: true });
-      baseMap[`asset:${rel}`] = sha256Bytes(data, rpc);
-      if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${rel}`);
-      assetCount += 1;
-      stepProgress();
-    }
+    const localAssetPath = (rel) => posixJoin(trimTrailingSlash(nbRoot), rel);
+    const remoteAssetPath = (rel) => posixJoin(trimTrailingSlash(targetDir), remoteAssetPathMap[rel] || rel);
 
-    for (const [rel] of plan.assets_to_push_overwrite || []) {
-      const data = localAssets[rel];
-      const expHash = Object.hasOwn(remoteAssets, rel) ? sha256Bytes(remoteAssets[rel], rpc) : null;
-      writeRemoteAsset(rel, data, { expectedHash: expHash });
-      baseMap[`asset:${rel}`] = sha256Bytes(data, rpc);
+    skips.each(plan.assets_to_push_new, (rel) => {
+      writeRemoteAsset(rel, null, localAssets[rel], {
+        createOnly: true,
+        copyFromPath: localAssetPath(rel),
+        readFallback: () => readLocalAsset(rel),
+      });
+      baseMap[`asset:${rel}`] = localAssets[rel];
       if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${rel}`);
       assetCount += 1;
       stepProgress();
-    }
+    });
 
-    for (const rel of plan.assets_to_pull_new || []) {
-      const data = remoteAssets[rel];
-      const rhash = sha256Bytes(data, rpc);
+    skips.each(plan.assets_to_push_overwrite, ([rel]) => {
+      writeRemoteAsset(rel, null, localAssets[rel], {
+        expectedHash: remoteAssets[rel],
+        copyFromPath: localAssetPath(rel),
+        readFallback: () => readLocalAsset(rel),
+      });
+      baseMap[`asset:${rel}`] = localAssets[rel];
+      if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${rel}`);
+      assetCount += 1;
+      stepProgress();
+    });
+
+    skips.each(plan.assets_to_pull_new, (rel) => {
+      const rhash = remoteAssets[rel];
       if (!plan.is_first_sync && configStore && configStore.lookupTombstoneHash(nbKeyVal, `asset:${rel}`) === rhash) {
         stepProgress();
-        continue;
+        return;
       }
-      localAdapter.writeAsset(nbRoot, rel, data, { createOnly: true });
+      localAdapter.writeAsset(nbRoot, rel, null, {
+        createOnly: true,
+        copyFromPath: remoteAssetPath(rel),
+        sourceHash: rhash,
+        readFallback: () => readRemoteAsset(rel),
+      });
       baseMap[`asset:${rel}`] = rhash;
       if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${rel}`);
       assetCount += 1;
       stepProgress();
-    }
+    });
 
-    for (const [rel] of plan.assets_to_pull_overwrite || []) {
-      const data = remoteAssets[rel];
-      const expHash = Object.hasOwn(localAssets, rel) ? sha256Bytes(localAssets[rel], rpc) : null;
-      localAdapter.writeAsset(nbRoot, rel, data, { expectedHash: expHash });
-      baseMap[`asset:${rel}`] = sha256Bytes(data, rpc);
+    skips.each(plan.assets_to_pull_overwrite, ([rel]) => {
+      localAdapter.writeAsset(nbRoot, rel, null, {
+        expectedHash: localAssets[rel],
+        copyFromPath: remoteAssetPath(rel),
+        sourceHash: remoteAssets[rel],
+        readFallback: () => readRemoteAsset(rel),
+      });
+      baseMap[`asset:${rel}`] = remoteAssets[rel];
       if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${rel}`);
       assetCount += 1;
       stepProgress();
-    }
+    });
 
     const deferredAssetOverwrites = [];
-    for (const [rel, copyRel] of plan.asset_conflicts || []) {
-      const ldata = localAssets[rel];
-      const rdata = remoteAssets[rel];
-      const rhash = sha256Bytes(rdata, rpc);
-      localAdapter.writeAsset(nbRoot, copyRel, rdata, { createOnly: true });
-      writeRemoteAsset(copyRel, rdata, { createOnly: true });
+    skips.each(plan.asset_conflicts, ([rel, copyRel]) => {
+      const rhash = remoteAssets[rel];
+      const srcPath = remoteAssetPath(rel);
+      const readRdata = () => readRemoteAsset(rel);
+      localAdapter.writeAsset(nbRoot, copyRel, null, {
+        createOnly: true,
+        copyFromPath: srcPath,
+        sourceHash: rhash,
+        readFallback: readRdata,
+      });
+      writeRemoteAsset(copyRel, null, rhash, {
+        createOnly: true,
+        copyFromPath: srcPath,
+        readFallback: readRdata,
+      });
       baseMap[`asset:${copyRel}`] = rhash;
       if (configStore) configStore.clearTombstone(nbKeyVal, `asset:${copyRel}`);
       assetCopyMap[rel] = copyRel;
-      deferredAssetOverwrites.push([rel, ldata, rhash]);
+      deferredAssetOverwrites.push(rel);
       assetCount += 1;
       stepProgress();
-    }
+    }, (paths) => paths);
 
     if (assetCount > 0) {
       appendLog(tr(locale, `${prefix}同步 ${assetCount} 个附件`, `${prefix}Synced attachments: ${assetCount}`), '成功', {
@@ -2588,12 +2727,12 @@ export function applyMirrorOrGitNotebookPlan(
     }
 
     // 2. Sync notes.
-    for (const relPath of plan.synced || []) {
+    skips.each(plan.synced, (relPath) => {
       baseMap[relPath] = sha256Text(localNotes[relPath], rpc);
       if (configStore) configStore.clearTombstone(nbKeyVal, relPath);
-    }
+    });
 
-    for (const relPath of plan.to_push_new || []) {
+    skips.each(plan.to_push_new, (relPath) => {
       const text = localNotes[relPath];
       writeRemoteNote(relPath, text, { createOnly: true });
       baseMap[relPath] = sha256Text(text, rpc);
@@ -2606,9 +2745,9 @@ export function applyMirrorOrGitNotebookPlan(
         logArgs: { path: `${prefix}${relPath}` },
       });
       stepProgress();
-    }
+    });
 
-    for (const relPath of plan.to_push_overwrite || []) {
+    skips.each(plan.to_push_overwrite, (relPath) => {
       const text = localNotes[relPath];
       const remoteHash = sha256Text(remoteNotes[relPath], rpc);
       const isConflict = baseMap[relPath] !== remoteHash;
@@ -2631,14 +2770,14 @@ export function applyMirrorOrGitNotebookPlan(
         }
       );
       stepProgress();
-    }
+    });
 
-    for (const relPath of plan.to_pull_new || []) {
+    skips.each(plan.to_pull_new, (relPath) => {
       const origText = remoteNotes[relPath];
       const origHash = sha256Text(origText, rpc);
       if (!plan.is_first_sync && configStore && configStore.lookupTombstoneHash(nbKeyVal, relPath) === origHash) {
         stepProgress();
-        continue;
+        return;
       }
       const text = rewriteNoteAssetLinks(relPath, origText, assetCopyMap);
       localAdapter.writeNote(relPath, text, { nbRoot });
@@ -2655,9 +2794,9 @@ export function applyMirrorOrGitNotebookPlan(
         logArgs: { path: `${prefix}${relPath}` },
       });
       stepProgress();
-    }
+    });
 
-    for (const relPath of plan.to_pull_overwrite || []) {
+    skips.each(plan.to_pull_overwrite, (relPath) => {
       const origText = remoteNotes[relPath];
       const text = rewriteNoteAssetLinks(relPath, origText, assetCopyMap);
       const localHash = sha256Text(localNotes[relPath], rpc);
@@ -2684,9 +2823,10 @@ export function applyMirrorOrGitNotebookPlan(
         }
       );
       stepProgress();
-    }
+    });
 
-    for (const [relPath, conflictRel, remoteText] of plan.conflicts || []) {
+    const conflictPaths = ([relPath, conflictRel]) => [relPath, conflictRel];
+    skips.each(plan.conflicts, ([relPath, conflictRel, remoteText]) => {
       const localText = localNotes[relPath];
       const savedConflictText = rewriteNoteAssetLinks(conflictRel, remoteText, assetCopyMap);
       localAdapter.writeNote(conflictRel, savedConflictText, { nbRoot });
@@ -2706,10 +2846,14 @@ export function applyMirrorOrGitNotebookPlan(
         logArgs: { path: `${prefix}${relPath}`, copy: conflictRel },
       });
       stepProgress();
-    }
+    }, conflictPaths);
 
-    for (const [relPath, conflictRel, remoteText] of plan.asset_view_copies || []) {
+    skips.each(plan.asset_view_copies, ([relPath, conflictRel, remoteText]) => {
       const savedConflictText = rewriteNoteAssetLinks(conflictRel, remoteText, assetCopyMap);
+      if (savedConflictText === remoteText) {
+        stepProgress();
+        return;
+      }
       localAdapter.writeNote(conflictRel, savedConflictText, { nbRoot });
       writeRemoteNote(conflictRel, savedConflictText, { createOnly: true });
       baseMap[conflictRel] = sha256Text(savedConflictText, rpc);
@@ -2722,13 +2866,13 @@ export function applyMirrorOrGitNotebookPlan(
         logArgs: { path: `${prefix}${relPath}`, copy: conflictRel },
       });
       stepProgress();
-    }
+    }, conflictPaths);
 
     // 3. Complete deferred remote original-asset overwrites.
-    for (const [rel, ldata, rhash] of deferredAssetOverwrites) {
-      writeRemoteAsset(rel, ldata, { expectedHash: rhash });
-      baseMap[`asset:${rel}`] = sha256Bytes(ldata, rpc);
-    }
+    skips.each(deferredAssetOverwrites, (rel) => {
+      writeRemoteAsset(rel, readLocalAsset(rel), localAssets[rel], { expectedHash: remoteAssets[rel] });
+      baseMap[`asset:${rel}`] = localAssets[rel];
+    });
 
     // 4. Propagate recoverable deletions.
     let deletedCount = 0;
@@ -2741,7 +2885,7 @@ export function applyMirrorOrGitNotebookPlan(
     const deleteExpectedHashes = plan.delete_expected_hashes || {};
     const baseKeyAliases = plan.base_key_aliases || {};
 
-    for (const [side, rel, isAsset] of deletions) {
+    skips.each(deletions, ([side, rel, isAsset]) => {
       const key = isAsset ? `asset:${rel}` : rel;
       const expect =
         deleteExpectedHashes[key] ||
@@ -2761,6 +2905,8 @@ export function applyMirrorOrGitNotebookPlan(
             locale,
             dataDir,
             nowMsFn,
+            cfg,
+            expectedAssetHash: isAsset ? expect : null,
           });
           if (outcome === 'deleted' && protocol === 'git') {
             const subTrim = subdir.replace(/^\/+|\/+$/g, '');
@@ -2770,11 +2916,12 @@ export function applyMirrorOrGitNotebookPlan(
           }
         } else {
           const revision = isAsset
-            ? (Object.hasOwn(localAssets, rel) ? sha256Bytes(localAssets[rel], rpc) : expect || '')
+            ? localAssets[rel] || expect || ''
             : (Object.hasOwn(localNotes, rel) ? sha256Text(localNotes[rel], rpc) : expect || '');
           outcome = localAdapter.trashFile(rel, revision, { nbRoot });
         }
       } catch (exc) {
+        if (['file_limit', 'fs_error', 'quota_full'].includes(classifySyncError(exc))) throw exc;
         outcome = 'failed';
         errText = errorDetail(locale, exc);
       }
@@ -2784,7 +2931,7 @@ export function applyMirrorOrGitNotebookPlan(
       if (outcome === 'deleted' || outcome === 'missing') {
         delete baseMap[key];
         for (const aliasKey of baseKeyAliases[key] || []) {
-          delete baseMap[aliasKey];
+          if (!skips.has(isAsset ? aliasKey.slice(6) : aliasKey)) delete baseMap[aliasKey];
         }
         if (expect && configStore) {
           configStore.recordTombstone(nbKeyVal, key, expect);
@@ -2824,7 +2971,10 @@ export function applyMirrorOrGitNotebookPlan(
         });
       }
       stepProgress();
-    }
+    }, ([, rel, isAsset]) => {
+      const actual = (isAsset ? remoteAssetPathMap : remotePathMap)[rel];
+      return actual && actual !== rel ? [rel, actual] : [rel];
+    });
     plan._deleted_count = deletedCount;
     plan._deleted_git_paths = deletedGitPaths;
   };
@@ -2837,6 +2987,7 @@ export function applyMirrorOrGitNotebookPlan(
       withTargetLock(rpc, lockDir, runInsideLock, { dataDir, pid, nowMsFn, sleepFn });
     }
   } catch (exc) {
+    restoreBase();
     if (protocol !== 'git' && configStore) {
       configStore.state.syncMeta[plan.meta_key] = baseMap;
     }
@@ -2844,28 +2995,31 @@ export function applyMirrorOrGitNotebookPlan(
   }
 
   for (const [lp, rp] of Object.entries(remotePathMap)) {
-    if (rp !== lp && Object.hasOwn(baseMap, lp) && !Object.hasOwn(localNotes, rp)) {
+    if (rp !== lp && !skips.has(lp) && !skips.has(rp) && Object.hasOwn(baseMap, lp) && !Object.hasOwn(localNotes, rp)) {
       delete baseMap[rp];
     }
   }
   for (const [lp, rp] of Object.entries(remoteAssetPathMap)) {
-    if (rp !== lp && Object.hasOwn(baseMap, `asset:${lp}`) && !Object.hasOwn(localAssets, rp)) {
+    if (rp !== lp && !skips.has(lp) && !skips.has(rp) && Object.hasOwn(baseMap, `asset:${lp}`) && !Object.hasOwn(localAssets, rp)) {
       delete baseMap[`asset:${rp}`];
     }
   }
+  const relativeKey = (key) => key.startsWith('asset:') ? key.slice(6) : key;
   for (const [key, aliases] of Object.entries(plan.base_key_aliases || {})) {
-    if (Object.hasOwn(baseMap, key)) {
+    if (!skips.has(relativeKey(key)) && Object.hasOwn(baseMap, key)) {
       for (const aliasKey of aliases) {
-        if (aliasKey !== key) delete baseMap[aliasKey];
+        if (aliasKey !== key && !skips.has(relativeKey(aliasKey))) delete baseMap[aliasKey];
       }
     }
   }
+  restoreBase();
 
   const syncedRepoPaths = [];
   if (protocol === 'git') {
     const subTrim = subdir.replace(/^\/+|\/+$/g, '');
     const subPrefix = subTrim ? `${subTrim}/` : '';
     for (const relPath of plan.synced || []) {
+      if (skips.has(relPath)) continue;
       const repoRel = `${subPrefix}${remotePathMap[relPath] || relPath}`;
       syncedRepoPaths.push(repoRel);
       if (!Object.hasOwn(plannedGitBlobs, repoRel) && Object.hasOwn(localNotes, relPath)) {
@@ -2873,10 +3027,12 @@ export function applyMirrorOrGitNotebookPlan(
       }
     }
     for (const relPath of plan.assets_synced || []) {
-      const repoRel = `${subPrefix}${remoteAssetPathMap[relPath] || relPath}`;
+      if (skips.has(relPath)) continue;
+      const remoteRel = remoteAssetPathMap[relPath] || relPath;
+      const repoRel = `${subPrefix}${remoteRel}`;
       syncedRepoPaths.push(repoRel);
-      if (!Object.hasOwn(plannedGitBlobs, repoRel) && Object.hasOwn(localAssets, relPath)) {
-        plannedGitBlobs[repoRel] = localAssets[relPath];
+      if (!Object.hasOwn(plannedGitBlobs, repoRel)) {
+        plannedGitBlobs[repoRel] = { file_path: posixJoin(targetDir, remoteRel), hash: remoteAssets[relPath] };
       }
     }
   }
@@ -2959,6 +3115,7 @@ export function createLocalMirrorSyncEngine({
     nbRoot = null,
     subdir = '',
     excludedSubdirs = new Set(),
+    skipRound,
   } = {}) => {
     const rpc = getRpc();
     const loc = getLocale();
@@ -2971,7 +3128,8 @@ export function createLocalMirrorSyncEngine({
       ? configStore.notebookLabel(effectiveNbRoot)
       : notebookLabel(effectiveNbRoot, loc, '', homeDir);
     const scope = cfg.sync_scope || 'all';
-    const localNotes = local.readNotes({ onlyPath, scope, nbRoot: effectiveNbRoot });
+    const skips = createSyncSkips(cfg, loc, skipRound);
+    const localNotes = local.readNotes({ onlyPath, scope, nbRoot: effectiveNbRoot, cfg, locale: loc, skips });
     for (const relPath of Object.keys(localNotes)) {
       if (inSyncSubdir(relPath, excludedSubdirs)) {
         throw new Error(
@@ -3001,6 +3159,8 @@ export function createLocalMirrorSyncEngine({
         scope,
         excludedSubdirs,
         locale: loc,
+        cfg,
+        skips,
       });
     } catch (exc) {
       remoteInspected = false;
@@ -3028,6 +3188,7 @@ export function createLocalMirrorSyncEngine({
       remoteError,
       onlyPath,
       locale: loc,
+      skips,
     });
   };
 
@@ -3093,6 +3254,7 @@ export function createLocalMirrorSyncEngine({
     }
 
     const plans = [];
+    const skipRound = { consecutive: 0 };
     for (const nb of effectiveNotebooks) {
       const sub = bindings[nb] || '';
       const plan = computeSyncPlan({
@@ -3101,6 +3263,7 @@ export function createLocalMirrorSyncEngine({
         nbRoot: nb,
         subdir: sub,
         excludedSubdirs: sub ? new Set() : reservedSubdirs,
+        skipRound,
       });
       plan.batch_base_root = baseDir;
       plan.batch_bindings = bindings;
@@ -3226,11 +3389,14 @@ export function createLocalMirrorSyncEngine({
       configStore.state.stats.last_sync = nowHms();
     }
 
+    const skippedItems = collectSkippedItems(batch.plans);
+    const skippedSummary = skippedItems.length ? formatSkippedCount(loc, skippedItems.length) : '';
     const totalNotes = totalPushed + totalPulled + totalConflicts;
     if (totalNotes === 0 && totalAssets === 0 && totalDeleted === 0) {
       return {
         status: '无变更',
-        summary: tr(loc, '已是最新', 'Up to date'),
+        summary: skippedSummary || tr(loc, '已是最新', 'Up to date'),
+        skipped_items: skippedItems,
         pushed: 0,
         pulled: 0,
         conflicts: 0,
@@ -3250,9 +3416,11 @@ export function createLocalMirrorSyncEngine({
     if (totalDeleted > 0) {
       summary += tr(loc, ` · 删除 ${totalDeleted} 项`, ` · Deleted: ${totalDeleted}`);
     }
+    if (skippedSummary) summary += ` · ${skippedSummary}`;
     return {
       status: '成功',
       summary,
+      skipped_items: skippedItems,
       pushed: totalPushed,
       pulled: totalPulled,
       conflicts: reportedConflicts,

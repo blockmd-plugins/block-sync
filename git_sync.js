@@ -9,6 +9,7 @@ import {
   tr,
   errorDetail,
   protocolLabel,
+  formatSkippedCount,
 } from './i18n.js';
 import {
   resolveCallHost,
@@ -33,6 +34,11 @@ import {
   noteAssetPaths,
   rewriteNoteAssetLinks,
   sanitizeUrlForDisplay,
+  createSyncSkips,
+  collectSkippedItems,
+  classifySyncError,
+  hashSyncFile,
+  restoreSkippedBase,
 } from './utils.js';
 import {
   INITIALIZED_META_KEY,
@@ -227,6 +233,8 @@ export function runGit(
 export function isTransientGitError(rawText) {
   const lower = String(rawText || '').toLowerCase();
   if (!lower) return false;
+  const errorClass = classifySyncError(rawText);
+  if (['file_limit', 'quota_full', 'fs_error'].includes(errorClass)) return false;
   const nonTransient = [
     'permission denied (publickey)',
     'authentication failed',
@@ -241,6 +249,11 @@ export function isTransientGitError(rawText) {
     'returned error: 404',
     'non-fast-forward',
     'could not apply',
+    'gh013',
+    'protected branch',
+    'pre-receive hook declined',
+    'index.lock',
+    'submodule',
   ];
   if (nonTransient.some((tok) => lower.includes(tok))) return false;
   const transient = [
@@ -276,6 +289,25 @@ export function isTransientGitError(rawText) {
 /** Map raw git stderr/stdout into a user-friendly bilingual diagnostic message. */
 export function gitErrorMessage(locale, rawText, fallback = '') {
   const lower = String(rawText || '').toLowerCase();
+  const detail = errorDetail(locale, rawText || fallback);
+  if (lower.includes('gh001') || lower.includes('large files detected')) {
+    return tr(locale, `GH001：文件超过 GitHub 的 100 MiB 上限。移除历史中的大文件或迁移到 Git LFS。\n${detail}`, `GH001: A file exceeds GitHub's 100 MiB limit. Remove the large file from history or migrate it to Git LFS.\n${detail}`);
+  }
+  if (lower.includes('gh013')) {
+    return tr(locale, 'GH013：推送违反仓库规则。若触发密钥保护，请撤销并轮换泄露的密钥，再从提交历史移除；其他情况请检查 GitHub 仓库规则。', 'GH013: The push violated repository rules. If secret protection triggered, revoke and rotate the secret and remove it from commit history. Otherwise, check the repository rules on GitHub.');
+  }
+  if (/protected branch|pre-receive hook declined/.test(lower)) {
+    return tr(locale, `远端拒绝推送。请核对分支保护或服务器钩子，必要时改用可写分支。\n${detail}`, `The remote rejected the push. Check branch protection or server hooks, and use a writable branch if required.\n${detail}`);
+  }
+  if (lower.includes('index.lock')) {
+    return tr(locale, 'Git 索引被 index.lock 锁定。请先结束正在运行的 Git 操作，确认没有 Git 进程后再删除残留锁文件。', 'Git index is locked by index.lock. Finish any running Git operations and remove the stale lock only after confirming Git is no longer running.');
+  }
+  if (/no space left|\benospc\b/.test(lower)) {
+    return tr(locale, '磁盘空间不足（ENOSPC）。请释放空间后重试。', 'No space left on disk (ENOSPC). Free disk space and retry.');
+  }
+  if (lower.includes('submodule') && /conflict|merge|unmerged|entry/.test(lower)) {
+    return tr(locale, `Git 子模块冲突。请在仓库中解决子模块引用冲突并完成 Git 操作。\n${detail}`, `Git submodule conflict. Resolve the submodule reference in the repository and finish the Git operation.\n${detail}`);
+  }
   if (lower.includes('permission denied (publickey)')) {
     return tr(
       locale,
@@ -618,6 +650,18 @@ export function gitPath(callHost, repoDir, rel, cfg = null, locale = 'zh') {
   return gitDir ? posixJoin(gitDir, rel) : '';
 }
 
+function assertGitOperationFinished(callHost, repoDir, locale) {
+  const [, gitDir] = resolveGitDir(callHost, repoDir);
+  if (!gitDir) return;
+  for (const [marker, operation] of [
+    ['MERGE_HEAD', 'merge'], ['REBASE_HEAD', 'rebase'], ['rebase-merge', 'rebase'],
+    ['rebase-apply', 'rebase'], ['CHERRY_PICK_HEAD', 'cherry-pick'],
+  ]) {
+    if (!fsStat(callHost, posixJoin(gitDir, marker)).exists) continue;
+    throw new Error(tr(locale, `Git ${operation} 尚未结束。请先完成操作，或在仓库中运行 git ${operation} --abort，再重试同步。`, `A Git ${operation} is in progress. Finish it or run git ${operation} --abort in the repository before syncing.`));
+  }
+}
+
 function loadGitPushedRefs(callHost, repoDir, cfg = null, locale = 'zh') {
   const p = gitPath(callHost, repoDir, 'block-sync-pushed-refs.json', cfg, locale);
   if (!p) return {};
@@ -810,6 +854,11 @@ export function prepareGitRepo(
     return [false, tr(locale, 'Git 缓存位置不安全，已停止同步', 'Git cache location is unsafe. Sync stopped.')];
   }
   if (activeRepoDir && hasGitMarker(rpc, activeRepoDir)) {
+    try {
+      assertGitOperationFinished(rpc, activeRepoDir, locale);
+    } catch (exc) {
+      return [false, errorDetail(locale, exc)];
+    }
     recoverAbandonedGitIndex(rpc, activeRepoDir, { cfg, locale });
   }
 
@@ -1666,8 +1715,23 @@ function buildGitTreeFromChanges(callHost, repoRoot, oldTree, changedEntries, { 
   return rebuiltTrees.get('') || EMPTY_TREE_OID;
 }
 
-/** Hash rawData into Git object store using --stdin for UTF-8 or a temp file for binary bytes. */
-function gitHashObjectWrite(callHost, repoRoot, gitDir, relPath, rawData, { cfg = null, pid = 1, nowMsFn = () => Date.now(), locale = 'zh' } = {}) {
+function gitFileLimitError(locale, relPath) {
+  return new Error(tr(locale, `文件超过大小上限（Git 的 100 MiB）。请改用 Git LFS：${relPath}`, `File exceeds size limit (Git's 100 MiB). Configure Git LFS for: ${relPath}`));
+}
+
+/** Write a blob using a verified on-disk file, stdin for UTF-8, or a temporary binary file. */
+function gitHashObjectWrite(callHost, repoRoot, gitDir, relPath, rawData, {
+  cfg = null, pid = 1, nowMsFn = () => Date.now(), locale = 'zh', filePath = '',
+} = {}) {
+  if (filePath) {
+    const proc = runGit(callHost, ['hash-object', '-w', '--path', relPath, '--', filePath], {
+      cwd: repoRoot, cfg, locale,
+    });
+    if (proc.returncode !== 0) {
+      throw new Error(`${relPath}: ${gitErrorMessage(locale, proc.stderr || proc.stdout, 'git hash-object failed')}`);
+    }
+    return proc.stdout.trim();
+  }
   const bytes = rawData instanceof Uint8Array ? rawData : textToBytes(String(rawData ?? ''));
   if (isUtf8Exact(bytes)) {
     const proc = runGit(callHost, ['hash-object', '-w', '--path', relPath, '--stdin'], {
@@ -1715,6 +1779,8 @@ export function commitAndPushGit(
     stagedRelPaths = [],
     trackedPlanPaths = [],
     plannedBlobs = {},
+    onFileError = null,
+    onFileSuccess = null,
     checkout = null,
     deletedRelPaths = [],
     dataDir = '',
@@ -1726,6 +1792,7 @@ export function commitAndPushGit(
   } = {}
 ) {
   const rpc = resolveCallHost(callHost);
+  assertGitOperationFinished(rpc, repoRoot, locale);
   if (checkout) {
     gitCheckoutState(rpc, repoRoot, cfg, checkout, locale);
   }
@@ -1790,29 +1857,78 @@ export function commitAndPushGit(
   }
 
   const [, gitDir] = resolveGitDir(rpc, repoRoot);
+  const fileInfo = new Map();
+  const skipped = new Set();
+  const isolateFileError = (path, exc) => {
+    if (!onFileError || !['fs_error', 'file_limit'].includes(classifySyncError(exc))) throw exc;
+    onFileError(path, exc);
+    skipped.add(path);
+  };
+  const gitMaxSize = 100 * 1024 * 1024;
+  for (const p of allCheckPaths) {
+    if (deleted.has(p)) continue;
+    const plannedBlob = Object.hasOwn(blobMap, p) ? blobMap[p] : undefined;
+    const diskPath = posixJoin(trimTrailingSlash(repoRoot), p);
+    const filePath = plannedBlob?.file_path || (plannedBlob === undefined ? diskPath : '');
+    if (filePath && filePath !== diskPath) throw new Error(`Invalid planned Git file: ${p}`);
+    let size;
+    try {
+      const stat = filePath ? fsStat(rpc, filePath) : null;
+      if (filePath && stat?.exists === false) {
+        if (plannedBlob !== undefined) throw new Error('Attachment changed while opening');
+        skipped.add(p);
+        continue;
+      }
+      if (stat?.is_dir || stat?.is_regular === false) throw new Error('Must be a regular file');
+      size = stat?.size ?? (plannedBlob instanceof Uint8Array ? plannedBlob.length : textToBytes(String(plannedBlob ?? '')).length);
+    } catch (exc) {
+      isolateFileError(p, exc);
+      continue;
+    }
+    if (size > gitMaxSize) {
+      const attr = runGit(rpc, ['check-attr', '-z', 'filter', '--', p], { cwd: repoRoot, cfg, locale });
+      if (attr.returncode !== 0 || attr.stdout.split('\u0000')[2] !== 'lfs') throw gitFileLimitError(locale, p);
+    }
+    fileInfo.set(p, { filePath, size, plannedBlob });
+    if (onFileSuccess) onFileSuccess(p);
+  }
   const changedEntries = [];
   for (const p of allCheckPaths) {
+    if (skipped.has(p)) continue;
     if (deleted.has(p)) {
       const prevOid = (headEntries[p] || ['', ''])[1];
-      if (prevOid) {
-        changedEntries.push([p, '0', '0'.repeat(prevOid.length)]);
-      }
+      if (prevOid) changedEntries.push([p, '0', '0'.repeat(prevOid.length)]);
       continue;
     }
-    let rawData;
-    if (Object.hasOwn(blobMap, p)) {
-      rawData = blobMap[p] instanceof Uint8Array ? blobMap[p] : textToBytes(String(blobMap[p] ?? ''));
-    } else {
-      rawData = fsReadBytes(rpc, posixJoin(trimTrailingSlash(repoRoot), p));
-      if (rawData === null) continue;
-    }
+    const { filePath, size, plannedBlob } = fileInfo.get(p);
     const [prevMode, prevOid] = headEntries[p] || ['100644', ''];
-    const mode = prevMode === '100644' || prevMode === '100755' ? prevMode : '100644';
-    const newOid = gitHashObjectWrite(rpc, repoRoot, gitDir, p, rawData, { cfg, pid, nowMsFn, locale });
-    if (oldHead && newOid === prevOid) {
+    if (prevMode === '160000') {
+      throw new Error(gitErrorMessage(locale, `submodule conflict: ${p}`));
+    }
+    let newOid;
+    try {
+      const diskHash = () => hashSyncFile(filePath, rpc, () => fsReadBytes(rpc, filePath));
+      const expected = filePath ? plannedBlob?.hash || diskHash() : null;
+      const verifySource = () => {
+        if (filePath && (!expected || diskHash() !== expected)) {
+          throw new Error(`Attachment changed during sync: ${p}`);
+        }
+      };
+      verifySource();
+      newOid = gitHashObjectWrite(rpc, repoRoot, gitDir, p, plannedBlob, { cfg, pid, nowMsFn, locale, filePath });
+      verifySource();
+      if (filePath || size > gitMaxSize) {
+        const blobSize = runGit(rpc, ['cat-file', '-s', newOid], { cwd: repoRoot, cfg, locale });
+        if (blobSize.returncode !== 0) throw new Error(`${p}: ${gitErrorMessage(locale, blobSize.stderr, 'git cat-file failed')}`);
+        if (Number(blobSize.stdout.trim()) > gitMaxSize) throw gitFileLimitError(locale, p);
+      }
+    } catch (exc) {
+      isolateFileError(p, exc);
       continue;
     }
-    changedEntries.push([p, mode, newOid]);
+    if (onFileSuccess) onFileSuccess(p);
+    const mode = prevMode === '100755' ? prevMode : '100644';
+    if (!oldHead || newOid !== prevOid) changedEntries.push([p, mode, newOid]);
   }
 
   if (allCheckPaths.length > 0) {
@@ -1846,13 +1962,7 @@ export function commitAndPushGit(
     const lockDeadline = nowMsFn() + 2000;
     while (fsStat(rpc, indexLock).exists) {
       if (nowMsFn() >= lockDeadline) {
-        throw new Error(
-          tr(
-            locale,
-            'Git 暂存区正被其他进程锁定，请稍后重试',
-            'Git index is locked by another process; retry shortly'
-          )
-        );
+        throw new Error(gitErrorMessage(locale, `${realIndex}.lock`));
       }
       sleepMs(50, sleepFn);
     }
@@ -1862,6 +1972,7 @@ export function commitAndPushGit(
     let indexUpdated = false;
     try {
       ownerPath = writeGitIndexOwner(rpc, repoRoot, { cfg, pid, locale });
+      assertGitOperationFinished(rpc, repoRoot, locale);
       if (checkout) {
         gitCheckoutState(rpc, repoRoot, cfg, checkout, locale);
       }
@@ -1894,7 +2005,7 @@ export function commitAndPushGit(
         stdin: indexInfoPayload,
       });
       if (uiProc.returncode !== 0) {
-        const err = errorDetail(locale, uiProc.stderr || uiProc.stdout || 'git update-index failed');
+        const err = gitErrorMessage(locale, uiProc.stderr || uiProc.stdout, 'git update-index failed');
         throw new Error(tr(locale, `Git 索引同步失败: ${err}`, `Git index sync failed: ${err}`));
       }
       indexUpdated = true;
@@ -2229,6 +2340,7 @@ export function createGitSyncEngine({
     targetBases = [],
     excludedSubdirs = new Set(),
     deadlineMs = 0,
+    skipRound,
   } = {}) => {
     const rpc = getRpc();
     const loc = getLocale();
@@ -2242,7 +2354,9 @@ export function createGitSyncEngine({
       ? configStore.notebookLabel(effectiveNbRoot)
       : notebookLabel(effectiveNbRoot, loc, '', homeDir);
     const scope = cfg.sync_scope || 'all';
-    const localNotes = local.readNotes({ onlyPath, scope, nbRoot: effectiveNbRoot });
+    const skips = createSyncSkips(cfg, loc, skipRound);
+    const localNotes = local.readNotes({ onlyPath, scope, nbRoot: effectiveNbRoot, cfg, locale: loc, skips });
+    const scanOptions = { onlyPath, scope, excludedSubdirs, locale: loc, cfg, skips };
     for (const relPath of Object.keys(localNotes)) {
       if (inSyncSubdir(relPath, excludedSubdirs)) {
         throw new Error(
@@ -2269,7 +2383,7 @@ export function createGitSyncEngine({
     let remoteInspected = true;
     let remoteError = null;
     if (preparedRepoDir) {
-      remoteNotes = scanMirrorFiles(rpc, targetDir, { onlyPath, scope, excludedSubdirs, locale: loc });
+      remoteNotes = scanMirrorFiles(rpc, targetDir, scanOptions);
     } else if (inspectRemote) {
       const [ok, res] = prepareGitRepo(rpc, cfg, {
         allowInitOrClone: true,
@@ -2286,13 +2400,13 @@ export function createGitSyncEngine({
       if (ok) {
         repoRoot = res;
         targetDir = subdir ? posixJoin(res, subdir) : res;
-        remoteNotes = scanMirrorFiles(rpc, targetDir, { onlyPath, scope, excludedSubdirs, locale: loc });
+        remoteNotes = scanMirrorFiles(rpc, targetDir, scanOptions);
       } else {
         remoteInspected = false;
         remoteError = res;
       }
     } else if (hasGitMarker(rpc, repoDir)) {
-      remoteNotes = scanMirrorFiles(rpc, targetDir, { onlyPath, scope, excludedSubdirs, locale: loc });
+      remoteNotes = scanMirrorFiles(rpc, targetDir, scanOptions);
     } else {
       remoteInspected = false;
     }
@@ -2341,7 +2455,7 @@ export function createGitSyncEngine({
         dirIsNormalizationInsensitive(rpc, effectiveNbRoot) ||
         dirIsNormalizationInsensitive(rpc, targetDir);
       for (const tp of [...gitTreePaths].sort()) {
-        if (inSyncSubdir(tp, excludedSubdirs)) continue;
+        if (inSyncSubdir(tp, excludedSubdirs) || skips.has(tp)) continue;
         const isMd = isSafeRelMd(tp) && !isSafeRelAsset(tp);
         const isAs = syncAssetsOn && isSafeRelAsset(tp);
         if (!isMd && !isAs) continue;
@@ -2396,6 +2510,7 @@ export function createGitSyncEngine({
       gitTreePaths,
       onlyPath,
       locale: loc,
+      skips,
     });
   };
 
@@ -2527,6 +2642,7 @@ export function createGitSyncEngine({
 
     const checkout = baseRoot && hasGitMarker(rpc, baseRoot) ? gitCheckoutState(rpc, baseRoot, cfg, null, loc) : null;
     const plans = [];
+    const skipRound = { consecutive: 0 };
     for (const nb of effectiveNotebooks) {
       const sub = bindings[nb] || '';
       const plan = computeSyncPlan({
@@ -2539,6 +2655,7 @@ export function createGitSyncEngine({
         targetBases,
         excludedSubdirs: sub ? new Set() : reservedSubdirs,
         deadlineMs,
+        skipRound,
       });
       plan.batch_base_root = baseRoot;
       plan.batch_bindings = { ...bindings };
@@ -2600,6 +2717,7 @@ export function createGitSyncEngine({
       sleepFn,
       progressState,
       skipLock,
+      beforeRemoteWrite: () => assertGitOperationFinished(getRpc(), plan.repo_root || plan.target_dir, getLocale()),
     });
 
   const executeBatchPlan = (batch, { reportProgress = false, deadlineMs = 0 } = {}) => {
@@ -2613,6 +2731,7 @@ export function createGitSyncEngine({
     }
     const cfg = batch.cfg;
     const repo = batch.repo_root;
+    if (repo) assertGitOperationFinished(rpc, repo, loc);
     const legacyRoots = new Set();
     if (repo) legacyRoots.add(repo);
     for (const plan of batch.plans) {
@@ -2737,6 +2856,7 @@ export function createGitSyncEngine({
     const trackedGitPaths = [];
     const deletedGitPaths = [];
     const plannedGitBlobs = {};
+    const pathOwners = new Map();
 
     for (const plan of batch.plans) {
       const res = applyNotebookPlan(plan, { progressState });
@@ -2747,7 +2867,12 @@ export function createGitSyncEngine({
       totalDeleted += Number(plan._deleted_count || 0);
       const risks = planRiskMetrics(rpc, plan);
       reportedConflicts += risks.conflicts + risks.pull_conflict + risks.push_conflict;
-      pendingBaseMaps.push([plan.meta_key, res.baseMap]);
+      pendingBaseMaps.push([plan, res.baseMap]);
+      const prefix = plan.subdir ? `${plan.subdir}/` : '';
+      const paths = [...res.writtenRemotePaths, ...res.syncedRepoPaths];
+      for (const path of paths) {
+        pathOwners.set(path, { plan, rel: path.slice(prefix.length) });
+      }
       stagedGitPaths.push(...res.writtenRemotePaths);
       trackedGitPaths.push(...res.syncedRepoPaths);
       deletedGitPaths.push(...(plan._deleted_git_paths || []));
@@ -2774,6 +2899,12 @@ export function createGitSyncEngine({
             stagedRelPaths: stagedGitPaths,
             trackedPlanPaths: trackedGitPaths,
             plannedBlobs: plannedGitBlobs,
+            onFileError: (path, exc) => {
+              const owner = pathOwners.get(path);
+              if (!owner?.plan.skips) throw exc;
+              owner.plan.skips.recordError(owner.rel, exc);
+            },
+            onFileSuccess: (path) => pathOwners.get(path)?.plan.skips?.succeeded(),
             checkout,
             deletedRelPaths: deletedGitPaths,
             dataDir: dDir,
@@ -2786,8 +2917,9 @@ export function createGitSyncEngine({
         { dataDir: dDir, pid, nowMsFn, sleepFn }
       );
       if (configStore) {
-        for (const [mk, updatedBase] of pendingBaseMaps) {
-          configStore.state.syncMeta[mk] = updatedBase;
+        for (const [plan, updatedBase] of pendingBaseMaps) {
+          if (plan.skips) restoreSkippedBase(updatedBase, plan.original_base_map || plan.base_map || {}, plan.skips);
+          configStore.state.syncMeta[plan.meta_key] = updatedBase;
         }
       }
     }
@@ -2800,13 +2932,16 @@ export function createGitSyncEngine({
       configStore.state.stats.last_sync = nowHms();
     }
 
+    const skippedItems = collectSkippedItems(batch.plans);
+    const skippedSummary = skippedItems.length ? formatSkippedCount(loc, skippedItems.length) : '';
     const totalNotes = totalPushed + totalPulled + totalConflicts;
     if (totalNotes === 0 && totalAssets === 0 && totalDeleted === 0) {
       if (didPush) {
         const summary = tr(loc, '已推送本地提交', 'Pushed local commits');
         return {
           status: '成功',
-          summary,
+          summary: skippedSummary ? `${summary} · ${skippedSummary}` : summary,
+          skipped_items: skippedItems,
           pushed: 0,
           pulled: 0,
           conflicts: 0,
@@ -2817,7 +2952,8 @@ export function createGitSyncEngine({
       }
       return {
         status: '无变更',
-        summary: tr(loc, '已是最新', 'Up to date'),
+        summary: skippedSummary || tr(loc, '已是最新', 'Up to date'),
+        skipped_items: skippedItems,
         pushed: 0,
         pulled: 0,
         conflicts: 0,
@@ -2839,9 +2975,11 @@ export function createGitSyncEngine({
       summary += tr(loc, ` · 删除 ${totalDeleted} 项`, ` · Deleted: ${totalDeleted}`);
     }
 
+    if (skippedSummary) summary += ` · ${skippedSummary}`;
     return {
       status: '成功',
       summary,
+      skipped_items: skippedItems,
       pushed: totalPushed,
       pulled: totalPulled,
       conflicts: reportedConflicts,
