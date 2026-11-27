@@ -62,6 +62,7 @@ import {
   MAX_LOG_ENTRIES,
   INITIALIZED_META_KEY,
   LAYOUTS_META_KEY,
+  queryLiveNotebookIdentity,
   resolveMirrorDir,
   computeNotebookSubdirMap,
   notebookKey,
@@ -264,6 +265,136 @@ export function fsDelete(callHost, path, recursive = false) {
   });
 }
 
+/** Delete a path strictly inside plugin data_dir via host.fs.delete_data (never follows symlinks). */
+export function fsDeleteData(callHost, path, recursive = false) {
+  const rpc = resolveCallHost(callHost);
+  return rpc('host.fs.delete_data', {
+    path: String(path ?? ''),
+    recursive: Boolean(recursive),
+  });
+}
+
+/** Verify with lstat that dirPath exists, is a directory, and is not a symlink. */
+export function isVerifiedDirNoSymlink(callHost, dirPath) {
+  const clean = trimTrailingSlash(dirPath);
+  if (!clean) return false;
+  try {
+    const st = fsStat(callHost, clean, { lstat: true });
+    return Boolean(st && st.exists && st.is_dir && !st.is_symlink);
+  } catch (_err) {
+    return false;
+  }
+}
+
+/** Walk every directory segment from baseDir down to targetDir with lstat and reject any symlink. */
+export function isVerifiedHierarchyUnder(
+  callHost,
+  baseDir,
+  targetDir,
+  { requireDir = false, allowMissing = false } = {}
+) {
+  const cleanBase = trimTrailingSlash(normAbsPath(baseDir) || String(baseDir ?? ''));
+  const cleanTarget = trimTrailingSlash(normAbsPath(targetDir) || String(targetDir ?? ''));
+  if (!cleanBase || !cleanTarget) return false;
+  if (cleanTarget !== cleanBase && !cleanTarget.startsWith(`${cleanBase}/`)) return false;
+  try {
+    const baseSt = fsStat(callHost, cleanBase, { lstat: true });
+    if (!baseSt || baseSt.is_symlink) return false;
+    if (!baseSt.exists) return Boolean(allowMissing);
+    if (!baseSt.is_dir) return false;
+    if (cleanTarget === cleanBase) {
+      return requireDir ? Boolean(baseSt.is_dir) : true;
+    }
+    const rel = cleanTarget.slice(cleanBase.length + 1);
+    const parts = rel.split('/').filter(Boolean);
+    let cur = cleanBase;
+    for (let i = 0; i < parts.length; i += 1) {
+      cur = posixJoin(cur, parts[i]);
+      const st = fsStat(callHost, cur, { lstat: true });
+      if (!st || st.is_symlink) return false;
+      if (!st.exists) return Boolean(allowMissing);
+      const isLast = i === parts.length - 1;
+      if ((!isLast || requireDir) && !st.is_dir) return false;
+    }
+    return true;
+  } catch (_err) {
+    return false;
+  }
+}
+
+function isVerifiedSubtreeNoSymlinks(callHost, targetPath, { recursive = false } = {}) {
+  const clean = trimTrailingSlash(targetPath);
+  if (!clean) return false;
+  let st;
+  try {
+    st = fsStat(callHost, clean, { lstat: true });
+  } catch (_err) {
+    return false;
+  }
+  if (!st || st.is_symlink) return false;
+  if (!st.exists) return true;
+  if (!recursive || !st.is_dir) return true;
+  let entries;
+  try {
+    entries = fsList(callHost, clean, true);
+  } catch (_err) {
+    return false;
+  }
+  for (const ent of entries) {
+    if (!ent || ent.is_symlink) return false;
+    const entPath = ent.path ? String(ent.path) : posixJoin(clean, String(ent.rel_path || ent.name || ''));
+    if (entPath) {
+      try {
+        const est = fsStat(callHost, entPath, { lstat: true });
+        if (est && est.is_symlink) return false;
+      } catch (_err) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+/** Delete a path inside plugin data_dir via host.fs.delete_data after lstat hierarchy verification. */
+export function deleteDataPath(callHost, targetPath, { recursive = false, baseDir = '' } = {}) {
+  const rpc = resolveCallHost(callHost);
+  const cleanTarget = trimTrailingSlash(normAbsPath(targetPath) || String(targetPath ?? ''));
+  if (!cleanTarget) return false;
+  const pluginDataDir = trimTrailingSlash(baseDir ? normAbsPath(baseDir) || baseDir : resolvePluginDataDir(rpc));
+  const insideDataDir = Boolean(pluginDataDir && cleanTarget.startsWith(`${pluginDataDir}/`));
+  if (pluginDataDir && cleanTarget === pluginDataDir) return false;
+  if (insideDataDir) {
+    if (!isVerifiedHierarchyUnder(rpc, pluginDataDir, cleanTarget, { requireDir: false, allowMissing: false })) {
+      return false;
+    }
+    if (!isVerifiedSubtreeNoSymlinks(rpc, cleanTarget, { recursive })) {
+      return false;
+    }
+    try {
+      const res = fsDeleteData(rpc, cleanTarget, recursive);
+      return res ? res.deleted !== false : true;
+    } catch (exc) {
+      if (!isHostMethodUnsupported(exc)) {
+        return false;
+      }
+    }
+  } else {
+    try {
+      const st = fsStat(rpc, cleanTarget, { lstat: true });
+      if (!st || !st.exists || st.is_symlink) return false;
+      if (!isVerifiedSubtreeNoSymlinks(rpc, cleanTarget, { recursive })) return false;
+    } catch (_err) {
+      return false;
+    }
+  }
+  try {
+    fsDelete(rpc, cleanTarget, recursive);
+    return true;
+  } catch (_delErr) {
+    return false;
+  }
+}
+
 /** Rename/move a path via host.fs.rename. */
 export function fsRename(callHost, from, to, { overwrite = false, mkdirParents = false } = {}) {
   const rpc = resolveCallHost(callHost);
@@ -290,7 +421,12 @@ function isHostMethodUnsupported(exc) {
   if (!exc) return false;
   if (typeof exc === 'object' && exc.code === -32601) return true;
   const low = String(exc?.message || exc || '').toLowerCase();
-  return low.includes('unknown host method') || low.includes('-32601');
+  return (
+    low.includes('unknown host method') ||
+    low.includes('method not found') ||
+    low.includes('-32601') ||
+    low.includes('unexpected host request')
+  );
 }
 
 /** Atomically swap two files in the same directory via host.fs.atomic_swap. */
@@ -1117,7 +1253,7 @@ function stashEntryTimestampMs(entry, name) {
   return 0;
 }
 
-const RECOGNIZED_STASH_FILE_RE = /^\d{15}-[0-9a-f]{8}-.+/;
+const RECOGNIZED_STASH_FILE_RE = /^(?:\d{13,15}-[0-9a-f]{8}-.+|\.block-sync-keep-\d{10,16}-[0-9a-f]{8}(?:-\d+)?)$/;
 
 function isRecognizedStashFileName(name) {
   return RECOGNIZED_STASH_FILE_RE.test(String(name || ''));
@@ -1127,31 +1263,29 @@ function isVerifiedRegularStashFile(callHost, filePath, name) {
   if (!isRecognizedStashFileName(name)) return false;
   try {
     const st = fsStat(callHost, filePath, { lstat: true });
-    return Boolean(st && st.exists && st.is_regular === true && !st.is_dir && !st.is_symlink);
+    if (!st || !st.exists || st.is_dir || st.is_symlink) return false;
+    return st.is_regular === true || (st.is_regular === undefined && st.is_file === true);
   } catch (_err) {
     return false;
   }
 }
 
-function verifiedLegacyRegularFile(callHost, filePath) {
-  try {
-    const st = fsStat(callHost, filePath, { lstat: true });
-    if (!st || !st.exists || st.is_dir || st.is_symlink) return null;
-    const regular = st.is_regular === true || (st.is_regular === undefined && st.is_file === true);
-    return regular ? st : null;
-  } catch (_err) {
-    return null;
+function isSafeStashDir(callHost, stashDir, pluginDataDir = '') {
+  const cleanStash = trimTrailingSlash(normAbsPath(stashDir) || String(stashDir ?? ''));
+  if (!cleanStash) return false;
+  const cleanBase = trimTrailingSlash(normAbsPath(pluginDataDir) || String(pluginDataDir ?? ''));
+  if (cleanBase && (cleanStash === cleanBase || cleanStash.startsWith(`${cleanBase}/`))) {
+    return isVerifiedHierarchyUnder(callHost, cleanBase, cleanStash, { requireDir: true, allowMissing: false });
   }
+  return isVerifiedDirNoSymlink(callHost, cleanStash);
 }
 
-function legacyStashName(callHost, name, tsMs) {
-  const safe = (String(name).replace(/[^A-Za-z0-9._-]+/g, '_') || 'file').slice(0, 48);
-  const ts = String(Math.max(0, Math.floor(tsMs))).padStart(15, '0').slice(-15);
-  return `${ts}-${sha256Text(name, callHost).slice(0, 8)}-${safe}`;
-}
-
-function pruneStashDir(callHost, stashDir, keepName, nowMs) {
+function pruneStashDir(callHost, stashDir, keepName, nowMs, { dataDir = '' } = {}) {
   try {
+    const pluginDataDir = resolvePluginDataDir(callHost, dataDir);
+    if (!isSafeStashDir(callHost, stashDir, pluginDataDir)) {
+      return;
+    }
     const expireBeforeMs = nowMs - RECOVERY_RETENTION_MS;
     const protectAfterMs = nowMs - STASH_PROTECT_WINDOW_MS;
     const entries = fsList(callHost, stashDir, false);
@@ -1165,7 +1299,7 @@ function pruneStashDir(callHost, stashDir, keepName, nowMs) {
       const tsMs = stashEntryTimestampMs(entry, name);
       if (name !== keepName && tsMs > 0 && tsMs < expireBeforeMs) {
         try {
-          fsDelete(callHost, entryPath);
+          deleteDataPath(callHost, entryPath, { recursive: false, baseDir: pluginDataDir });
         } catch (_err) {
           // Ignore prune errors.
         }
@@ -1181,7 +1315,7 @@ function pruneStashDir(callHost, stashDir, keepName, nowMs) {
         const entryPath = posixJoin(stashDir, item.name);
         if (!isVerifiedRegularStashFile(callHost, entryPath, item.name)) continue;
         try {
-          fsDelete(callHost, entryPath);
+          deleteDataPath(callHost, entryPath, { recursive: false, baseDir: pluginDataDir });
         } catch (_err) {
           // Ignore prune errors.
         }
@@ -1189,8 +1323,8 @@ function pruneStashDir(callHost, stashDir, keepName, nowMs) {
     }
     if (!keepName) {
       try {
-        if (fsList(callHost, stashDir, false).length === 0) {
-          fsDelete(callHost, stashDir, false);
+        if (isSafeStashDir(callHost, stashDir, pluginDataDir) && fsList(callHost, stashDir, false).length === 0) {
+          deleteDataPath(callHost, stashDir, { recursive: false, baseDir: pluginDataDir });
         }
       } catch (_err) {
         // Ignore empty dir cleanup errors.
@@ -1201,13 +1335,17 @@ function pruneStashDir(callHost, stashDir, keepName, nowMs) {
   }
 }
 
-function moveFileIntoRecovery(callHost, srcPath, stashDir, baseName, nowMs) {
+function moveFileIntoRecovery(callHost, srcPath, stashDir, baseName, nowMs, { dataDir = '' } = {}) {
+  const pluginDataDir = resolvePluginDataDir(callHost, dataDir);
+  if (!isSafeStashDir(callHost, stashDir, pluginDataDir)) {
+    throw new Error(`Unsafe recovery directory: ${stashDir}`);
+  }
   const baseDest = posixJoin(stashDir, baseName);
   for (let idx = 0; idx < 50; idx += 1) {
     const cand = idx === 0 ? baseDest : `${baseDest}-${idx}`;
     try {
       fsRename(callHost, srcPath, cand, { overwrite: false });
-      pruneStashDir(callHost, stashDir, posixBasename(cand), nowMs);
+      pruneStashDir(callHost, stashDir, posixBasename(cand), nowMs, { dataDir: pluginDataDir });
       return cand;
     } catch (exc) {
       if (isAlreadyExistsError(exc)) continue;
@@ -1220,7 +1358,7 @@ function moveFileIntoRecovery(callHost, srcPath, stashDir, baseName, nowMs) {
       let tmpPath = '';
       for (let tIdx = 0; tIdx < 100; tIdx += 1) {
         const tCand = posixJoin(stashDir, `.block-sync-stash-${nowMs}-${tIdx}.tmp`);
-        const tSt = fsStat(callHost, tCand);
+        const tSt = fsStat(callHost, tCand, { lstat: true });
         if (!tSt.exists) {
           tmpPath = tCand;
           break;
@@ -1242,16 +1380,17 @@ function moveFileIntoRecovery(callHost, srcPath, stashDir, baseName, nowMs) {
             throw copyExc;
           }
           tmpAlive = false;
-          const dstSt = fsStat(callHost, copyCand);
+          const dstSt = fsStat(callHost, copyCand, { lstat: true });
           if (
             !dstSt.exists ||
             dstSt.is_dir ||
+            dstSt.is_symlink ||
             dstSt.size === undefined ||
             dstSt.size === null ||
             Number(dstSt.size) !== bytes.byteLength
           ) {
             try {
-              fsDelete(callHost, copyCand);
+              deleteDataPath(callHost, copyCand, { recursive: false, baseDir: pluginDataDir });
             } catch (_cleanupErr) {
               // Best-effort cleanup of unverified destination.
             }
@@ -1262,14 +1401,14 @@ function moveFileIntoRecovery(callHost, srcPath, stashDir, baseName, nowMs) {
           } catch (delSrcErr) {
             if (!isNotFoundError(delSrcErr)) throw delSrcErr;
           }
-          pruneStashDir(callHost, stashDir, posixBasename(copyCand), nowMs);
+          pruneStashDir(callHost, stashDir, posixBasename(copyCand), nowMs, { dataDir: pluginDataDir });
           return copyCand;
         }
         throw new Error('Exhausted recovery destination candidates');
       } finally {
         if (tmpAlive) {
           try {
-            fsDelete(callHost, tmpPath);
+            deleteDataPath(callHost, tmpPath, { recursive: false, baseDir: pluginDataDir });
           } catch (_delErr) {
             // Ignore temp cleanup errors.
           }
@@ -1282,15 +1421,24 @@ function moveFileIntoRecovery(callHost, srcPath, stashDir, baseName, nowMs) {
 
 function moveToRecoveryStash(callHost, srcPath, rootDir, relPath, nowMsFn = () => Date.now(), dataDir = '') {
   const { nowMs, tag, gitDir, candidates } = stashCandidatesForRoot(callHost, rootDir, relPath, nowMsFn, dataDir);
+  const pluginDataDir = resolvePluginDataDir(callHost, dataDir);
   for (const [stashDir, needsExclude, exclPattern] of candidates) {
     try {
-      const st = fsStat(callHost, stashDir);
-      if (st.exists && !st.is_dir) continue;
+      const cleanStash = trimTrailingSlash(normAbsPath(stashDir) || stashDir);
+      if (pluginDataDir && cleanStash.startsWith(`${pluginDataDir}/`)) {
+        if (!isVerifiedHierarchyUnder(callHost, pluginDataDir, cleanStash, { requireDir: true, allowMissing: true })) {
+          continue;
+        }
+      } else {
+        const st = fsStat(callHost, cleanStash, { lstat: true });
+        if (st.is_symlink || (st.exists && !st.is_dir)) continue;
+      }
       fsMkdir(callHost, stashDir, true);
+      if (!isSafeStashDir(callHost, stashDir, pluginDataDir)) continue;
       if (needsExclude && gitDir && exclPattern) {
         ensureGitInfoExclude(callHost, gitDir, exclPattern);
       }
-      const moved = moveFileIntoRecovery(callHost, srcPath, stashDir, tag, nowMs);
+      const moved = moveFileIntoRecovery(callHost, srcPath, stashDir, tag, nowMs, { dataDir: pluginDataDir });
       if (moved) return moved;
     } catch (_err) {
       // Try next candidate directory.
@@ -1299,14 +1447,14 @@ function moveToRecoveryStash(callHost, srcPath, rootDir, relPath, nowMsFn = () =
   return '';
 }
 
-function moveDirFilesToRecovery(rpc, srcDir, recoveryDir, nowMs) {
-  let dirSt;
-  try {
-    dirSt = fsStat(rpc, srcDir, { lstat: true });
-  } catch (_statErr) {
-    return;
+function moveDirFilesToRecovery(rpc, srcDir, recoveryDir, nowMs, { dataDir = '' } = {}) {
+  const pluginDataDir = resolvePluginDataDir(rpc, dataDir);
+  if (!isSafeStashDir(rpc, srcDir, pluginDataDir)) return;
+  if (pluginDataDir && recoveryDir.startsWith(`${pluginDataDir}/`)) {
+    if (!isVerifiedHierarchyUnder(rpc, pluginDataDir, recoveryDir, { requireDir: true, allowMissing: true })) {
+      return;
+    }
   }
-  if (!dirSt.exists || !dirSt.is_dir || dirSt.is_symlink) return;
   let entries = [];
   try {
     entries = fsList(rpc, srcDir, false);
@@ -1322,20 +1470,26 @@ function moveDirFilesToRecovery(rpc, srcDir, recoveryDir, nowMs) {
     if (!isVerifiedRegularStashFile(rpc, srcPath, name)) continue;
     try {
       if (!ensuredRecoveryDir) {
-        const recSt = fsStat(rpc, recoveryDir, { lstat: true });
-        if (recSt.exists && (!recSt.is_dir || recSt.is_symlink)) return;
+        if (pluginDataDir && recoveryDir.startsWith(`${pluginDataDir}/`)) {
+          if (!isVerifiedHierarchyUnder(rpc, pluginDataDir, recoveryDir, { requireDir: true, allowMissing: true })) {
+            return;
+          }
+        } else {
+          const recSt = fsStat(rpc, recoveryDir, { lstat: true });
+          if (recSt.is_symlink || (recSt.exists && !recSt.is_dir)) return;
+        }
         fsMkdir(rpc, recoveryDir, true);
+        if (!isSafeStashDir(rpc, recoveryDir, pluginDataDir)) return;
         ensuredRecoveryDir = true;
       }
-      moveFileIntoRecovery(rpc, srcPath, recoveryDir, name, nowMs);
+      moveFileIntoRecovery(rpc, srcPath, recoveryDir, name, nowMs, { dataDir: pluginDataDir });
     } catch (_moveErr) {
       // Best-effort per entry; never block sync.
     }
   }
   try {
-    const remaining = fsList(rpc, srcDir, false);
-    if (remaining.length === 0) {
-      fsDelete(rpc, srcDir, false);
+    if (isSafeStashDir(rpc, srcDir, pluginDataDir) && fsList(rpc, srcDir, false).length === 0) {
+      deleteDataPath(rpc, srcDir, { recursive: false, baseDir: pluginDataDir });
     }
   } catch (_delErr) {
     // Best-effort empty directory cleanup.
@@ -1354,13 +1508,18 @@ export function migrateLegacyRecoveryDirs(
   try {
     const rpc = resolveCallHost(callHost);
     const cleanRoot = trimTrailingSlash(rootDir);
-    if (!cleanRoot) return;
+    if (!cleanRoot || !isVerifiedDirNoSymlink(rpc, cleanRoot)) return;
     const nbDetails = resolveNotebookRecoveryDetails(rpc, cleanRoot);
     const recoveryDir = recoveryDirForRoot(rpc, cleanRoot, dataDir);
     if (!recoveryDir) return;
+    const pluginDataDir = resolvePluginDataDir(rpc, dataDir);
+    if (pluginDataDir && recoveryDir.startsWith(`${pluginDataDir}/`)) {
+      if (!isVerifiedHierarchyUnder(rpc, pluginDataDir, recoveryDir, { requireDir: true, allowMissing: true })) {
+        return;
+      }
+    }
     const nowMs = nowMsFn();
 
-    const pluginDataDir = resolvePluginDataDir(rpc, dataDir);
     if (pluginDataDir) {
       const hashRoots = [cleanRoot];
       const mergedExtras = [...(nbDetails.previousPaths || []), ...(extraHashRoots || [])];
@@ -1371,20 +1530,16 @@ export function migrateLegacyRecoveryDirs(
       for (const hr of hashRoots) {
         const legacyHashDir = posixJoin(pluginDataDir, 'recovery', sha256Text(hr, rpc).slice(0, 16));
         if (legacyHashDir && legacyHashDir !== recoveryDir) {
-          moveDirFilesToRecovery(rpc, legacyHashDir, recoveryDir, nowMs);
+          moveDirFilesToRecovery(rpc, legacyHashDir, recoveryDir, nowMs, { dataDir: pluginDataDir });
         }
       }
     }
 
     for (const legacyName of ['.block-sync-replaced', '.block-sync-recovery']) {
       const legacyDir = posixJoin(cleanRoot, legacyName);
-      let dirSt;
-      try {
-        dirSt = fsStat(rpc, legacyDir, { lstat: true });
-      } catch (_statErr) {
+      if (!isVerifiedHierarchyUnder(rpc, cleanRoot, legacyDir, { requireDir: true, allowMissing: false })) {
         continue;
       }
-      if (!dirSt.exists || !dirSt.is_dir || dirSt.is_symlink) continue;
 
       let entries = [];
       try {
@@ -1397,32 +1552,35 @@ export function migrateLegacyRecoveryDirs(
       for (const entry of entries) {
         if (!entry || entry.is_dir || entry.is_symlink || entry.is_regular === false || entry.is_file === false) continue;
         const name = String(entry.name ?? '') || posixBasename(entry.path || '');
-        if (!name) continue;
+        if (!name || !isRecognizedStashFileName(name)) continue;
         const srcPath = entry.path ? String(entry.path) : posixJoin(legacyDir, name);
-        // Plugin-owned legacy dirs: move any verified regular file (never delete). Unrecognized
-        // names are re-tagged into the stash format so the 7-day retention applies later.
-        const legacySt = verifiedLegacyRegularFile(rpc, srcPath);
-        if (!legacySt) continue;
-        const destName = isRecognizedStashFileName(name)
-          ? name
-          : legacyStashName(rpc, name, Number(legacySt.mtime_ms) || nowMs);
+        if (!isVerifiedRegularStashFile(rpc, srcPath, name)) continue;
         try {
           if (!ensuredRecoveryDir) {
-            const recSt = fsStat(rpc, recoveryDir, { lstat: true });
-            if (recSt.exists && (!recSt.is_dir || recSt.is_symlink)) break;
+            if (pluginDataDir && recoveryDir.startsWith(`${pluginDataDir}/`)) {
+              if (!isVerifiedHierarchyUnder(rpc, pluginDataDir, recoveryDir, { requireDir: true, allowMissing: true })) {
+                break;
+              }
+            } else {
+              const recSt = fsStat(rpc, recoveryDir, { lstat: true });
+              if (recSt.is_symlink || (recSt.exists && !recSt.is_dir)) break;
+            }
             fsMkdir(rpc, recoveryDir, true);
+            if (!isSafeStashDir(rpc, recoveryDir, pluginDataDir)) break;
             ensuredRecoveryDir = true;
           }
-          moveFileIntoRecovery(rpc, srcPath, recoveryDir, destName, nowMs);
+          moveFileIntoRecovery(rpc, srcPath, recoveryDir, name, nowMs, { dataDir: pluginDataDir });
         } catch (_moveErr) {
           // Best-effort per entry; never block sync.
         }
       }
 
       try {
-        const remaining = fsList(rpc, legacyDir, false);
-        if (remaining.length === 0) {
-          fsDelete(rpc, legacyDir, false);
+        if (isVerifiedHierarchyUnder(rpc, cleanRoot, legacyDir, { requireDir: true, allowMissing: false })) {
+          const remaining = fsList(rpc, legacyDir, false);
+          if (remaining.length === 0) {
+            fsDelete(rpc, legacyDir, false);
+          }
         }
       } catch (_delErr) {
         // Best-effort empty directory cleanup.
@@ -1431,9 +1589,11 @@ export function migrateLegacyRecoveryDirs(
     if (pluginDataDir) {
       try {
         const legacyRecoveryBase = posixJoin(pluginDataDir, 'recovery');
-        const st = fsStat(rpc, legacyRecoveryBase);
-        if (st.exists && st.is_dir && fsList(rpc, legacyRecoveryBase, false).length === 0) {
-          fsDelete(rpc, legacyRecoveryBase, false);
+        if (
+          isVerifiedHierarchyUnder(rpc, pluginDataDir, legacyRecoveryBase, { requireDir: true, allowMissing: false }) &&
+          fsList(rpc, legacyRecoveryBase, false).length === 0
+        ) {
+          deleteDataPath(rpc, legacyRecoveryBase, { recursive: false, baseDir: pluginDataDir });
         }
       } catch (_cleanErr) {
         // Ignore cleanup errors.
@@ -1453,31 +1613,37 @@ export function cleanupRecoveryDirs(
     const rpc = resolveCallHost(callHost);
     const nowMs = nowMsFn();
     const seenDirs = new Set();
+    const pluginDataDir = resolvePluginDataDir(rpc, dataDir);
     for (const nb of notebooks || []) {
       const cleanNb = trimTrailingSlash(nb);
       if (!cleanNb) continue;
       const recDir = recoveryDirForRoot(rpc, cleanNb, dataDir);
       if (recDir && !seenDirs.has(recDir)) {
         seenDirs.add(recDir);
-        pruneStashDir(rpc, recDir, '', nowMs);
+        if (isSafeStashDir(rpc, recDir, pluginDataDir)) {
+          pruneStashDir(rpc, recDir, '', nowMs, { dataDir: pluginDataDir });
+        }
       }
     }
-    const pluginDataDir = resolvePluginDataDir(rpc, dataDir);
     if (pluginDataDir) {
       const base = posixJoin(pluginDataDir, 'recovery');
-      const st = fsStat(rpc, base);
-      if (st.exists && st.is_dir) {
+      if (isVerifiedHierarchyUnder(rpc, pluginDataDir, base, { requireDir: true, allowMissing: false })) {
         for (const ent of fsList(rpc, base, false)) {
-          if (!ent || !ent.is_dir) continue;
+          if (!ent || !ent.is_dir || ent.is_symlink) continue;
           const p = ent.path ? String(ent.path) : posixJoin(base, String(ent.name || ''));
           if (p && !seenDirs.has(p)) {
             seenDirs.add(p);
-            pruneStashDir(rpc, p, '', nowMs);
+            if (isVerifiedHierarchyUnder(rpc, pluginDataDir, p, { requireDir: true, allowMissing: false })) {
+              pruneStashDir(rpc, p, '', nowMs, { dataDir: pluginDataDir });
+            }
           }
         }
         try {
-          if (fsList(rpc, base, false).length === 0) {
-            fsDelete(rpc, base, false);
+          if (
+            isVerifiedHierarchyUnder(rpc, pluginDataDir, base, { requireDir: true, allowMissing: false }) &&
+            fsList(rpc, base, false).length === 0
+          ) {
+            deleteDataPath(rpc, base, { recursive: false, baseDir: pluginDataDir });
           }
         } catch (_delErr) {
           // Ignore empty dir cleanup.
@@ -1696,12 +1862,23 @@ export function writeMirrorPayload(
         tmpAlive = false;
       } else {
         // Keep a dot-prefixed non-.tmp fallback so stale temp cleanup never removes it.
+        const pluginDataDir = resolvePluginDataDir(rpc, dataDir);
         const recoveryDir = recoveryDirForRoot(rpc, cleanMirror, dataDir);
         const keepName = `.block-sync-keep-${nowMsFn()}-${sha256Text(relPath, rpc).slice(0, 8)}`;
-        if (recoveryDir) {
+        const recUnderDataDir = Boolean(pluginDataDir && recoveryDir && recoveryDir.startsWith(`${pluginDataDir}/`));
+        const recSafe = Boolean(
+          recoveryDir &&
+            (recUnderDataDir
+              ? isVerifiedHierarchyUnder(rpc, pluginDataDir, recoveryDir, { requireDir: true, allowMissing: true })
+              : (() => {
+                  const rst = fsStat(rpc, recoveryDir, { lstat: true });
+                  return !rst.is_symlink && (!rst.exists || rst.is_dir);
+                })())
+        );
+        if (recoveryDir && recSafe) {
           try {
             fsMkdir(rpc, recoveryDir, true);
-            const moved = moveFileIntoRecovery(rpc, tmpPath, recoveryDir, keepName, nowMsFn());
+            const moved = moveFileIntoRecovery(rpc, tmpPath, recoveryDir, keepName, nowMsFn(), { dataDir: pluginDataDir });
             if (moved) tmpAlive = false;
           } catch (_fbErr) {
             // Keep workspace clean; finally will clean up tmpPath if move failed.
@@ -2414,16 +2591,39 @@ export function computeThreeWaySyncPlan({
       configStore.allowLegacyFallback(nbKeyVal, protocol, candidateLegacyKeys));
   const effectiveLegacyKeys = allowLegacy ? candidateLegacyKeys : [];
   const originalBaseMap = configStore ? configStore.getBaseMap(metaKey, ...aliases, ...effectiveLegacyKeys) : {};
-  const baseMap = { ...originalBaseMap };
   const initializedMap = configStore ? configStore.state.syncMeta[INITIALIZED_META_KEY] : null;
-  const isInitialized = Boolean(
+  const hasExistingMeta = Boolean(
     (initializedMap &&
       typeof initializedMap === 'object' &&
       ([metaKey, ...aliases].some((k) => Boolean(initializedMap[k])) ||
         effectiveLegacyKeys.some((k) => Boolean(initializedMap[k])))) ||
-      Object.keys(baseMap).length > 0
+      Object.keys(originalBaseMap).length > 0
   );
-  const isFirstSync = !isInitialized;
+  const homeDir = configStore ? configStore.state.homeDir : '';
+  const idCheck =
+    configStore && typeof configStore.verifyNotebookIdentity === 'function'
+      ? configStore.verifyNotebookIdentity(nbRoot, {
+          metaKey,
+          aliases,
+          legacyKeys: effectiveLegacyKeys,
+          nbKeyVal,
+          hasExistingBaseline: hasExistingMeta,
+        })
+      : (() => {
+          const live = queryLiveNotebookIdentity(rpc, nbRoot, homeDir);
+          return {
+            identity_ok: Boolean(live.verified && live.rootIdentity),
+            verified: Boolean(live.verified),
+            root_identity: live.rootIdentity || '',
+            recorded_root_identity: '',
+            live_id: live.id || '',
+            reason: live.verified ? '' : 'host_unverified',
+          };
+        })();
+  const identityVerified = Boolean(idCheck && idCheck.identity_ok === true);
+  const identityDegraded = Boolean(hasExistingMeta && !identityVerified);
+  const baseMap = identityVerified ? { ...originalBaseMap } : {};
+  const isFirstSync = !identityVerified || !hasExistingMeta;
 
   let inspected = remoteInspected;
   let errText = remoteError;
@@ -2935,6 +3135,8 @@ export function computeThreeWaySyncPlan({
     base_hashes: baseHashes,
     remote_path_map: remotePathMap,
     remote_asset_path_map: assetPlan.remote_asset_path_map,
+    identity_verified: identityVerified,
+    live_root_identity: idCheck.root_identity || '',
   });
 
   const exposedReadLocal = typeof readLocalNote === 'function' ? readSingleLocal : null;
@@ -2954,10 +3156,16 @@ export function computeThreeWaySyncPlan({
     base_url: '',
     meta_key: metaKey,
     base_map: baseMap,
-    original_base_map: originalBaseMap,
+    original_base_map: identityVerified ? originalBaseMap : {},
     skipped_items: skips.items,
     skips,
     is_first_sync: isFirstSync,
+    identity_verified: identityVerified,
+    live_identity_verified: Boolean(idCheck && idCheck.verified === true),
+    root_identity: idCheck.recorded_root_identity || idCheck.root_identity || '',
+    live_root_identity: idCheck.root_identity || '',
+    identity_reason: idCheck.reason || '',
+    identity_degraded: identityDegraded,
     remote_nonempty_on_first_sync: remoteNonemptyOnFirstSync,
     local_notes: localNotes,
     remote_notes: remoteNotes,
@@ -3217,6 +3425,31 @@ export function buildPendingConfirm(
   };
 }
 
+/** Re-verify live notebook identity against the expected root identity recorded in plan. */
+export function verifyPlanLiveIdentity(callHost, configStore, plan) {
+  const rpc = resolveCallHost(callHost);
+  const expectedRoot = String((plan && (plan.live_root_identity || plan.root_identity)) || '').trim();
+  if (configStore && typeof configStore.verifyNotebookIdentity === 'function') {
+    return configStore.verifyNotebookIdentity(plan && plan.nb_root, {
+      metaKey: (plan && plan.meta_key) || '',
+      nbKeyVal: (plan && plan.nb_key) || '',
+      expectedRootIdentity: expectedRoot,
+      hasExistingBaseline: Boolean(plan && !plan.is_first_sync),
+    });
+  }
+  const homeDir = configStore ? configStore.state.homeDir : '';
+  const live = queryLiveNotebookIdentity(rpc, plan && plan.nb_root, homeDir);
+  const ok = Boolean(live.verified && live.rootIdentity && (!expectedRoot || live.rootIdentity === expectedRoot));
+  return {
+    identity_ok: ok,
+    verified: Boolean(live.verified),
+    root_identity: live.rootIdentity || '',
+    recorded_root_identity: expectedRoot,
+    live_id: live.id || '',
+    reason: ok ? '' : (!live.verified ? 'host_unverified' : 'root_changed'),
+  };
+}
+
 /** Shared notebook plan applicator used by both local_mirror and git engines. */
 export function applyMirrorOrGitNotebookPlan(
   plan,
@@ -3247,7 +3480,7 @@ export function applyMirrorOrGitNotebookPlan(
   const targetDir = plan.target_dir;
   const excludedSubdirs = plan.excluded_subdirs || new Set();
   const baseMap = { ...(plan.base_map || {}) };
-  const originalBaseMap = plan.original_base_map || plan.base_map || {};
+  const originalBaseMap = plan.identity_verified === true ? (plan.original_base_map || plan.base_map || {}) : (plan.base_map || {});
   const skips = plan.skips || createSyncSkips(cfg, locale);
   plan.skipped_items = skips.items;
   const restoreBase = () => restoreSkippedBase(baseMap, originalBaseMap, skips);
@@ -3457,6 +3690,33 @@ export function applyMirrorOrGitNotebookPlan(
       beforeRemoteWrite();
     }
 
+    const startIdCheck = verifyPlanLiveIdentity(rpc, configStore, plan);
+    const forceSkipDeletions =
+      plan.identity_verified !== true ||
+      plan.is_first_sync === true ||
+      !startIdCheck ||
+      startIdCheck.identity_ok !== true;
+    const unverifiedAtStart = Boolean(
+      plan.identity_degraded ||
+        (plan.identity_verified !== true && plan.identity_reason !== 'missing_baseline_identity') ||
+        (plan.identity_verified === true && (!startIdCheck || startIdCheck.identity_ok !== true))
+    );
+    if (unverifiedAtStart) {
+      appendLog(
+        tr(locale, `${prefix}未验证笔记本身份，已降级为仅合并`, `${prefix}Notebook identity unverified; downgraded to merge-only`),
+        '已跳过',
+        {
+          tone: 'warning',
+          tooltip: tr(locale, '当前仅合并不删文件', 'Merged without deleting files'),
+          logKey: 'identity_unverified',
+          logArgs: {
+            prefix,
+            reason: (!startIdCheck || !startIdCheck.identity_ok ? (startIdCheck && startIdCheck.reason) : plan.identity_reason) || '',
+          },
+        }
+      );
+    }
+
     // 1. Sync attachments first.
     skips.each(plan.assets_synced, (rel) => {
       baseMap[`asset:${rel}`] = localAssets[rel];
@@ -3492,7 +3752,7 @@ export function applyMirrorOrGitNotebookPlan(
 
     skips.each(plan.assets_to_pull_new, (rel) => {
       const rhash = remoteAssets[rel];
-      if (!plan.is_first_sync && configStore && configStore.lookupTombstoneHash(nbKeyVal, `asset:${rel}`) === rhash) {
+      if (!forceSkipDeletions && !plan.is_first_sync && plan.identity_verified === true && configStore && configStore.lookupTombstoneHash(nbKeyVal, `asset:${rel}`) === rhash) {
         stepProgress();
         return;
       }
@@ -3602,7 +3862,7 @@ export function applyMirrorOrGitNotebookPlan(
     skips.each(plan.to_pull_new, (relPath) => {
       const origText = getVerifiedRemoteText(relPath);
       const origHash = getRemoteHash(relPath) || sha256Text(origText, rpc);
-      if (!plan.is_first_sync && configStore && configStore.lookupTombstoneHash(nbKeyVal, relPath) === origHash) {
+      if (!forceSkipDeletions && !plan.is_first_sync && plan.identity_verified === true && configStore && configStore.lookupTombstoneHash(nbKeyVal, relPath) === origHash) {
         stepProgress();
         return;
       }
@@ -3719,6 +3979,43 @@ export function applyMirrorOrGitNotebookPlan(
     const deleteExpectedHashes = plan.delete_expected_hashes || {};
     const baseKeyAliases = plan.base_key_aliases || {};
 
+    const preDeleteIdCheck = verifyPlanLiveIdentity(rpc, configStore, plan);
+    const liveMissingPinOk =
+      plan.identity_verified !== true &&
+      plan.live_identity_verified === true &&
+      plan.identity_reason === 'missing_baseline_identity' &&
+      Boolean(preDeleteIdCheck && preDeleteIdCheck.verified === true) &&
+      (!plan.live_root_identity || preDeleteIdCheck.root_identity === plan.live_root_identity);
+    const preDeleteIdentityOk =
+      Boolean(startIdCheck && startIdCheck.identity_ok === true) &&
+      Boolean(preDeleteIdCheck && preDeleteIdCheck.identity_ok === true);
+    const midSyncIdentityLost =
+      (plan.identity_verified === true && !preDeleteIdentityOk) ||
+      (plan.live_identity_verified === true && plan.identity_reason === 'missing_baseline_identity' && !liveMissingPinOk);
+    if (forceSkipDeletions || !preDeleteIdentityOk) {
+      if (midSyncIdentityLost || (deletions.length > 0 && !preDeleteIdentityOk)) {
+        plan._deletions_aborted = true;
+      }
+      plan._deleted_count = 0;
+      plan._deleted_git_paths = [];
+      if (deletions.length > 0) {
+        appendLog(
+          tr(locale, `${prefix}执行删除前笔记本身份已变化，已跳过删除`, `${prefix}Notebook identity changed before delete; deletions skipped`),
+          '已跳过',
+          {
+            tone: 'warning',
+            tooltip: tr(locale, '已跳过全部删除以保护数据', 'All deletions were skipped to protect data'),
+            logKey: 'deletions_aborted',
+            logArgs: {
+              prefix,
+              reason: (preDeleteIdCheck && preDeleteIdCheck.reason) || (startIdCheck && startIdCheck.reason) || plan.identity_reason || '',
+            },
+          }
+        );
+      }
+      return;
+    }
+
     skips.each(deletions, ([side, rel, isAsset]) => {
       const key = isAsset ? `asset:${rel}` : rel;
       const expect =
@@ -3831,8 +4128,19 @@ export function applyMirrorOrGitNotebookPlan(
     }
   } catch (exc) {
     restoreBase();
-    if (protocol !== 'git' && configStore) {
-      configStore.state.syncMeta[plan.meta_key] = baseMap;
+    if (protocol !== 'git' && configStore && plan.identity_verified === true && !plan._deletions_aborted) {
+      const commitRoot = String(plan.live_root_identity || plan.root_identity || '').trim();
+      if (commitRoot && typeof configStore.commitNotebookBaseline === 'function') {
+        configStore.commitNotebookBaseline(plan.meta_key, baseMap, {
+          rootIdentity: commitRoot,
+          verified: true,
+          nbKeyVal: plan.nb_key,
+          nbRoot: plan.nb_root,
+          markInitialized: false,
+        });
+      } else if (commitRoot) {
+        configStore.state.syncMeta[plan.meta_key] = baseMap;
+      }
     }
     throw exc;
   }
@@ -4295,14 +4603,32 @@ export function createLocalMirrorSyncEngine({
       const risks = planRiskMetrics(rpc, plan);
       reportedConflicts += risks.conflicts + risks.pull_conflict + risks.push_conflict;
       if (configStore) {
-        configStore.state.syncMeta[plan.meta_key] = res.baseMap;
+        const commitRoot = String(plan.live_root_identity || plan.root_identity || '').trim();
+        const canCommit =
+          !plan._deletions_aborted &&
+          Boolean(commitRoot) &&
+          (plan.identity_verified === true ||
+            (plan.live_identity_verified === true && plan.identity_reason === 'missing_baseline_identity'));
+        if (canCommit) {
+          if (typeof configStore.commitNotebookBaseline === 'function') {
+            configStore.commitNotebookBaseline(plan.meta_key, res.baseMap, {
+              rootIdentity: commitRoot,
+              verified: true,
+              nbKeyVal: plan.nb_key,
+              nbRoot: plan.nb_root,
+              markInitialized: true,
+            });
+          } else {
+            configStore.state.syncMeta[plan.meta_key] = res.baseMap;
+            const initMap = { ...(configStore.state.syncMeta[INITIALIZED_META_KEY] || {}) };
+            initMap[plan.meta_key] = true;
+            configStore.state.syncMeta[INITIALIZED_META_KEY] = initMap;
+          }
+        }
       }
     }
 
     if (configStore) {
-      const initMap = { ...(configStore.state.syncMeta[INITIALIZED_META_KEY] || {}) };
-      for (const plan of batch.plans) initMap[plan.meta_key] = true;
-      configStore.state.syncMeta[INITIALIZED_META_KEY] = initMap;
       configStore.state.stats.total_synced += totalPushed + totalPulled + totalConflicts;
       configStore.state.stats.last_sync = nowHms();
     }

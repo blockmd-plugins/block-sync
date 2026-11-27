@@ -281,11 +281,15 @@ jobs:
           export const state = {
             handler: null,
             notebook: '',
+            notebookId: 'nb-smoke-1',
             notebookName: '',
             mirror: '',
             dataDir: '',
             notes: {},
             storage: {},
+            storageWriteError: null,
+            identityVerified: true,
+            previousPaths: [],
             secrets: new Map(),
             logs: [],
             bgErrors: [],
@@ -294,6 +298,7 @@ jobs:
 
           export function initState(opts) {
             state.notebook = opts.notebook;
+            state.notebookId = opts.notebookId !== undefined ? opts.notebookId : 'nb-smoke-1';
             state.notebookName = opts.notebookName;
             state.mirror = opts.mirror;
             state.dataDir = opts.dataDir || '';
@@ -304,6 +309,9 @@ jobs:
               fs.writeFileSync(full, content, 'utf8');
             }
             state.storage = opts.storage;
+            state.storageWriteError = null;
+            state.identityVerified = opts.identityVerified !== undefined ? Boolean(opts.identityVerified) : true;
+            state.previousPaths = Array.isArray(opts.previousPaths) ? [...opts.previousPaths] : [];
             state.secrets = new Map();
             state.logs = [];
             state.bgErrors = [];
@@ -326,17 +334,54 @@ jobs:
               return { found, value: found ? state.storage[key] : undefined };
             }
             if (method === 'host.storage.set') {
+              if (state.storageWriteError) throw new Error(String(state.storageWriteError));
               state.storage[params.key] = params.value;
               return { ok: true };
             }
             if (method === 'host.storage.set_many') {
+              if (state.storageWriteError) throw new Error(String(state.storageWriteError));
               for (const [k, v] of Object.entries(params.values || {})) {
                 state.storage[k] = v;
               }
               return { ok: true };
             }
             if (method === 'host.notebooks.list') {
-              return { notebooks: [{ path: state.notebook, name: state.notebookName, active: true }] };
+              const st = state.notebook ? fs.lstatSync(state.notebook, { throwIfNoEntry: false }) : null;
+              const rootIdentity = st && st.isDirectory() && !st.isSymbolicLink() ? st.dev + ':' + st.ino : '';
+              return {
+                notebooks: [
+                  {
+                    ...(state.notebookId ? { id: state.notebookId } : {}),
+                    path: state.notebook,
+                    name: state.notebookName,
+                    active: true,
+                    previous_paths: [...state.previousPaths],
+                    identity_verified: Boolean(state.identityVerified && rootIdentity),
+                    root_identity: rootIdentity,
+                  },
+                ],
+              };
+            }
+            if (method === 'host.notebooks.data_dir') {
+              const reqPath = path.resolve(String(params.path || state.notebook || ''));
+              const nbPath = path.resolve(String(state.notebook || ''));
+              if (!nbPath || reqPath !== nbPath) {
+                throw new Error('Unauthorized notebook root: ' + reqPath);
+              }
+              const st = fs.lstatSync(nbPath, { throwIfNoEntry: false });
+              const rootIdentity = st && st.isDirectory() && !st.isSymbolicLink() ? st.dev + ':' + st.ino : '';
+              const nbDataDir = state.dataDir ? path.join(state.dataDir, 'notebooks', state.notebookId || 'nb-smoke-1') : '';
+              if (nbDataDir) fs.mkdirSync(nbDataDir, { recursive: true });
+              return {
+                ...(state.notebookId ? { id: state.notebookId } : {}),
+                path: nbDataDir,
+                notebook_path: state.notebook,
+                name: state.notebookName,
+                active: true,
+                previous_paths: [...state.previousPaths],
+                identity_verified: Boolean(state.identityVerified && rootIdentity),
+                root_identity: rootIdentity,
+              };
             }
             if (method === 'host.notes.list') {
               return { notes: Object.keys(state.notes).sort().map((p) => ({ path: p })) };
@@ -382,15 +427,18 @@ jobs:
             if (method === 'host.fs.stat') {
               const target = String(params.path || '');
               try {
-                const st = fs.statSync(target);
+                const st = params.lstat ? fs.lstatSync(target) : fs.statSync(target);
                 return {
                   exists: true,
                   path: target,
                   name: path.basename(target),
                   is_dir: st.isDirectory(),
                   is_file: st.isFile(),
+                  is_regular: st.isFile() && !st.isSymbolicLink(),
+                  is_symlink: st.isSymbolicLink(),
                   size: st.size,
                   mtime_ms: st.mtimeMs,
+                  mod_time_ms: st.mtimeMs,
                 };
               } catch (err) {
                 if (err && err.code === 'ENOENT') {
@@ -406,23 +454,80 @@ jobs:
                 for (const de of fs.readdirSync(cur, { withFileTypes: true })) {
                   const full = path.join(cur, de.name);
                   const rel = relBase ? relBase + '/' + de.name : de.name;
-                  const st = fs.statSync(full);
+                  const st = fs.lstatSync(full);
+                  const isSymlink = st.isSymbolicLink();
                   entries.push({
                     path: full,
                     name: de.name,
                     rel_path: rel,
                     is_dir: st.isDirectory(),
                     is_file: st.isFile(),
+                    is_regular: st.isFile() && !isSymlink,
+                    is_symlink: isSymlink,
                     size: st.size,
                     mtime_ms: st.mtimeMs,
+                    mod_time_ms: st.mtimeMs,
                   });
-                  if (params.recursive && st.isDirectory()) {
+                  if (params.recursive && st.isDirectory() && !isSymlink) {
                     walk(full, rel);
                   }
                 }
               };
               walk(dir, '');
               return { path: dir, entries };
+            }
+            if (method === 'host.fs.delete_data') {
+              const base = String(state.dataDir || '');
+              if (!base) throw new Error('host.fs.delete_data: data_dir not set');
+              const cleanBase = path.resolve(base);
+              const rawTarget = String(params.path || '');
+              if (!rawTarget) throw new Error('host.fs.delete_data: empty path');
+              const cleanTarget = path.resolve(rawTarget);
+              const rel = path.relative(cleanBase, cleanTarget);
+              if (!rel || rel === '.' || rel.startsWith('..') || path.isAbsolute(rel)) {
+                throw Object.assign(new Error('host.fs.delete_data: path outside data_dir'), { code: -32001 });
+              }
+              if (rel === 'granted-paths.json' || rel === 'scheduler.json' || rel === 'state.json') {
+                throw Object.assign(new Error('host.fs.delete_data: control file protected'), { code: -32001 });
+              }
+              const baseL = fs.lstatSync(cleanBase, { throwIfNoEntry: false });
+              if (!baseL || baseL.isSymbolicLink() || !baseL.isDirectory()) {
+                throw Object.assign(new Error('host.fs.delete_data: symlink detected'), { code: -32004 });
+              }
+              const parts = rel.split(path.sep).filter(Boolean);
+              let cur = cleanBase;
+              for (let i = 0; i < parts.length; i += 1) {
+                cur = path.join(cur, parts[i]);
+                const segL = fs.lstatSync(cur, { throwIfNoEntry: false });
+                if (!segL) {
+                  return { ok: true, deleted: false, path: cleanTarget };
+                }
+                if (segL.isSymbolicLink()) {
+                  throw Object.assign(new Error('host.fs.delete_data: symlink in path'), { code: -32004 });
+                }
+                if (i < parts.length - 1 && !segL.isDirectory()) {
+                  throw Object.assign(new Error('host.fs.delete_data: non-directory parent'), { code: -32001 });
+                }
+              }
+              if (params.recursive) {
+                const checkSubtree = (d) => {
+                  for (const de of fs.readdirSync(d, { withFileTypes: true })) {
+                    const p = path.join(d, de.name);
+                    const s = fs.lstatSync(p);
+                    if (s.isSymbolicLink()) {
+                      throw Object.assign(new Error('host.fs.delete_data: symlink inside subtree'), { code: -32004 });
+                    }
+                    if (s.isDirectory()) checkSubtree(p);
+                  }
+                };
+                if (fs.lstatSync(cleanTarget).isDirectory()) checkSubtree(cleanTarget);
+                fs.rmSync(cleanTarget, { recursive: true, force: false });
+              } else {
+                const tgtL = fs.lstatSync(cleanTarget);
+                if (tgtL.isDirectory()) fs.rmdirSync(cleanTarget);
+                else fs.rmSync(cleanTarget, { force: false });
+              }
+              return { ok: true, deleted: true, path: cleanTarget };
             }
             if (method === 'host.fs.read') {
               const target = String(params.path || '');
@@ -559,6 +664,7 @@ jobs:
           `;
 
             const runnerSrc = `
+          import crypto from 'node:crypto';
           import fs from 'node:fs';
           import { register } from 'node:module';
           import path from 'node:path';
@@ -723,10 +829,11 @@ jobs:
             // 1. Legacy .block-sync-replaced / .block-sync-recovery auto-migration and empty dir removal.
             const legacyReplaced = path.join(mirror, '.block-sync-replaced');
             const legacyRecovery = path.join(mirror, '.block-sync-recovery');
+            const recentStashTs = String(Date.now()).padStart(15, '0');
             fs.mkdirSync(legacyReplaced, { recursive: true });
             fs.mkdirSync(legacyRecovery, { recursive: true });
-            fs.writeFileSync(path.join(legacyReplaced, 'legacy-old.md'), 'Legacy replaced content', 'utf8');
-            fs.writeFileSync(path.join(legacyRecovery, 'legacy-rec.md'), 'Legacy recovery content', 'utf8');
+            fs.writeFileSync(path.join(legacyReplaced, recentStashTs + '-1234abcd-legacy-old.md'), 'Legacy replaced content', 'utf8');
+            fs.writeFileSync(path.join(legacyRecovery, recentStashTs + '-5678ef01-legacy-rec.md'), 'Legacy recovery content', 'utf8');
 
             notes['remote.md'] = 'Updated local note';
             fs.writeFileSync(path.join(notebook, 'remote.md'), 'Updated local note', 'utf8');
@@ -763,7 +870,7 @@ jobs:
             // 3. EXDEV cross-device rename failure falls back to copy -> stat verify -> delete.
             fs.writeFileSync(path.join(mirror, 'exdev-note.md'), 'Cross device note', 'utf8');
             fs.mkdirSync(legacyReplaced, { recursive: true });
-            fs.writeFileSync(path.join(legacyReplaced, 'exdev-legacy.md'), 'Cross device legacy', 'utf8');
+            fs.writeFileSync(path.join(legacyReplaced, recentStashTs + '-deadbeef-exdev-legacy.md'), 'Cross device legacy', 'utf8');
             const exdevCallHost = (method, params = {}) => {
               if (
                 method === 'host.fs.rename' &&
@@ -829,6 +936,338 @@ jobs:
             console.log(locale + ': recovery checks passed');
           }
 
+          async function checkSafetyInvariants(rpc, sdk, pkgDir, notebook, mirror, dataDir, notes) {
+            const realPkgDir = fs.realpathSync(pkgDir);
+            const localMirror = await import(pathToFileURL(path.join(realPkgDir, 'local_mirror.js')).href);
+            const webdavMod = await import(pathToFileURL(path.join(realPkgDir, 'webdav.js')).href);
+            const configMod = await import(pathToFileURL(path.join(realPkgDir, 'config.js')).href);
+            const hostLocalAdapter = webdavMod.createHostLocalAdapter({ callHost: sdk.callHost });
+            const recoveryDir = localMirror.recoveryDirForRoot(sdk.callHost, mirror, dataDir);
+
+            // Issue 8: Unrecognized files in .block-sync-replaced must stay intact and non-empty dir must not be removed.
+            const legacyReplaced = path.join(mirror, '.block-sync-replaced');
+            fs.mkdirSync(legacyReplaced, { recursive: true });
+            const unknownPath = path.join(legacyReplaced, 'notes-backup-do-not-delete.md');
+            const recognizedName = String(Date.now()).padStart(15, '0') + '-abcdef12-known.md';
+            fs.writeFileSync(unknownPath, 'User extra file', 'utf8');
+            fs.writeFileSync(path.join(legacyReplaced, recognizedName), 'Recognized stash content', 'utf8');
+            localMirror.migrateLegacyRecoveryDirs(sdk.callHost, mirror, { dataDir });
+            requireCond(fs.existsSync(unknownPath) && fs.readFileSync(unknownPath, 'utf8') === 'User extra file', 'Issue 8: unrecognized file must be preserved');
+            requireCond(fs.existsSync(legacyReplaced), 'Issue 8: non-empty legacy recovery dir with unknown files must not be removed');
+            requireCond(
+              fs.readdirSync(recoveryDir).some((n) => fs.readFileSync(path.join(recoveryDir, n), 'utf8') === 'Recognized stash content'),
+              'Issue 8: recognized stash file should still migrate cleanly'
+            );
+            fs.rmSync(legacyReplaced, { recursive: true, force: true });
+
+            // Issue 4: host.fs.delete_data & cleanupRecoveryDirs must reject and skip symlink paths/parents.
+            const outsideDir = path.join(tempRoot, 'outside-symlink-target');
+            fs.mkdirSync(outsideDir, { recursive: true });
+            fs.writeFileSync(path.join(outsideDir, 'keep.txt'), 'Keep me safe', 'utf8');
+            const recBase = path.join(dataDir, 'recovery');
+            fs.mkdirSync(recBase, { recursive: true });
+            const symInsideRec = path.join(recBase, 'sym-dir');
+            const symParent = path.join(dataDir, 'sym-parent');
+            fs.symlinkSync(outsideDir, symInsideRec, 'dir');
+            fs.symlinkSync(outsideDir, symParent, 'dir');
+            let symErr1 = false;
+            try {
+              sdk.callHost('host.fs.delete_data', { path: symInsideRec, recursive: true });
+            } catch (_e) {
+              symErr1 = true;
+            }
+            requireCond(symErr1, 'Issue 4: host.fs.delete_data must reject symlink directory');
+            let symErr2 = false;
+            try {
+              sdk.callHost('host.fs.delete_data', { path: path.join(symParent, 'keep.txt'), recursive: false });
+            } catch (_e) {
+              symErr2 = true;
+            }
+            requireCond(symErr2, 'Issue 4: host.fs.delete_data must reject file under symlinked parent');
+            requireCond(localMirror.deleteDataPath(sdk.callHost, symInsideRec, { recursive: true, baseDir: dataDir }) === false, 'Issue 4: deleteDataPath must return false on symlink');
+            localMirror.cleanupRecoveryDirs(sdk.callHost, { dataDir, notebooks: [notebook] });
+            requireCond(fs.readFileSync(path.join(outsideDir, 'keep.txt'), 'utf8') === 'Keep me safe', 'Issue 4: symlink target contents must stay intact');
+            fs.rmSync(symInsideRec, { force: true });
+            fs.rmSync(symParent, { force: true });
+            fs.rmSync(outsideDir, { recursive: true, force: true });
+
+            // Issue 1: Unverified notebook identity (identity_verified: false or pre-delete flip) degrades to merge-only and aborts deletion.
+            notes['id-protected.md'] = 'Protect this note';
+            fs.writeFileSync(path.join(notebook, 'id-protected.md'), 'Protect this note', 'utf8');
+            const seedRes = rpc('plugin.action', { action_id: 'sync_now', values: {} });
+            requireCond(seedRes.ok === true, 'Issue 1: seed sync failed');
+
+            delete notes['id-protected.md'];
+            fs.rmSync(path.join(notebook, 'id-protected.md'), { force: true });
+            sdk.state.identityVerified = false;
+            const degRes = rpc('plugin.action', { action_id: 'sync_now', values: {} });
+            requireCond(degRes.ok === true, 'Issue 1: degraded sync_now failed');
+            if (degRes.tone === 'warning') {
+              const confDeg = rpc('plugin.action', { action_id: 'confirm_sync', values: {} });
+              requireCond(confDeg.ok === true, 'Issue 1: confirm degraded sync failed');
+            }
+            requireCond(fs.readFileSync(path.join(mirror, 'id-protected.md'), 'utf8') === 'Protect this note', 'Issue 1: remote file must NOT be deleted when identity_verified is false');
+            requireCond(notes['id-protected.md'] === 'Protect this note', 'Issue 1: merge-only sync should restore file locally');
+
+            sdk.state.identityVerified = true;
+            const nbLstat = fs.lstatSync(notebook);
+            const liveRootId = nbLstat.dev + ':' + nbLstat.ino;
+            const fakeSwappedStore = {
+              state: { homeDir: '', syncMeta: { [configMod.INITIALIZED_META_KEY]: { 'nb:id-test|local_mirror:m': true }, 'nb:id-test|local_mirror:m': { 'gone.md': 'h1' }, [configMod.ROOT_IDENTITIES_META_KEY]: { 'nb:id-test|local_mirror:m': '999:999' } }, notebookIdMap: { by_id: {}, by_path: {}, identities: {}, path_identities: {} }, logs: [] },
+              allowLegacyFallback: () => false,
+              getBaseMap: (mk) => ({ ...(fakeSwappedStore.state.syncMeta[mk] || {}) }),
+              verifyNotebookIdentity: () => ({ identity_ok: false, verified: true, root_identity: liveRootId, recorded_root_identity: '999:999', live_id: 'id-test', reason: 'baseline_identity_mismatch' }),
+              lookupTombstoneHash: () => null,
+              lookupOtherProtocolHash: () => null,
+              recordTombstone: () => false,
+              clearTombstone: () => {},
+            };
+            const mismatchPlan = localMirror.computeThreeWaySyncPlan({
+              callHost: sdk.callHost,
+              configStore: fakeSwappedStore,
+              localAdapter: hostLocalAdapter,
+              protocol: 'local_mirror',
+              cfg: { sync_scope: 'all', conflict_policy: 'keep_both' },
+              nbRoot: notebook,
+              nbKeyVal: 'id-test',
+              nbLabelVal: 'nb',
+              targetDisplay: mirror,
+              targetDir: mirror,
+              metaKey: 'nb:id-test|local_mirror:m',
+              localNotes: {},
+              remoteNotes: { 'gone.md': 'h1' },
+              remoteInspected: true,
+              remoteError: null,
+              locale,
+            });
+            requireCond(mismatchPlan.identity_verified === false && mismatchPlan.is_first_sync === true && mismatchPlan.to_delete_remote.length === 0, 'Issue 1: mismatched root dev+inode must force merge-only first sync without deletions');
+
+            const gitMismatchPlan = localMirror.computeThreeWaySyncPlan({
+              callHost: sdk.callHost,
+              configStore: fakeSwappedStore,
+              localAdapter: hostLocalAdapter,
+              protocol: 'git',
+              cfg: { sync_scope: 'all', conflict_policy: 'keep_both' },
+              nbRoot: notebook,
+              nbKeyVal: 'id-test',
+              nbLabelVal: 'nb',
+              targetDisplay: mirror,
+              targetDir: mirror,
+              metaKey: 'nb:id-test|git:m',
+              localNotes: {},
+              remoteNotes: { 'gone.md': 'h1' },
+              remoteInspected: true,
+              remoteError: null,
+              locale,
+            });
+            requireCond(gitMismatchPlan.identity_verified === false && gitMismatchPlan.is_first_sync === true && gitMismatchPlan.to_delete_remote.length === 0, 'Issue 1 (Git): mismatched root dev+inode must force merge-only first sync without deletions');
+
+            // Mid-sync flip right before Step 4 execution must abort deletion cleanly across local_mirror, git, and webdav.
+            const livePlan = localMirror.computeThreeWaySyncPlan({
+              callHost: sdk.callHost,
+              localAdapter: hostLocalAdapter,
+              protocol: 'local_mirror',
+              cfg: { sync_scope: 'all', conflict_policy: 'keep_both' },
+              nbRoot: notebook,
+              nbKeyVal: sdk.state.notebookId,
+              nbLabelVal: notebookName,
+              targetDisplay: mirror,
+              targetDir: mirror,
+              metaKey: 'nb:' + sdk.state.notebookId + '|local_mirror:' + mirror,
+              localNotes: {},
+              remoteNotes: {},
+              remoteInspected: true,
+              remoteError: null,
+              locale,
+            });
+            livePlan.is_first_sync = false;
+            livePlan.identity_verified = true;
+            livePlan.to_delete_remote = ['id-protected.md'];
+            livePlan.delete_expected_hashes = { 'id-protected.md': 'dummy' };
+            sdk.state.identityVerified = false;
+            localMirror.applyMirrorOrGitNotebookPlan(livePlan, {
+              callHost: sdk.callHost,
+              configStore: fakeSwappedStore,
+              localAdapter: hostLocalAdapter,
+              locale,
+              dataDir,
+            });
+            requireCond(livePlan._deletions_aborted === true, 'Issue 1: Step 4 must abort deletions when live identity turns unverified');
+            requireCond(fs.existsSync(path.join(mirror, 'id-protected.md')), 'Issue 1: file must stay intact when Step 4 aborts');
+
+            let davTrashCalled = false;
+            const remoteDavBytes = new TextEncoder().encode('Remote keep');
+            const remoteDavHash = crypto.createHash('sha256').update(remoteDavBytes).digest('hex');
+            const fakeDavClient = {
+              listScoped: (_baseUrl, filterFn) => ['gone.md'].filter((p) => (typeof filterFn === 'function' ? filterFn(p) : true)),
+              listFiles: (_baseUrl, filterFn) => ['gone.md'].filter((p) => (typeof filterFn === 'function' ? filterFn(p) : true)),
+              getBytesWithEtag: (url) => (
+                String(url || '').endsWith('/gone.md')
+                  ? { found: true, bytes: remoteDavBytes, etag: 'e1' }
+                  : { found: false }
+              ),
+              findCaseVariants: () => [],
+              ensureDir: () => ({ ok: true }),
+              putText: () => ({ ok: true }),
+              putBytes: () => ({ ok: true }),
+              putAssetFile: () => ({ ok: true }),
+              trashFile: () => { davTrashCalled = true; return 'deleted'; },
+            };
+            const davStore = configMod.createConfigStore({ callHost: sdk.callHost, supportsSystem: true, supportsMultiNotebook: true, notebookRoot: notebook });
+            davStore.loadState();
+            const davMetaKey = davStore.metaKey('webdav', 'https://dav.example.invalid/BlockNotes/', sdk.state.notebookId);
+            davStore.state.syncMeta[davMetaKey] = { 'gone.md': remoteDavHash };
+            davStore.state.syncMeta[configMod.INITIALIZED_META_KEY] = { [davMetaKey]: true };
+            davStore.state.syncMeta[configMod.ROOT_IDENTITIES_META_KEY] = { [davMetaKey]: liveRootId };
+            const davEngine = webdavMod.createWebDAVSyncEngine({ callHost: sdk.callHost, configStore: davStore, localAdapter: hostLocalAdapter, client: fakeDavClient, locale });
+            sdk.state.identityVerified = false;
+            const davDegPlan = davEngine.computeSyncPlan({ cfg: { protocol: 'webdav', webdav_url: 'https://dav.example.invalid', webdav_dir: '/BlockNotes', sync_scope: 'all', conflict_policy: 'keep_both' }, inspectRemote: true, forceRefresh: true, nbRoot: notebook });
+            requireCond(davDegPlan.identity_verified === false && davDegPlan.is_first_sync === true && davDegPlan.to_delete_remote.length === 0, 'Issue 1 (WebDAV): unverified identity must force merge-only without deletions');
+            sdk.state.identityVerified = true;
+            const davOkPlan = davEngine.computeSyncPlan({ cfg: { protocol: 'webdav', webdav_url: 'https://dav.example.invalid', webdav_dir: '/BlockNotes', sync_scope: 'all', conflict_policy: 'keep_both' }, inspectRemote: true, forceRefresh: true, nbRoot: notebook });
+            requireCond(davOkPlan.identity_verified === true && davOkPlan.is_first_sync === false && davOkPlan.to_delete_remote.includes('gone.md'), 'Issue 1 (WebDAV): verified plan should schedule remote deletion before mid-sync flip');
+            sdk.state.identityVerified = false;
+            davEngine.applyNotebookPlan(davOkPlan);
+            requireCond(davOkPlan._deletions_aborted === true && !davTrashCalled, 'Issue 1 (WebDAV): Step 4 must abort remote deletion when live identity turns unverified');
+            sdk.state.identityVerified = true;
+
+            // Issue 3: New ID must NOT inherit unowned path-keyed or unnamespaced legacy baseline on first migration.
+            const makeIsoStore = (isoStorage, { prevPaths = [], failWrite = false } = {}) => {
+              const isoRpc = (method, params = {}) => {
+                if (method === 'host.storage.get') {
+                  const k = params.key;
+                  if (!k) return { data: { ...isoStorage } };
+                  const f = Object.prototype.hasOwnProperty.call(isoStorage, k);
+                  return { found: f, value: f ? isoStorage[k] : undefined };
+                }
+                if (method === 'host.storage.set') {
+                  if (failWrite.value) throw new Error('simulated storage write failure');
+                  isoStorage[params.key] = params.value;
+                  return { ok: true };
+                }
+                if (method === 'host.storage.set_many') {
+                  if (failWrite.value) throw new Error('simulated storage write failure');
+                  Object.assign(isoStorage, params.values || {});
+                  return { ok: true };
+                }
+                if (method === 'host.notebooks.list') {
+                  return { notebooks: [{ id: isoStorage.__nbId || 'nb-iso-new', path: isoStorage.__nbPath || '/iso/nbA', name: 'nbA', active: true, previous_paths: prevPaths, identity_verified: true, root_identity: isoStorage.__rootId || '11:22' }] };
+                }
+                if (method === 'host.notebooks.data_dir') {
+                  return { id: isoStorage.__nbId || 'nb-iso-new', path: isoStorage.__nbPath || '/iso/nbA', name: 'nbA', active: true, previous_paths: prevPaths, identity_verified: true, root_identity: isoStorage.__rootId || '11:22' };
+                }
+                return { ok: true };
+              };
+              const st = configMod.createConfigStore({ callHost: isoRpc, supportsSystem: true, supportsMultiNotebook: true, notebookRoot: isoStorage.__nbPath || '/iso/nbA', homeDir: '/iso' });
+              st.loadState();
+              return st;
+            };
+            const unownedStorage = {
+              __nbId: 'nb-iso-new',
+              __nbPath: '/iso/nbA',
+              __rootId: '11:22',
+              config: { mirror_dir: '/iso/M', selected_notebooks: ['/iso/nbA'] },
+              notebook_configs: { '/iso/nbA': { mirror_dir: '/iso/M', selected_notebooks: ['/iso/nbA'] } },
+              sync_meta: {
+                'nb:/iso/nbA|local_mirror:/iso/M': { 'old.md': 'h-old' },
+                'local_mirror:/iso/M': { 'unns.md': 'h-unns' },
+                [configMod.INITIALIZED_META_KEY]: { 'nb:/iso/nbA|local_mirror:/iso/M': true, 'local_mirror:/iso/M': true },
+              },
+              notebook_results: {},
+            };
+            const isoStore1 = makeIsoStore(unownedStorage);
+            requireCond(isoStore1.state.syncMeta['nb:nb-iso-new|local_mirror:/iso/M'] === undefined, 'Issue 3: first migration without map/previous_paths must NOT inherit path baseline');
+            requireCond(isoStore1.state.syncMeta['nb:/iso/nbA|local_mirror:/iso/M']['old.md'] === 'h-old', 'Issue 3: unowned old path baseline must remain preserved');
+            requireCond(isoStore1.allowLegacyFallback('nb-iso-new', 'local_mirror', ['local_mirror:/iso/M']) === false, 'Issue 3: allowLegacyFallback must block unowned legacy key');
+            isoStore1.loadState();
+            requireCond(isoStore1.state.syncMeta['nb:nb-iso-new|local_mirror:/iso/M'] === undefined, 'Issue 3: subsequent restart must NOT inherit unowned baseline');
+            requireCond(isoStore1.allowLegacyFallback('nb-iso-new', 'local_mirror', ['local_mirror:/iso/M']) === false, 'Issue 3: subsequent restart must keep blocking unowned fallback');
+
+            const ownedStorage = {
+              __nbId: 'nb-owned',
+              __nbPath: '/iso/nbMoved',
+              __rootId: '33:44',
+              config: {},
+              notebook_configs: {},
+              notebook_id_map: {
+                by_id: { 'nb-owned': '/iso/nbOld' },
+                by_path: { '/iso/nbOld': 'nb-owned' },
+                identities: { 'nb-owned': '33:44' },
+                path_identities: { '/iso/nbOld': '33:44' },
+              },
+              sync_meta: {
+                'nb:/iso/nbOld|local_mirror:/iso/M': { 'kept.md': 'h-kept' },
+                [configMod.INITIALIZED_META_KEY]: { 'nb:/iso/nbOld|local_mirror:/iso/M': true },
+                [configMod.ROOT_IDENTITIES_META_KEY]: { '/iso/nbOld': '33:44' },
+              },
+              notebook_results: {},
+            };
+            const ownedStore = makeIsoStore(ownedStorage, { prevPaths: ['/iso/nbOld'] });
+            requireCond(
+              ownedStore.state.syncMeta['nb:nb-owned|local_mirror:/iso/M'] && ownedStore.state.syncMeta['nb:nb-owned|local_mirror:/iso/M']['kept.md'] === 'h-kept',
+              'Issue 3: proven ownership with matching dev+inode should migrate baseline cleanly'
+            );
+
+            // Issue 6: Pending migration preserves baselines, blocks sync until retry succeeds, and merges colliding keys item-by-item.
+            const failFlag = { value: true };
+            const mergeStorage = {
+              __nbId: 'nb-m6',
+              __nbPath: '/iso/m6-new',
+              __rootId: '77:88',
+              config: {},
+              notebook_configs: {},
+              notebook_id_map: {
+                by_id: { 'nb-m6': '/iso/m6-old' },
+                by_path: { '/iso/m6-old': 'nb-m6' },
+                identities: { 'nb-m6': '77:88' },
+                path_identities: { '/iso/m6-old': '77:88' },
+              },
+              sync_meta: {
+                [configMod.ROOT_IDENTITIES_META_KEY]: { '/iso/m6-old': '77:88', 'nb-m6': '77:88' },
+                'nb:/iso/m6-old|local_mirror:/iso/M': { 'shared.md': 'h-newer', 'old-only.md': 'h-old', 'conflict.md': 'h-a' },
+                'nb:nb-m6|local_mirror:/iso/M': { 'shared.md': 'h-older', 'new-only.md': 'h-new', 'conflict.md': 'h-b' },
+                [configMod.BASE_TIMESTAMPS_META_KEY]: {
+                  'nb:/iso/m6-old|local_mirror:/iso/M': { 'shared.md': 2000 },
+                  'nb:nb-m6|local_mirror:/iso/M': { 'shared.md': 1000 },
+                },
+                [configMod.TOMBSTONES_META_KEY]: {
+                  '/iso/m6-old': { 'del1.md': { hash: 'hd1', ts: 500 } },
+                  'nb-m6': { 'del2.md': { hash: 'hd2', ts: 600 } },
+                },
+              },
+              notebook_results: {},
+            };
+            const store6 = makeIsoStore(mergeStorage, { prevPaths: ['/iso/m6-old'], failWrite: failFlag });
+            requireCond(store6.hasPendingMigration('/iso/m6-old') === true && store6.hasPendingMigration('nb-m6') === true, 'Issue 6: failed migration write must record pendingMigration');
+            requireCond(Boolean(mergeStorage.sync_meta['nb:/iso/m6-old|local_mirror:/iso/M']['old-only.md']), 'Issue 6: failed write must NOT discard old baseline');
+            failFlag.value = false;
+            requireCond(store6.retryPendingMigrations() === true && !store6.hasPendingMigration(), 'Issue 6: retryPendingMigrations should complete once storage succeeds');
+            const mergedNew = store6.state.syncMeta['nb:nb-m6|local_mirror:/iso/M'] || {};
+            requireCond(mergedNew['shared.md'] === 'h-newer', 'Issue 6: item-by-item merge must pick newer timestamp');
+            requireCond(mergedNew['old-only.md'] === 'h-old' && mergedNew['new-only.md'] === 'h-new', 'Issue 6: non-conflicting items from both keys must be preserved');
+            requireCond(!Object.hasOwn(mergedNew, 'conflict.md'), 'Issue 6: ambiguous conflict item must be cleared from baseline so both copies are kept');
+            const mergedTomb = (store6.state.syncMeta[configMod.TOMBSTONES_META_KEY] || {})['nb-m6'] || {};
+            requireCond(Boolean(mergedTomb['del1.md']) && Boolean(mergedTomb['del2.md']), 'Issue 6: tombstones must merge item-by-item');
+
+            // Verify live plugin pauses manual sync and single-note auto-sync while migration is pending, then resumes.
+            sdk.state.storageWriteError = 'simulated pending migration write error';
+            rpc('plugin.event', {
+              event: 'notebook.renamed',
+              id: sdk.state.notebookId,
+              old_path: notebook + '-prev',
+              new_path: notebook,
+            });
+            const pausedAction = rpc('plugin.action', { action_id: 'sync_now', values: {} });
+            requireCond(pausedAction.ok === false && pausedAction.tone === 'warning', 'Issue 6: manual sync_now must pause while migration is pending');
+            const pausedEvent = rpc('plugin.event', { event: 'note.saved', path: 'id-protected.md', notebook_root: notebook });
+            requireCond(pausedEvent && pausedEvent.handled === true && pausedEvent.outcome === 'skipped', 'Issue 6: single-note sync must pause/queue while migration is pending');
+            sdk.state.storageWriteError = null;
+            const resumedAction = rpc('plugin.action', { action_id: 'sync_now', values: {} });
+            requireCond(resumedAction.ok === true, 'Issue 6: sync must automatically retry migration and resume cleanly once storage recovers');
+
+            console.log(locale + ': safety invariants passed');
+          }
+
           const notebook = path.join(tempRoot, notebookName);
           const downloads = path.join(tempRoot, 'Downloads');
           const dataDir = path.join(tempRoot, 'Data');
@@ -882,6 +1321,7 @@ jobs:
           if (actions) {
             checkActions(rpc, notebook, mirror, notes);
             await checkRecovery(rpc, sdk.callHost, pkgDir, mirror, dataDir, notes);
+            await checkSafetyInvariants(rpc, sdk, pkgDir, notebook, mirror, dataDir, notes);
           }
 
           const ev = rpc('plugin.event', { event: 'scheduler.tick', trigger: 'interval', online: true });
@@ -950,7 +1390,7 @@ jobs:
                 }
               }
 
-              const results = await Promise.all(
+              const settled = await Promise.allSettled(
                 cases.map(async (c, idx) => {
                   const tempRoot = path.join(harnessDir, `case-${idx}`);
                   fs.mkdirSync(tempRoot, { recursive: true });
@@ -983,6 +1423,11 @@ jobs:
                   return [`${c.layout}:${c.locale}`, JSON.parse(fs.readFileSync(outPath, 'utf8'))];
                 }),
               );
+              const failedCase = settled.find((item) => item.status === 'rejected');
+              if (failedCase) {
+                throw failedCase.reason;
+              }
+              const results = settled.map((item) => item.value);
 
               const pagesByCase = Object.fromEntries(results);
               for (const layout of Object.keys(LAYOUTS)) {

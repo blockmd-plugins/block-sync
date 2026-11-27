@@ -42,6 +42,7 @@ import {
   LAYOUTS_META_KEY,
   INITIALIZED_META_KEY,
   TOMBSTONES_META_KEY,
+  isReservedSyncMetaKey,
   parseNbMetaKey,
   storageGet,
   storageSet,
@@ -1564,6 +1565,18 @@ function createSyncController() {
     return engines.localMirror.buildPendingConfirm(batch, reasonItems, opts);
   };
 
+  const migrationBlockedForNotebooks = (notebooks = null) => {
+    if (!configStore || !configStore.hasPendingMigration()) return false;
+    configStore.retryPendingMigrations();
+    if (!configStore.hasPendingMigration()) return false;
+    const list =
+      Array.isArray(notebooks) && notebooks.length > 0
+        ? notebooks
+        : configStore.selectedNotebooks(configStore.state.config);
+    if (!list || list.length === 0) return configStore.hasPendingMigration();
+    return list.some((nb) => configStore.hasPendingMigration(nb));
+  };
+
   const runSync = ({
     onlyPath = null,
     onlyNbRoot = null,
@@ -1643,6 +1656,35 @@ function createSyncController() {
       if (!notebooks || notebooks.length === 0) {
         const msg = t('请至少选择一个笔记本', 'Select at least one notebook');
         lastStatus = msg;
+        return msg;
+      }
+      const targetCheckNbs = onlyNbRoot ? [normAbsPath(onlyNbRoot, homeDir)].filter(Boolean) : notebooks;
+      if (migrationBlockedForNotebooks(targetCheckNbs)) {
+        const msg = t(
+          '笔记本迁移尚未完成，同步已暂停',
+          'Notebook migration is pending; sync is paused until it finishes'
+        );
+        appendLog(
+          t('笔记本迁移尚未完成，同步已暂停', 'Notebook migration is pending; sync paused'),
+          '已跳过',
+          {
+            tone: 'warning',
+            tooltip: t('迁移重试完成后将自动恢复同步', 'Sync will resume once the pending migration finishes'),
+            logKey: 'sync_migration_pending',
+            logArgs: { protocol: proto },
+          }
+        );
+        lastSyncOutcome = 'skipped';
+        lastStatus = msg;
+        if (reportProgress) {
+          emitProgress({
+            channel: proto,
+            progress: 0,
+            label: t('等待迁移', 'Waiting migration'),
+            tone: 'warning',
+            running: false,
+          });
+        }
         return msg;
       }
 
@@ -1828,6 +1870,15 @@ function createSyncController() {
   };
 
   const runMultiProtocolSync = (protocols, reportProgress = false) => {
+    const selectedNbs = configStore.selectedNotebooks(configStore.state.config);
+    if (migrationBlockedForNotebooks(selectedNbs)) {
+      const msg = t(
+        '笔记本迁移尚未完成，同步已暂停',
+        'Notebook migration is pending; sync is paused until it finishes'
+      );
+      lastStatus = msg;
+      return [false, 'warning', msg];
+    }
     const totalTargets = protocols.length;
     if (reportProgress && totalTargets > 1) {
       for (const proto of protocols) {
@@ -1892,6 +1943,9 @@ function createSyncController() {
 
       if (lastSyncOutcome === 'pending_confirm') {
         pending.push(proto);
+      } else if (lastSyncOutcome === 'skipped') {
+        failed.push(proto);
+        lastErr = lastStatus;
       } else {
         succeeded.push(proto);
         for (const nb of lastSyncedNotebooks) {
@@ -1997,6 +2051,20 @@ function createSyncController() {
     const seenNbs = new Set();
     let notified = false;
     const resultNbKey = configStore.resultKey();
+    const targetSystemNbs = supportsMultiNotebook
+      ? configStore.selectedNotebooks(cfg)
+      : [configStore.state.notebookRoot || notebookRoot];
+    if (migrationBlockedForNotebooks(targetSystemNbs)) {
+      for (const protocol of activeProtocols) {
+        markPendingDirty(
+          resultNbKey,
+          protocol,
+          null,
+          !supportsMultiNotebook ? configStore.state.notebookRoot || notebookRoot : null
+        );
+      }
+      return skipped;
+    }
 
     for (const protocol of activeProtocols) {
       if (deadlineMs > 0 && Date.now() >= deadlineMs) break;
@@ -2133,6 +2201,9 @@ function createSyncController() {
 
   const recordDeletedEventTombstones = (nbKey, localDir, relPath, folder) => {
     if (!nbKey || (!folder && !relPath)) return false;
+    if (configStore.hasPendingMigration(localDir) || configStore.hasPendingMigration(nbKey)) {
+      return false;
+    }
     const defaultNb = nbKey === configStore.notebookKey();
     const matchesTargetNb = (mk) => {
       const parsed = parseNbMetaKey(mk);
@@ -2142,6 +2213,17 @@ function createSyncController() {
       }
       return false;
     };
+    const hasNbBaseline = Object.entries(configStore.state.syncMeta).some(([mk, entry]) => {
+      if (isReservedSyncMetaKey(mk) || !entry || typeof entry !== 'object') return false;
+      return matchesTargetNb(mk);
+    });
+    const idCheck = configStore.verifyNotebookIdentity(localDir, {
+      nbKeyVal: nbKey,
+      hasExistingBaseline: hasNbBaseline,
+    });
+    if (!idCheck || idCheck.identity_ok !== true) {
+      return false;
+    }
     let dirOk = false;
     if (localDir) {
       try {
@@ -2167,9 +2249,7 @@ function createSyncController() {
       }
       for (const [mk, entry] of Object.entries(configStore.state.syncMeta)) {
         if (
-          mk === LAYOUTS_META_KEY ||
-          mk === INITIALIZED_META_KEY ||
-          mk === TOMBSTONES_META_KEY ||
+          isReservedSyncMetaKey(mk) ||
           !entry ||
           typeof entry !== 'object'
         ) {
@@ -2196,9 +2276,7 @@ function createSyncController() {
     const targetFold = foldSyncPath(relPath, { caseInsensitive: true, normalize: true });
     for (const [mk, entry] of Object.entries(configStore.state.syncMeta)) {
       if (
-        mk === LAYOUTS_META_KEY ||
-        mk === INITIALIZED_META_KEY ||
-        mk === TOMBSTONES_META_KEY ||
+        isReservedSyncMetaKey(mk) ||
         !entry ||
         typeof entry !== 'object'
       ) {
@@ -2224,7 +2302,10 @@ function createSyncController() {
   const runInitialMaintenance = () => {
     if (!configStore) return;
     try {
-      const known = configStore.state.knownNotebooks.filter((nb) => nb && nb.path);
+      const migrated = configStore.retryPendingMigrations();
+      const known = configStore.state.knownNotebooks.filter(
+        (nb) => nb && nb.path && nb.identity_verified === true && Boolean(nb.root_identity)
+      );
       const nbs = known.map((nb) => nb.path);
       for (const kn of known) {
         migrateLegacyRecoveryDirs(callHost, kn.path, {
@@ -2232,7 +2313,9 @@ function createSyncController() {
           extraHashRoots: Array.isArray(kn.previous_paths) ? kn.previous_paths : [],
         });
       }
-      cleanupRecoveryDirs(callHost, { dataDir, notebooks: nbs });
+      if (migrated && known.length > 0 && !configStore.hasPendingMigration()) {
+        cleanupRecoveryDirs(callHost, { dataDir, notebooks: nbs });
+      }
     } catch (_err) {
       // Best-effort maintenance; never fail initialization.
     }
@@ -2285,13 +2368,32 @@ function createSyncController() {
 
     if (Array.isArray(params.notebooks)) {
       configStore.state.knownNotebooks = params.notebooks
-        .map((p) => String(p || '').trim())
-        .filter(Boolean)
-        .map((p) => ({
-          path: normAbsPath(p, homeDir),
-          name: normAbsPath(p, homeDir).split('/').pop() || p,
-          active: Boolean(notebookRoot && normAbsPath(p, homeDir) === normAbsPath(notebookRoot, homeDir)),
-        }));
+        .map((item) => {
+          if (item && typeof item === 'object') {
+            const p = String(item.path || '').trim();
+            const np = normAbsPath(p, homeDir);
+            if (!np) return null;
+            const entry = {
+              path: np,
+              name: String(item.name || '').trim() || np.split('/').pop() || np,
+              active: Boolean(item.active) || Boolean(notebookRoot && np === normAbsPath(notebookRoot, homeDir)),
+              previous_paths: Array.isArray(item.previous_paths)
+                ? item.previous_paths.map((x) => normAbsPath(x, homeDir)).filter(Boolean)
+                : [],
+            };
+            if (item.id) entry.id = String(item.id).trim();
+            return entry;
+          }
+          const p = String(item || '').trim();
+          const np = normAbsPath(p, homeDir);
+          if (!np) return null;
+          return {
+            path: np,
+            name: np.split('/').pop() || np,
+            active: Boolean(notebookRoot && np === normAbsPath(notebookRoot, homeDir)),
+          };
+        })
+        .filter(Boolean);
     }
 
     configStore.loadState();
@@ -2759,6 +2861,14 @@ function createSyncController() {
         lastStatus = status;
         ok = false;
         tone = 'danger';
+      } else if (migrationBlockedForNotebooks(configStore.selectedNotebooks(configStore.state.config))) {
+        status = t(
+          '笔记本迁移尚未完成，同步已暂停',
+          'Notebook migration is pending; sync is paused until it finishes'
+        );
+        lastStatus = status;
+        ok = false;
+        tone = 'warning';
       } else if (configStore.getPendingConfirm(proto)) {
         status = t('请先确认或取消已暂停的同步', 'Confirm or cancel the paused sync first');
         lastStatus = status;
@@ -2840,6 +2950,14 @@ function createSyncController() {
           lastStatus = status;
           ok = false;
           tone = 'danger';
+        } else if (migrationBlockedForNotebooks(selectedNbs)) {
+          status = t(
+            '笔记本迁移尚未完成，同步已暂停',
+            'Notebook migration is pending; sync is paused until it finishes'
+          );
+          lastStatus = status;
+          ok = false;
+          tone = 'warning';
         } else if (activeProtocols.length === 1) {
           const onlyProto = activeProtocols[0];
           if (configStore.getPendingConfirm(onlyProto)) {
@@ -3008,6 +3126,14 @@ function createSyncController() {
             lastStatus = status;
             ok = false;
             tone = 'danger';
+          } else if (migrationBlockedForNotebooks(notebooks)) {
+            status = t(
+              '笔记本迁移尚未完成，同步已暂停',
+              'Notebook migration is pending; sync is paused until it finishes'
+            );
+            lastStatus = status;
+            ok = false;
+            tone = 'warning';
           } else {
             status = runSync({
               onlyPath,
@@ -3094,7 +3220,7 @@ function createSyncController() {
       if (renamed.oldPath) {
         clearRecoveryDirCache(callHost, renamed.oldPath);
       }
-      if (renamed.newPath) {
+      if (renamed.newPath && renamed.verified === true) {
         try {
           migrateLegacyRecoveryDirs(callHost, renamed.newPath, {
             dataDir,
@@ -3140,6 +3266,9 @@ function createSyncController() {
     }
 
     if (eventName === 'app.focus') {
+      if (configStore && configStore.hasPendingMigration()) {
+        configStore.retryPendingMigrations();
+      }
       if (pendingDirty.size > 0) {
         return syncAfterSystemEvent(eventName, { ...(params || {}), trigger: 'focus' });
       }
@@ -3206,6 +3335,19 @@ function createSyncController() {
         const outcomes = new Set();
         let lastExc = null;
         const dirtyScopeKey = currentDirtyScopeKey(localDir);
+        if (migrationBlockedForNotebooks([localDir])) {
+          for (const proto of activeProtocols) {
+            if (
+              !protocolError(configStore.state.config, proto, {
+                ...uiContext(),
+                requireNotebooks: true,
+              })
+            ) {
+              markPendingDirty(dirtyScopeKey, proto, syncOnlyPath, eventNb || null);
+            }
+          }
+          return { handled: true, outcome: 'skipped' };
+        }
         for (const proto of activeProtocols) {
           if (
             protocolError(configStore.state.config, proto, {

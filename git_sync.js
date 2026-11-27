@@ -60,6 +60,7 @@ import {
   fsWriteText,
   fsMkdir,
   fsDelete,
+  deleteDataPath,
   fsReadNoteText,
   dirIsCaseInsensitive,
   dirIsNormalizationInsensitive,
@@ -1172,7 +1173,7 @@ export function prepareGitRepo(
             const headChk = runGit(rpc, ['rev-parse', '--verify', 'HEAD'], { cwd: activeRepoDir, cfg, locale });
             if (headChk.returncode === 0) {
               try {
-                fsDelete(rpc, activeRepoDir, true);
+                deleteDataPath(rpc, activeRepoDir, { recursive: true, baseDir: dataDir });
               } catch (_err) {
                 // Ignore if direct root; re-init below.
               }
@@ -1203,7 +1204,7 @@ export function prepareGitRepo(
       const cleanupPartialClone = () => {
         if (!existedBefore && fsStat(rpc, activeRepoDir).exists) {
           try {
-            fsDelete(rpc, activeRepoDir, true);
+            deleteDataPath(rpc, activeRepoDir, { recursive: true, baseDir: dataDir });
           } catch (_err) {
             // Best-effort cleanup.
           }
@@ -3338,16 +3339,35 @@ export function createGitSyncEngine({
       );
       if (configStore) {
         for (const [plan, updatedBase] of pendingBaseMaps) {
-          if (plan.skips) restoreSkippedBase(updatedBase, plan.original_base_map || plan.base_map || {}, plan.skips);
-          configStore.state.syncMeta[plan.meta_key] = updatedBase;
+          const origBase = plan.identity_verified === true ? (plan.original_base_map || plan.base_map || {}) : (plan.base_map || {});
+          if (plan.skips) restoreSkippedBase(updatedBase, origBase, plan.skips);
+          const commitRoot = String(plan.live_root_identity || plan.root_identity || '').trim();
+          const canCommit =
+            !plan._deletions_aborted &&
+            Boolean(commitRoot) &&
+            (plan.identity_verified === true ||
+              (plan.live_identity_verified === true && plan.identity_reason === 'missing_baseline_identity'));
+          if (canCommit) {
+            if (typeof configStore.commitNotebookBaseline === 'function') {
+              configStore.commitNotebookBaseline(plan.meta_key, updatedBase, {
+                rootIdentity: commitRoot,
+                verified: true,
+                nbKeyVal: plan.nb_key,
+                nbRoot: plan.nb_root,
+                markInitialized: true,
+              });
+            } else {
+              configStore.state.syncMeta[plan.meta_key] = updatedBase;
+              const initMap = { ...(configStore.state.syncMeta[INITIALIZED_META_KEY] || {}) };
+              initMap[plan.meta_key] = true;
+              configStore.state.syncMeta[INITIALIZED_META_KEY] = initMap;
+            }
+          }
         }
       }
     }
 
     if (configStore) {
-      const initMap = { ...(configStore.state.syncMeta[INITIALIZED_META_KEY] || {}) };
-      for (const plan of batch.plans) initMap[plan.meta_key] = true;
-      configStore.state.syncMeta[INITIALIZED_META_KEY] = initMap;
       configStore.state.stats.total_synced += totalPushed + totalPulled + totalConflicts;
       configStore.state.stats.last_sync = nowHms();
     }

@@ -79,6 +79,7 @@ import {
   computeNotebookSubdirMap,
   notebookKey,
   notebookLabel,
+  queryLiveNotebookIdentity,
 } from './config.js';
 import {
   entryRelPath,
@@ -89,6 +90,7 @@ import {
   scanDirSnapshot,
   snapshotHasCloudPlaceholder,
   isConfirmedAbsentOnRoot,
+  verifyPlanLiveIdentity,
 } from './local_mirror.js';
 
 // ============================================================================
@@ -2463,13 +2465,35 @@ export function createWebDAVSyncEngine({
       (!(configStore && typeof configStore.allowLegacyFallback === 'function') ||
         configStore.allowLegacyFallback(nbKeyVal, 'webdav', [legacyKey]));
     const effectiveLegacyKey = allowLegacy ? legacyKey : null;
-    const baseMap = configStore ? configStore.getBaseMap(metaKey, effectiveLegacyKey) : {};
+    const rawBaseMap = configStore ? configStore.getBaseMap(metaKey, effectiveLegacyKey) : {};
     const initMap = (configStore && configStore.state.syncMeta[INITIALIZED_META_KEY]) || {};
     const hasMeta = Boolean(
-      Object.keys(baseMap).length > 0 ||
+      Object.keys(rawBaseMap).length > 0 ||
       (initMap && (initMap[metaKey] || (effectiveLegacyKey && initMap[effectiveLegacyKey])))
     );
-    const isFirstSync = !hasMeta;
+    const idCheck =
+      configStore && typeof configStore.verifyNotebookIdentity === 'function'
+        ? configStore.verifyNotebookIdentity(effectiveNbRoot, {
+            metaKey,
+            legacyKeys: effectiveLegacyKey ? [effectiveLegacyKey] : [],
+            nbKeyVal,
+            hasExistingBaseline: hasMeta,
+          })
+        : (() => {
+            const live = queryLiveNotebookIdentity(rpc, effectiveNbRoot, homeDir);
+            return {
+              identity_ok: Boolean(live.verified && live.rootIdentity),
+              verified: Boolean(live.verified),
+              root_identity: live.rootIdentity || '',
+              recorded_root_identity: '',
+              live_id: live.id || '',
+              reason: live.verified ? '' : 'host_unverified',
+            };
+          })();
+    const identityVerified = Boolean(idCheck && idCheck.identity_ok === true);
+    const identityDegraded = Boolean(hasMeta && !identityVerified);
+    const baseMap = identityVerified ? rawBaseMap : {};
+    const isFirstSync = !identityVerified || !hasMeta;
 
     let remoteNonemptyOnFirstSync = false;
     if (remoteInspected && !remoteError && isFirstSync && onlyPath === null) {
@@ -2574,7 +2598,7 @@ export function createWebDAVSyncEngine({
     const toDeleteLocal = [];
     const deleteExpectedHashes = {};
     const deletionHeld = new Set();
-    if (remoteInspected && !remoteError && !isFirstSync) {
+    if (remoteInspected && !remoteError && !isFirstSync && identityVerified) {
       for (const relPath of [...toPullNew]) {
         const rhash = getRemoteNoteHash(relPath);
         const bhash = baseMap[relPath];
@@ -2724,6 +2748,8 @@ export function createWebDAVSyncEngine({
       del_local: [...toDeleteLocal].sort(),
       del_assets_remote: [...assetPlan.assets_to_delete_remote].sort(),
       del_assets_local: [...assetPlan.assets_to_delete_local].sort(),
+      identity_verified: identityVerified,
+      live_root_identity: idCheck.root_identity || '',
     });
 
     return {
@@ -2738,9 +2764,16 @@ export function createWebDAVSyncEngine({
       base_url: baseUrl,
       meta_key: metaKey,
       base_map: baseMap,
+      original_base_map: identityVerified ? rawBaseMap : {},
       skipped_items: skips.items,
       skips,
       is_first_sync: isFirstSync,
+      identity_verified: identityVerified,
+      live_identity_verified: Boolean(idCheck && idCheck.verified === true),
+      root_identity: idCheck.recorded_root_identity || idCheck.root_identity || '',
+      live_root_identity: idCheck.root_identity || '',
+      identity_reason: idCheck.reason || '',
+      identity_degraded: identityDegraded,
       remote_nonempty_on_first_sync: remoteNonemptyOnFirstSync,
       local_notes: localNotes,
       remote_notes: remoteNotes,
@@ -2994,6 +3027,7 @@ export function createWebDAVSyncEngine({
     const nbKeyVal = plan.nb_key;
     const subdir = plan.subdir || '';
     const baseMap = { ...(plan.base_map || {}) };
+    const originalBaseMap = plan.identity_verified === true ? (plan.original_base_map || plan.base_map || {}) : (plan.base_map || {});
     const skips = plan.skips || createSyncSkips(cfg, loc);
     plan.skipped_items = skips.items;
     const localNotes = plan.local_notes || {};
@@ -3080,7 +3114,36 @@ export function createWebDAVSyncEngine({
       }
     };
 
+    let forceSkipDeletions = plan.identity_verified !== true || plan.is_first_sync === true;
     try {
+      const startIdCheck = verifyPlanLiveIdentity(rpc, configStore, plan);
+      forceSkipDeletions =
+        plan.identity_verified !== true ||
+        plan.is_first_sync === true ||
+        !startIdCheck ||
+        startIdCheck.identity_ok !== true;
+      const unverifiedAtStart = Boolean(
+        plan.identity_degraded ||
+          (plan.identity_verified !== true && plan.identity_reason !== 'missing_baseline_identity') ||
+          (plan.identity_verified === true && (!startIdCheck || startIdCheck.identity_ok !== true))
+      );
+      if (unverifiedAtStart) {
+        appendLog(
+          state,
+          tr(loc, `${prefix}未验证笔记本身份，已降级为仅合并`, `${prefix}Notebook identity unverified; downgraded to merge-only`),
+          '已跳过',
+          {
+            tone: 'warning',
+            tooltip: tr(loc, '当前仅合并不删文件', 'Merged without deleting files'),
+            logKey: 'identity_unverified',
+            logArgs: {
+              prefix,
+              reason: (!startIdCheck || !startIdCheck.identity_ok ? (startIdCheck && startIdCheck.reason) : plan.identity_reason) || '',
+            },
+          }
+        );
+      }
+
       // 1. Sync attachments.
       skips.each(plan.assets_synced, (rel) => {
         baseMap[`asset:${rel}`] = localAssets[rel];
@@ -3105,7 +3168,7 @@ export function createWebDAVSyncEngine({
 
       skips.each(plan.assets_to_pull_new, (rel) => {
         const rhash = remoteAssets[rel];
-        if (!plan.is_first_sync && configStore && configStore.lookupTombstoneHash(nbKeyVal, `asset:${rel}`) === rhash) {
+        if (!forceSkipDeletions && !plan.is_first_sync && plan.identity_verified === true && configStore && configStore.lookupTombstoneHash(nbKeyVal, `asset:${rel}`) === rhash) {
           stepProgress();
           return;
         }
@@ -3220,7 +3283,7 @@ export function createWebDAVSyncEngine({
       skips.each(plan.to_pull_new, (relPath) => {
         const origText = remoteNotes[relPath];
         const origHash = remoteHashes[relPath] || sha256Text(origText, rpc);
-        if (!plan.is_first_sync && configStore && configStore.lookupTombstoneHash(nbKeyVal, relPath) === origHash) {
+        if (!forceSkipDeletions && !plan.is_first_sync && plan.identity_verified === true && configStore && configStore.lookupTombstoneHash(nbKeyVal, relPath) === origHash) {
           stepProgress();
           return;
         }
@@ -3310,93 +3373,140 @@ export function createWebDAVSyncEngine({
       ];
       const deleteExpectedHashes = plan.delete_expected_hashes || {};
 
-      skips.each(deletions, ([side, rel, isAsset]) => {
-        const key = isAsset ? `asset:${rel}` : rel;
-        const expect =
-          deleteExpectedHashes[key] ||
-          baseMap[key] ||
-          (configStore ? configStore.lookupTombstoneHash(nbKeyVal, key) : null);
-        let outcome = 'failed';
-        let errText = '';
-        try {
-          if (side === 'remote') {
-            const hasPlaceholder = typeof local.isCloudPlaceholder === 'function' && local.isCloudPlaceholder(nbRoot, rel);
-            const stillPresentOnDisk = nbRoot ? !isConfirmedAbsentOnRoot(rpc, nbRoot, rel) : false;
-            if (hasPlaceholder || stillPresentOnDisk) {
-              outcome = 'changed';
-            } else {
-              const matchesFn = isAsset
-                ? (raw) => sha256Bytes(raw, rpc) === expect
-                : (raw) => sha256Text(decodeNoteBytes(raw, rel), rpc) === expect;
-              const assetCheck = isAsset && streamAssets ? { hash: expect, readState: readRemoteAssetState } : null;
-              outcome = davClient.trashFile(baseUrl, rel, matchesFn, cfg, deadlineMs, assetCheck);
-            }
-          } else {
-            const revision = isAsset
-              ? localAssets[rel] || expect || ''
-              : (localHashes[rel] || sha256Text(localNotes[rel], rpc));
-            outcome = local.trashFile(rel, revision, { nbRoot });
-          }
-        } catch (exc) {
-          if (['file_limit', 'fs_error', 'quota_full'].includes(classifySyncError(exc))) throw exc;
-          outcome = 'failed';
-          errText = errorDetail(loc, exc);
+      const preDeleteIdCheck = verifyPlanLiveIdentity(rpc, configStore, plan);
+      const liveMissingPinOk =
+        plan.identity_verified !== true &&
+        plan.live_identity_verified === true &&
+        plan.identity_reason === 'missing_baseline_identity' &&
+        Boolean(preDeleteIdCheck && preDeleteIdCheck.verified === true) &&
+        (!plan.live_root_identity || preDeleteIdCheck.root_identity === plan.live_root_identity);
+      const preDeleteIdentityOk =
+        Boolean(startIdCheck && startIdCheck.identity_ok === true) &&
+        Boolean(preDeleteIdCheck && preDeleteIdCheck.identity_ok === true);
+      const midSyncIdentityLost =
+        (plan.identity_verified === true && !preDeleteIdentityOk) ||
+        (plan.live_identity_verified === true && plan.identity_reason === 'missing_baseline_identity' && !liveMissingPinOk);
+      if (forceSkipDeletions || !preDeleteIdentityOk) {
+        if (midSyncIdentityLost || (deletions.length > 0 && !preDeleteIdentityOk)) {
+          plan._deletions_aborted = true;
         }
-
-        const shown = `${prefix}${rel}`;
-        const where = side === 'remote' ? 'WebDAV' : tr(loc, '本地', 'local');
-        if (outcome === 'deleted' || outcome === 'missing') {
-          delete baseMap[key];
-          if (expect && configStore) {
-            configStore.recordTombstone(nbKeyVal, key, expect);
-          }
-        }
-        if (outcome === 'deleted') {
-          deletedCount += 1;
-          appendLog(state, tr(loc, `删除 ${shown}`, `Delete ${shown}`), '成功', {
-            tone: 'success',
-            tooltip: tr(loc, `已在${where}删除（可找回）`, `Deleted from ${where} (recoverable)`),
-            logKey: `delete_${side}`,
-            logArgs: { path: shown },
-          });
-        } else if (outcome === 'changed') {
-          appendLog(state, tr(loc, `保留 ${shown}`, `Keep ${shown}`), '无变更', {
-            tone: 'warning',
-            tooltip: tr(loc, `${where}内容已变化，未删除`, `Changed on ${where}; not deleted`),
-            logKey: 'delete_skipped',
-            logArgs: { path: shown, side },
-          });
-        } else if (outcome === 'unsupported') {
+        plan._deleted_count = 0;
+        if (deletions.length > 0) {
           appendLog(
             state,
-            tr(loc, '远端删除未同步到本地', 'Remote deletions not applied locally'),
-            '待确认',
+            tr(loc, `${prefix}执行删除前笔记本身份已变化，已跳过删除`, `${prefix}Notebook identity changed before delete; deletions skipped`),
+            '已跳过',
             {
               tone: 'warning',
-              tooltip: tr(loc, '请升级 Block 后重试', 'Update Block and sync again'),
-              logKey: 'delete_unsupported',
+              tooltip: tr(loc, '已跳过全部删除以保护数据', 'All deletions were skipped to protect data'),
+              logKey: 'deletions_aborted',
+              logArgs: {
+                prefix,
+                reason: (preDeleteIdCheck && preDeleteIdCheck.reason) || (startIdCheck && startIdCheck.reason) || plan.identity_reason || '',
+              },
             }
           );
-        } else if (outcome === 'failed') {
-          appendLog(state, tr(loc, `删除失败 ${shown}`, `Delete failed: ${shown}`), '失败', {
-            tone: 'danger',
-            tooltip: errText,
-            logKey: 'delete_failed',
-            logArgs: { path: shown, error: errText },
-          });
         }
-        stepProgress();
-      }, ([, rel]) => [rel]);
-      plan._deleted_count = deletedCount;
+      } else {
+        skips.each(deletions, ([side, rel, isAsset]) => {
+          const key = isAsset ? `asset:${rel}` : rel;
+          const expect =
+            deleteExpectedHashes[key] ||
+            baseMap[key] ||
+            (configStore ? configStore.lookupTombstoneHash(nbKeyVal, key) : null);
+          let outcome = 'failed';
+          let errText = '';
+          try {
+            if (side === 'remote') {
+              const hasPlaceholder = typeof local.isCloudPlaceholder === 'function' && local.isCloudPlaceholder(nbRoot, rel);
+              const stillPresentOnDisk = nbRoot ? !isConfirmedAbsentOnRoot(rpc, nbRoot, rel) : false;
+              if (hasPlaceholder || stillPresentOnDisk) {
+                outcome = 'changed';
+              } else {
+                const matchesFn = isAsset
+                  ? (raw) => sha256Bytes(raw, rpc) === expect
+                  : (raw) => sha256Text(decodeNoteBytes(raw, rel), rpc) === expect;
+                const assetCheck = isAsset && streamAssets ? { hash: expect, readState: readRemoteAssetState } : null;
+                outcome = davClient.trashFile(baseUrl, rel, matchesFn, cfg, deadlineMs, assetCheck);
+              }
+            } else {
+              const revision = isAsset
+                ? localAssets[rel] || expect || ''
+                : (localHashes[rel] || sha256Text(localNotes[rel], rpc));
+              outcome = local.trashFile(rel, revision, { nbRoot });
+            }
+          } catch (exc) {
+            if (['file_limit', 'fs_error', 'quota_full'].includes(classifySyncError(exc))) throw exc;
+            outcome = 'failed';
+            errText = errorDetail(loc, exc);
+          }
+
+          const shown = `${prefix}${rel}`;
+          const where = side === 'remote' ? 'WebDAV' : tr(loc, '本地', 'local');
+          if (outcome === 'deleted' || outcome === 'missing') {
+            delete baseMap[key];
+            if (expect && configStore) {
+              configStore.recordTombstone(nbKeyVal, key, expect);
+            }
+          }
+          if (outcome === 'deleted') {
+            deletedCount += 1;
+            appendLog(state, tr(loc, `删除 ${shown}`, `Delete ${shown}`), '成功', {
+              tone: 'success',
+              tooltip: tr(loc, `已在${where}删除（可找回）`, `Deleted from ${where} (recoverable)`),
+              logKey: `delete_${side}`,
+              logArgs: { path: shown },
+            });
+          } else if (outcome === 'changed') {
+            appendLog(state, tr(loc, `保留 ${shown}`, `Keep ${shown}`), '无变更', {
+              tone: 'warning',
+              tooltip: tr(loc, `${where}内容已变化，未删除`, `Changed on ${where}; not deleted`),
+              logKey: 'delete_skipped',
+              logArgs: { path: shown, side },
+            });
+          } else if (outcome === 'unsupported') {
+            appendLog(
+              state,
+              tr(loc, '远端删除未同步到本地', 'Remote deletions not applied locally'),
+              '待确认',
+              {
+                tone: 'warning',
+                tooltip: tr(loc, '请升级 Block 后重试', 'Update Block and sync again'),
+                logKey: 'delete_unsupported',
+              }
+            );
+          } else if (outcome === 'failed') {
+            appendLog(state, tr(loc, `删除失败 ${shown}`, `Delete failed: ${shown}`), '失败', {
+              tone: 'danger',
+              tooltip: errText,
+              logKey: 'delete_failed',
+              logArgs: { path: shown, error: errText },
+            });
+          }
+          stepProgress();
+        }, ([, rel]) => [rel]);
+        plan._deleted_count = deletedCount;
+      }
     } catch (exc) {
-      restoreSkippedBase(baseMap, plan.base_map || {}, skips);
-      if (configStore) {
-        configStore.state.syncMeta[plan.meta_key] = baseMap;
+      restoreSkippedBase(baseMap, originalBaseMap, skips);
+      if (configStore && plan.identity_verified === true && !plan._deletions_aborted) {
+        const commitRoot = String(plan.live_root_identity || plan.root_identity || '').trim();
+        if (commitRoot && typeof configStore.commitNotebookBaseline === 'function') {
+          configStore.commitNotebookBaseline(plan.meta_key, baseMap, {
+            rootIdentity: commitRoot,
+            verified: true,
+            nbKeyVal: plan.nb_key,
+            nbRoot: plan.nb_root,
+            markInitialized: false,
+          });
+        } else if (commitRoot) {
+          configStore.state.syncMeta[plan.meta_key] = baseMap;
+        }
       }
       throw exc;
     }
 
-    restoreSkippedBase(baseMap, plan.base_map || {}, skips);
+    restoreSkippedBase(baseMap, originalBaseMap, skips);
     return { pushed, pulled, conflictCount, assetCount, baseMap };
   };
 
@@ -3539,16 +3649,32 @@ export function createWebDAVSyncEngine({
       const risks = planRiskMetrics(plan);
       reportedConflicts += risks.conflicts + risks.pull_conflict + risks.push_conflict;
       if (configStore) {
-        configStore.state.syncMeta[plan.meta_key] = res.baseMap;
+        const commitRoot = String(plan.live_root_identity || plan.root_identity || '').trim();
+        const canCommit =
+          !plan._deletions_aborted &&
+          Boolean(commitRoot) &&
+          (plan.identity_verified === true ||
+            (plan.live_identity_verified === true && plan.identity_reason === 'missing_baseline_identity'));
+        if (canCommit) {
+          if (typeof configStore.commitNotebookBaseline === 'function') {
+            configStore.commitNotebookBaseline(plan.meta_key, res.baseMap, {
+              rootIdentity: commitRoot,
+              verified: true,
+              nbKeyVal: plan.nb_key,
+              nbRoot: plan.nb_root,
+              markInitialized: true,
+            });
+          } else {
+            configStore.state.syncMeta[plan.meta_key] = res.baseMap;
+            const initMap = { ...(configStore.state.syncMeta[INITIALIZED_META_KEY] || {}) };
+            initMap[plan.meta_key] = true;
+            configStore.state.syncMeta[INITIALIZED_META_KEY] = initMap;
+          }
+        }
       }
     }
 
     if (configStore) {
-      const initMap = { ...(configStore.state.syncMeta[INITIALIZED_META_KEY] || {}) };
-      for (const plan of batch.plans) {
-        initMap[plan.meta_key] = true;
-      }
-      configStore.state.syncMeta[INITIALIZED_META_KEY] = initMap;
       configStore.state.stats.total_synced += totalPushed + totalPulled + totalConflicts;
       configStore.state.stats.last_sync = nowHms();
     }

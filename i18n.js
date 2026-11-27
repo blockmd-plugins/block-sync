@@ -391,6 +391,25 @@ export function renderStructuredLog(locale, key, args) {
         ];
       }
       return [null, null];
+    case 'identity_unverified': {
+      const pfx = String(a.prefix || '');
+      return [
+        tr(locale, `${pfx}未验证笔记本身份，已降级为仅合并`, `${pfx}Notebook identity unverified; downgraded to merge-only`),
+        tr(locale, '当前仅合并不删文件', 'Merged without deleting files'),
+      ];
+    }
+    case 'deletions_aborted': {
+      const pfx = String(a.prefix || '');
+      return [
+        tr(locale, `${pfx}执行删除前笔记本身份已变化，已跳过删除`, `${pfx}Notebook identity changed before delete; deletions skipped`),
+        tr(locale, '已跳过全部删除以保护数据', 'All deletions were skipped to protect data'),
+      ];
+    }
+    case 'sync_migration_pending':
+      return [
+        tr(locale, '笔记本迁移尚未完成，同步已暂停', 'Notebook migration is pending; sync paused'),
+        tr(locale, '迁移重试完成后将自动恢复同步', 'Sync will resume once the pending migration finishes'),
+      ];
     default:
       return [null, null];
   }
