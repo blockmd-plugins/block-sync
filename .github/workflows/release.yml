@@ -298,6 +298,11 @@ jobs:
             state.mirror = opts.mirror;
             state.dataDir = opts.dataDir || '';
             state.notes = opts.notes;
+            for (const [rel, content] of Object.entries(state.notes || {})) {
+              const full = path.join(state.notebook, rel);
+              fs.mkdirSync(path.dirname(full), { recursive: true });
+              fs.writeFileSync(full, content, 'utf8');
+            }
             state.storage = opts.storage;
             state.secrets = new Map();
             state.logs = [];
@@ -348,6 +353,9 @@ jobs:
             }
             if (method === 'host.notes.write') {
               state.notes[params.path] = params.content;
+              const full = path.join(state.notebook, params.path);
+              fs.mkdirSync(path.dirname(full), { recursive: true });
+              fs.writeFileSync(full, params.content, 'utf8');
               return { ok: true };
             }
             if (method === 'host.notes.trash') {
@@ -361,6 +369,7 @@ jobs:
                 throw new Error('host.notes.trash: revision mismatch for ' + p);
               }
               delete state.notes[p];
+              fs.rmSync(path.join(state.notebook, p), { force: true });
               return { ok: true, trashed: true };
             }
             if (method === 'host.fs.list_grants') {
@@ -720,6 +729,7 @@ jobs:
             fs.writeFileSync(path.join(legacyRecovery, 'legacy-rec.md'), 'Legacy recovery content', 'utf8');
 
             notes['remote.md'] = 'Updated local note';
+            fs.writeFileSync(path.join(notebook, 'remote.md'), 'Updated local note', 'utf8');
             const owRes = rpc('plugin.action', { action_id: 'sync_now', values: {} });
             requireCond(owRes.ok === true, 'Overwrite sync failed during recovery check');
             requireCond(!fs.existsSync(legacyReplaced), 'Legacy .block-sync-replaced directory was not removed');
@@ -738,6 +748,7 @@ jobs:
 
             // 2. Recoverable deletion lands in data_dir/recovery/<hash>/ without polluting workspace.
             delete notes['remote.md'];
+            fs.rmSync(path.join(notebook, 'remote.md'), { force: true });
             const delRes = rpc('plugin.action', { action_id: 'sync_now', values: {} });
             requireCond(delRes.ok === true, 'Delete sync failed during recovery check');
             requireCond(!fs.existsSync(path.join(mirror, 'remote.md')), 'remote.md was not deleted from mirror');
