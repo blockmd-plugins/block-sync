@@ -2734,8 +2734,14 @@ export function computeThreeWaySyncPlan({
   const candidateLegacyKeys = [legacyKey, ...(legacyAliases || [])].filter(Boolean);
   const allowLegacy =
     candidateLegacyKeys.length > 0 &&
-    (!(configStore && typeof configStore.allowLegacyFallback === 'function') ||
-      configStore.allowLegacyFallback(nbKeyVal, protocol, candidateLegacyKeys));
+    !(
+      configStore &&
+      configStore.state &&
+      (configStore.state.hostSupportsNotebookIds ||
+        (configStore.state.notebookIdMap &&
+          configStore.state.notebookIdMap.by_id &&
+          Object.hasOwn(configStore.state.notebookIdMap.by_id, nbKeyVal)))
+    );
   const effectiveLegacyKeys = allowLegacy ? candidateLegacyKeys : [];
   const originalBaseMap = configStore ? configStore.getBaseMap(metaKey, ...aliases, ...effectiveLegacyKeys) : {};
   const initializedMap = configStore ? configStore.state.syncMeta[INITIALIZED_META_KEY] : null;
@@ -3786,6 +3792,7 @@ export function applyMirrorOrGitNotebookPlan(
   const batchBindings = plan.batch_bindings || {};
   const targetIdentities = { ...(plan.target_identities || {}) };
   const writtenRemotePaths = [];
+  const syncedRepoPaths = [];
   const deletedGitPaths = [];
   const plannedGitBlobs = {};
 
@@ -3880,6 +3887,22 @@ export function applyMirrorOrGitNotebookPlan(
         plan.target_root_identity = String(st.root_identity).trim();
       }
     }
+  };
+
+  const verifyMirrorRootIdentityForDelete = () => {
+    verifyTarget();
+    const cleanTarget = targetDir ? trimTrailingSlash(targetDir) : '';
+    if (!cleanTarget) return true;
+    const st = fsStat(rpc, cleanTarget, { lstat: true });
+    if (!st.exists || st.is_symlink || !st.is_dir) {
+      return false;
+    }
+    const expId = getTargetRootIdentity();
+    const curId = String(st.root_identity || '').trim();
+    if (expId && curId !== expId) {
+      return false;
+    }
+    return true;
   };
 
   const recordRemotePath = (rel, blob) => {
@@ -4355,7 +4378,9 @@ export function applyMirrorOrGitNotebookPlan(
           }
         } else {
           const targetRel = (isAsset ? remoteAssetPathMap : remotePathMap)[rel] || rel;
-          if (!isConfirmedAbsentOnRoot(rpc, targetDir, targetRel)) {
+          if (!verifyMirrorRootIdentityForDelete()) {
+            outcome = 'root_mismatch';
+          } else if (!isConfirmedAbsentOnRoot(rpc, targetDir, targetRel)) {
             outcome = 'changed';
           } else {
             const revision = isAsset
@@ -4511,7 +4536,6 @@ export function applyMirrorOrGitNotebookPlan(
   }
   restoreBase();
 
-  const syncedRepoPaths = [];
   if (protocol === 'git') {
     const subTrim = subdir.replace(/^\/+|\/+$/g, '');
     const subPrefix = subTrim ? `${subTrim}/` : '';

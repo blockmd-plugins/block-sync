@@ -39,6 +39,7 @@ export const INITIALIZED_META_KEY = 'initialized_targets';
 export const TOMBSTONES_META_KEY = '__tombstones__';
 export const ROOT_IDENTITIES_META_KEY = '__nb_identities__';
 export const BASE_TIMESTAMPS_META_KEY = '__base_ts__';
+export const LEGACY_PATH_MIGRATED_KEY = '__legacy_path_migrated__';
 export const NOTEBOOK_ID_MAP_KEY = 'notebook_id_map';
 export const MAX_TOMBSTONES_PER_NB = 4000;
 export const MAX_STORED_CONFIRM_SAMPLES = 30;
@@ -54,7 +55,8 @@ export function isReservedSyncMetaKey(key) {
     key === INITIALIZED_META_KEY ||
     key === TOMBSTONES_META_KEY ||
     key === ROOT_IDENTITIES_META_KEY ||
-    key === BASE_TIMESTAMPS_META_KEY
+    key === BASE_TIMESTAMPS_META_KEY ||
+    key === LEGACY_PATH_MIGRATED_KEY
   );
 }
 
@@ -1032,11 +1034,8 @@ export function createConfigStore({
     pendingNotices: {},
     connStates: {},
     credentialCleanup: new Set(),
-    notebookIdMap: { by_id: {}, by_path: {}, identities: {}, path_identities: {} },
-    blockedLegacyIds: new Set(),
+    notebookIdMap: { by_id: {}, by_path: {} },
     hostSupportsNotebookIds: false,
-    pendingMigration: null,
-    pendingMigrations: new Map(),
   };
 
   const normOpts = () => ({
@@ -1297,169 +1296,55 @@ export function createConfigStore({
     return { merged, mergedTs };
   };
 
-  const syncLegacyPendingSummary = () => {
-    const it = state.pendingMigrations.values().next();
-    state.pendingMigration = it && !it.done ? it.value : null;
-  };
-
-  const applyIdMapPatches = (baseMapObj, patches = []) => {
+  const buildUpdatedIdMap = (baseMapObj, pairs = [], { oldPath = '' } = {}) => {
     const next = {
       by_id: { ...((baseMapObj && baseMapObj.by_id) || {}) },
       by_path: { ...((baseMapObj && baseMapObj.by_path) || {}) },
-      identities: { ...((baseMapObj && baseMapObj.identities) || {}) },
-      path_identities: { ...((baseMapObj && baseMapObj.path_identities) || {}) },
     };
-    const liveKnById = new Map();
-    for (const kn of state.knownNotebooks) {
-      if (kn && kn.id && kn.path) liveKnById.set(String(kn.id), kn);
+    const normOld = oldPath ? normAbsPath(oldPath, state.homeDir) : '';
+    for (const [rawId, rawPath] of pairs) {
+      const id = String(rawId || '').trim();
+      const np = normAbsPath(rawPath, state.homeDir);
+      if (!id || !np || id === np) continue;
+      const prevPath = next.by_id[id];
+      if (prevPath && prevPath !== np && next.by_path[prevPath] === id) {
+        delete next.by_path[prevPath];
+      }
+      if (normOld && normOld !== np && next.by_path[normOld] === id) {
+        delete next.by_path[normOld];
+      }
+      const prevOwner = next.by_path[np];
+      if (prevOwner && prevOwner !== id && next.by_id[prevOwner] === np) {
+        delete next.by_id[prevOwner];
+      }
+      next.by_id[id] = np;
+      next.by_path[np] = id;
     }
-    for (const p of Array.isArray(patches) ? patches : []) {
-      if (!p || !p.id || !p.newPath) continue;
-      const pid = String(p.id).trim();
-      const np = String(p.newPath).trim();
-      const liveKn = liveKnById.get(pid);
-      // Do not overwrite a newer verified path for this notebook with an older patch.
-      if (liveKn && liveKn.path && liveKn.path !== np) continue;
-      const prevRecorded = next.by_id[pid];
-      if (prevRecorded && prevRecorded !== np && next.by_path[prevRecorded] === pid) {
-        delete next.by_path[prevRecorded];
-      }
-      for (const op of Array.isArray(p.oldPaths) ? p.oldPaths : []) {
-        if (op && op !== np && next.by_path[op] === pid) {
-          delete next.by_path[op];
-        }
-      }
-      next.by_id[pid] = np;
-      next.by_path[np] = pid;
-      if (p.rootIdentity) {
-        next.identities[pid] = String(p.rootIdentity);
-        next.path_identities[np] = String(p.rootIdentity);
-      }
-    }
-    return next;
+    const prevStr = JSON.stringify({
+      by_id: (baseMapObj && baseMapObj.by_id) || {},
+      by_path: (baseMapObj && baseMapObj.by_path) || {},
+    });
+    return { next, changed: JSON.stringify(next) !== prevStr };
   };
 
-  const mergeIdMapPatchLists = (a = [], b = []) => {
-    const byId = new Map();
-    for (const p of [...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])]) {
-      if (!p || !p.id) continue;
-      const prev = byId.get(p.id);
-      byId.set(p.id, {
-        id: p.id,
-        newPath: p.newPath || (prev && prev.newPath) || '',
-        oldPaths: [...new Set([...((prev && prev.oldPaths) || []), ...(p.oldPaths || [])])],
-        rootIdentity: p.rootIdentity || (prev && prev.rootIdentity) || '',
-      });
-    }
-    return [...byId.values()];
-  };
-
-  const clearPendingMigrationsFor = (migrationKey = '') => {
-    const key = String(migrationKey || '').trim();
-    if (key) {
-      state.pendingMigrations.delete(key);
-    }
-    syncLegacyPendingSummary();
-  };
-
-  const applyAliasMigrations = (
-    aliasMap,
+  const applyUiScopeAliases = (
+    uiAlias,
     {
-      baselineAliasMap = null,
-      baselineKeyMap = null,
       oldPath = '',
       newPath = '',
       persist = false,
       preMigratedNbConfigs = false,
       preMigratedGlobal = false,
-      idMapPatches = [],
-      blockedIdsToAdd = null,
-      migrationKey = '',
+      extraDirty = null,
     } = {}
   ) => {
     const rpc = getRpc();
-    const uiAlias = aliasMap instanceof Map ? aliasMap : new Map();
-    const baseAlias = baselineAliasMap instanceof Map ? baselineAliasMap : new Map();
-    const explicitKeyMap = baselineKeyMap instanceof Map ? baselineKeyMap : null;
-    const dirty = {};
+    const aliasMap = uiAlias instanceof Map ? uiAlias : new Map();
+    const dirty = extraDirty && typeof extraDirty === 'object' ? { ...extraDirty } : {};
     const idToCurrentPath = new Map();
     for (const kn of state.knownNotebooks) {
       if (kn && kn.id && kn.path) idToCurrentPath.set(String(kn.id), kn.path);
     }
-    const collectAffectedKeys = () => {
-      const affected = new Set();
-      for (const [k, v] of uiAlias.entries()) {
-        if (k) affected.add(String(k));
-        if (v) affected.add(String(v));
-      }
-      for (const [k, v] of baseAlias.entries()) {
-        if (k) affected.add(String(k));
-        if (v) affected.add(String(v));
-      }
-      if (explicitKeyMap) {
-        for (const [mk, targetMk] of explicitKeyMap.entries()) {
-          const p1 = parseNbMetaKey(mk);
-          const p2 = parseNbMetaKey(targetMk);
-          if (p1 && p1.nb) affected.add(p1.nb);
-          if (p2 && p2.nb) affected.add(p2.nb);
-        }
-      }
-      for (const p of Array.isArray(idMapPatches) ? idMapPatches : []) {
-        if (p && p.id) affected.add(String(p.id));
-        if (p && p.newPath) affected.add(String(p.newPath));
-        for (const op of (p && p.oldPaths) || []) {
-          if (op) affected.add(String(op));
-        }
-      }
-      if (oldPath) affected.add(normAbsPath(oldPath, state.homeDir) || oldPath);
-      if (newPath) affected.add(normAbsPath(newPath, state.homeDir) || newPath);
-      return affected;
-    };
-    const normalizedPatches = Array.isArray(idMapPatches)
-      ? idMapPatches.filter((p) => p && p.id && p.newPath)
-      : [];
-    const normalizedBlockedAdd = new Set(
-      blockedIdsToAdd ? [...blockedIdsToAdd].map((x) => String(x || '').trim()).filter(Boolean) : []
-    );
-    const recordPending = () => {
-      const mKey = String(migrationKey || '').trim() || '__global__';
-      const prev = state.pendingMigrations.get(mKey) || null;
-      const mergedUi = new Map(prev ? prev.aliasMap : []);
-      for (const [k, v] of uiAlias.entries()) mergedUi.set(k, v);
-      const mergedBase = new Map(prev ? prev.baselineAliasMap : []);
-      for (const [k, v] of baseAlias.entries()) mergedBase.set(k, v);
-      let mergedKeyMap = null;
-      if (prev && prev.baselineKeyMap instanceof Map) {
-        mergedKeyMap = new Map(prev.baselineKeyMap);
-      } else if (explicitKeyMap) {
-        mergedKeyMap = new Map();
-      }
-      if (mergedKeyMap && explicitKeyMap) {
-        for (const [k, v] of explicitKeyMap.entries()) mergedKeyMap.set(k, v);
-      }
-      const mergedBlockedAdd = new Set([
-        ...(prev && prev.blockedIdsToAdd ? prev.blockedIdsToAdd : []),
-        ...normalizedBlockedAdd,
-      ]);
-      const mergedPatches = mergeIdMapPatchLists(prev && prev.idMapPatches, normalizedPatches);
-      const mergedAffected = new Set([
-        ...(prev && prev.affectedNbKeys ? prev.affectedNbKeys : []),
-        ...collectAffectedKeys(),
-      ]);
-      state.pendingMigrations.set(mKey, {
-        aliasMap: mergedUi,
-        baselineAliasMap: mergedBase,
-        baselineKeyMap: mergedKeyMap,
-        oldPath: oldPath || (prev ? prev.oldPath : ''),
-        newPath: newPath || (prev ? prev.newPath : ''),
-        preMigratedNbConfigs: Boolean((prev && prev.preMigratedNbConfigs) || preMigratedNbConfigs),
-        preMigratedGlobal: Boolean((prev && prev.preMigratedGlobal) || preMigratedGlobal),
-        idMapPatches: mergedPatches,
-        blockedIdsToAdd: mergedBlockedAdd,
-        affectedNbKeys: mergedAffected,
-      });
-      syncLegacyPendingSummary();
-    };
 
     const ensureSelectedPathReplaced = (cfg) => {
       if (!cfg || typeof cfg !== 'object' || !Array.isArray(cfg.selected_notebooks)) return [cfg, false];
@@ -1470,22 +1355,23 @@ export function createConfigStore({
         let mapped = item;
         if (oldPath && newPath && mapped === oldPath) {
           mapped = newPath;
-        } else if (uiAlias.has(mapped)) {
-          const targetId = uiAlias.get(mapped);
+        } else if (aliasMap.has(mapped)) {
+          const targetId = aliasMap.get(mapped);
           mapped = idToCurrentPath.get(targetId) || newPath || mapped;
         }
         if (mapped !== item) mod = true;
         if (mapped && !seen.has(mapped)) {
           seen.add(mapped);
           nextSel.push(mapped);
+        } else if (seen.has(mapped)) {
+          mod = true;
         }
       }
       if (!mod) return [cfg, false];
       return [{ ...cfg, selected_notebooks: nextSel }, true];
     };
 
-    // Prepare candidate notebookConfigs without mutating state until persistence succeeds.
-    const [migratedNbCfgsRaw, nbCfgsKeyChanged] = rewriteScopedAliasMap(state.notebookConfigs, uiAlias);
+    const [migratedNbCfgsRaw, nbCfgsKeyChanged] = rewriteScopedAliasMap(state.notebookConfigs, aliasMap);
     const candNotebookConfigs = {};
     let nbCfgsSelChanged = false;
     if (migratedNbCfgsRaw && typeof migratedNbCfgsRaw === 'object') {
@@ -1510,17 +1396,21 @@ export function createConfigStore({
       dirty.config = encodeConfigSelected(candStoredGlobal);
     }
 
-    const [migratedRes, resChanged] = rewriteScopedAliasMap(state.notebookResults, uiAlias, { isResult: true });
+    const [migratedRes, resChanged] = rewriteScopedAliasMap(state.notebookResults, aliasMap, { isResult: true });
     if (resChanged) {
       dirty.notebook_results = migratedRes;
     }
 
-    const [migratedConfs, confsChanged] = rewriteScopedAliasMap(state.pendingConfirms, uiAlias, { isConfirm: true, oldPath, newPath });
+    const [migratedConfs, confsChanged] = rewriteScopedAliasMap(state.pendingConfirms, aliasMap, {
+      isConfirm: true,
+      oldPath,
+      newPath,
+    });
     if (confsChanged) {
       dirty.pending_confirms = migratedConfs;
     }
 
-    const [migratedConn, connChanged] = rewriteScopedAliasMap(state.connStates, uiAlias, { isConn: true });
+    const [migratedConn, connChanged] = rewriteScopedAliasMap(state.connStates, aliasMap, { isConn: true });
     if (connChanged) {
       dirty.conn_states = migratedConn;
     }
@@ -1528,187 +1418,13 @@ export function createConfigStore({
     let migratedNotices = state.pendingNotices;
     let noticesChanged = false;
     if (state.supportsSystem) {
-      [migratedNotices, noticesChanged] = rewriteScopedAliasMap(state.pendingNotices, uiAlias, { isNotice: true, oldPath, newPath });
+      [migratedNotices, noticesChanged] = rewriteScopedAliasMap(state.pendingNotices, aliasMap, {
+        isNotice: true,
+        oldPath,
+        newPath,
+      });
       if (noticesChanged) {
         dirty.pending_notices = migratedNotices;
-      }
-    }
-
-    // Prepare syncMeta copy using baselineAliasMap only (strictly verified ownership):
-    // 2-pass per-item merge so existing new keys merge per note/asset/tombstone instead of overwriting or losing items.
-    let syncMetaChanged = false;
-    const rawMeta = state.syncMeta || {};
-    const rawTsAll =
-      rawMeta[BASE_TIMESTAMPS_META_KEY] &&
-      typeof rawMeta[BASE_TIMESTAMPS_META_KEY] === 'object' &&
-      !Array.isArray(rawMeta[BASE_TIMESTAMPS_META_KEY])
-        ? rawMeta[BASE_TIMESTAMPS_META_KEY]
-        : {};
-    const nextMeta = {};
-    const nextTsAll = {};
-    const rewriteMetaKey = (mk) => {
-      if (explicitKeyMap) {
-        return explicitKeyMap.get(mk) || mk;
-      }
-      const parsed = parseNbMetaKey(mk);
-      if (!parsed) return mk;
-      const newNb = baseAlias.get(parsed.nb);
-      if (!newNb || newNb === parsed.nb) return mk;
-      return `nb:${newNb}${parsed.rest}`;
-    };
-
-    const aliasedBaselineEntries = [];
-    for (const [mk, mv] of Object.entries(rawMeta)) {
-      if (
-        mk === INITIALIZED_META_KEY ||
-        mk === TOMBSTONES_META_KEY ||
-        mk === LAYOUTS_META_KEY ||
-        mk === ROOT_IDENTITIES_META_KEY ||
-        mk === BASE_TIMESTAMPS_META_KEY
-      ) {
-        continue;
-      }
-      if (!mv || typeof mv !== 'object' || Array.isArray(mv)) {
-        nextMeta[mk] = mv;
-        continue;
-      }
-      const newMk = rewriteMetaKey(mk);
-      if (newMk === mk) {
-        nextMeta[mk] = { ...mv };
-        if (rawTsAll[mk] && typeof rawTsAll[mk] === 'object' && !Array.isArray(rawTsAll[mk])) {
-          nextTsAll[mk] = { ...rawTsAll[mk] };
-        }
-      } else {
-        aliasedBaselineEntries.push([mk, newMk, mv]);
-      }
-    }
-    for (const [mk, newMk, mv] of aliasedBaselineEntries) {
-      syncMetaChanged = true;
-      const incomingTs = rawTsAll[mk] && typeof rawTsAll[mk] === 'object' && !Array.isArray(rawTsAll[mk]) ? rawTsAll[mk] : null;
-      if (!Object.hasOwn(nextMeta, newMk)) {
-        nextMeta[newMk] = { ...mv };
-        if (incomingTs) nextTsAll[newMk] = { ...incomingTs };
-      } else {
-        const { merged, mergedTs } = mergeBaselineMaps(nextMeta[newMk], mv, nextTsAll[newMk], incomingTs);
-        nextMeta[newMk] = merged;
-        if (Object.keys(mergedTs).length > 0) nextTsAll[newMk] = mergedTs;
-        else delete nextTsAll[newMk];
-      }
-    }
-    if (Object.keys(nextTsAll).length > 0) {
-      nextMeta[BASE_TIMESTAMPS_META_KEY] = nextTsAll;
-    }
-
-    if (rawMeta[INITIALIZED_META_KEY] && typeof rawMeta[INITIALIZED_META_KEY] === 'object' && !Array.isArray(rawMeta[INITIALIZED_META_KEY])) {
-      const initOut = {};
-      const pendingInit = [];
-      for (const [ik, iv] of Object.entries(rawMeta[INITIALIZED_META_KEY])) {
-        const newIk = rewriteMetaKey(ik);
-        if (newIk === ik) {
-          initOut[ik] = iv;
-        } else {
-          pendingInit.push([newIk, iv]);
-        }
-      }
-      for (const [newIk, iv] of pendingInit) {
-        syncMetaChanged = true;
-        if (initOut[newIk] || iv) initOut[newIk] = Boolean(initOut[newIk] || iv);
-      }
-      nextMeta[INITIALIZED_META_KEY] = initOut;
-    }
-
-    if (rawMeta[TOMBSTONES_META_KEY] && typeof rawMeta[TOMBSTONES_META_KEY] === 'object' && !Array.isArray(rawMeta[TOMBSTONES_META_KEY])) {
-      const tombsOut = {};
-      const pendingTombs = [];
-      for (const [tk, tv] of Object.entries(rawMeta[TOMBSTONES_META_KEY])) {
-        const newTk = baseAlias.get(tk) || tk;
-        if (newTk === tk) {
-          tombsOut[tk] = mergeTombstoneBuckets(tombsOut[tk], tv);
-        } else {
-          pendingTombs.push([newTk, tv]);
-        }
-      }
-      for (const [newTk, tv] of pendingTombs) {
-        syncMetaChanged = true;
-        tombsOut[newTk] = mergeTombstoneBuckets(tombsOut[newTk], tv);
-      }
-      nextMeta[TOMBSTONES_META_KEY] = tombsOut;
-    }
-
-    if (rawMeta[LAYOUTS_META_KEY] && typeof rawMeta[LAYOUTS_META_KEY] === 'object' && !Array.isArray(rawMeta[LAYOUTS_META_KEY])) {
-      const layoutsOut = {};
-      for (const [lk, lv] of Object.entries(rawMeta[LAYOUTS_META_KEY])) {
-        if (!lv || typeof lv !== 'object' || Array.isArray(lv)) {
-          layoutsOut[lk] = lv;
-          continue;
-        }
-        const bOut = {};
-        const pendingBindings = [];
-        for (const [bk, bVal] of Object.entries(lv)) {
-          const newBk = baseAlias.get(bk) || bk;
-          if (newBk === bk) {
-            bOut[bk] = bVal;
-          } else {
-            pendingBindings.push([newBk, bVal]);
-          }
-        }
-        for (const [newBk, bVal] of pendingBindings) {
-          syncMetaChanged = true;
-          if (!Object.hasOwn(bOut, newBk)) bOut[newBk] = bVal;
-        }
-        layoutsOut[lk] = bOut;
-      }
-      nextMeta[LAYOUTS_META_KEY] = layoutsOut;
-    }
-
-    if (rawMeta[ROOT_IDENTITIES_META_KEY] && typeof rawMeta[ROOT_IDENTITIES_META_KEY] === 'object' && !Array.isArray(rawMeta[ROOT_IDENTITIES_META_KEY])) {
-      const idOut = {};
-      const pendingIdKeys = [];
-      for (const [rk, rv] of Object.entries(rawMeta[ROOT_IDENTITIES_META_KEY])) {
-        const isPerMeta = Boolean(parseNbMetaKey(rk));
-        const newRk = isPerMeta ? rewriteMetaKey(rk) : (baseAlias.get(rk) || rk);
-        if (newRk === rk) {
-          idOut[rk] = rv;
-        } else {
-          pendingIdKeys.push([newRk, rv]);
-        }
-      }
-      for (const [newRk, rv] of pendingIdKeys) {
-        syncMetaChanged = true;
-        if (!Object.hasOwn(idOut, newRk) && rv) idOut[newRk] = rv;
-      }
-      nextMeta[ROOT_IDENTITIES_META_KEY] = idOut;
-    }
-
-    if (syncMetaChanged) {
-      dirty.sync_meta = nextMeta;
-    }
-
-    let idMapDirty = false;
-    let idMapPayload = null;
-    if (normalizedPatches.length > 0 || normalizedBlockedAdd.size > 0) {
-      const candIdMap = normalizedPatches.length > 0
-        ? applyIdMapPatches(state.notebookIdMap, normalizedPatches)
-        : state.notebookIdMap;
-      const candBlocked = new Set([...(state.blockedLegacyIds || []), ...normalizedBlockedAdd]);
-      const prevStr = JSON.stringify({
-        by_id: state.notebookIdMap.by_id || {},
-        by_path: state.notebookIdMap.by_path || {},
-        identities: state.notebookIdMap.identities || {},
-        path_identities: state.notebookIdMap.path_identities || {},
-        blocked_legacy_ids: [...state.blockedLegacyIds].sort(),
-      });
-      const nextPayload = {
-        by_id: { ...(candIdMap.by_id || {}) },
-        by_path: { ...(candIdMap.by_path || {}) },
-        identities: { ...(candIdMap.identities || {}) },
-        path_identities: { ...(candIdMap.path_identities || {}) },
-        blocked_legacy_ids: [...candBlocked].sort(),
-      };
-      if (JSON.stringify(nextPayload) !== prevStr) {
-        idMapDirty = true;
-        idMapPayload = nextPayload;
-        dirty[NOTEBOOK_ID_MAP_KEY] = nextPayload;
       }
     }
 
@@ -1736,17 +1452,15 @@ export function createConfigStore({
       if (noticesChanged && has('pending_notices')) {
         state.pendingNotices = migratedNotices;
       }
-      if (syncMetaChanged && has('sync_meta')) {
-        state.syncMeta = nextMeta;
+      if (Object.hasOwn(dirty, 'sync_meta') && has('sync_meta')) {
+        state.syncMeta = dirty.sync_meta;
       }
-      if (idMapDirty && idMapPayload && has(NOTEBOOK_ID_MAP_KEY)) {
+      if (Object.hasOwn(dirty, NOTEBOOK_ID_MAP_KEY) && has(NOTEBOOK_ID_MAP_KEY)) {
+        const payload = dirty[NOTEBOOK_ID_MAP_KEY];
         state.notebookIdMap = {
-          by_id: { ...idMapPayload.by_id },
-          by_path: { ...idMapPayload.by_path },
-          identities: { ...idMapPayload.identities },
-          path_identities: { ...idMapPayload.path_identities },
+          by_id: { ...(payload.by_id || {}) },
+          by_path: { ...(payload.by_path || {}) },
         };
-        state.blockedLegacyIds = new Set(idMapPayload.blocked_legacy_ids);
       }
     };
 
@@ -1756,13 +1470,19 @@ export function createConfigStore({
           storageSetMany(rpc, dirty);
           commitInMemory();
         } catch (_err) {
-          // Do not discard or corrupt in-memory baselines if atomic storage write fails.
-          recordPending();
           return false;
         }
       } else {
-        // Persist ID map and sync baselines before auxiliary config/state keys.
-        const order = ['sync_meta', NOTEBOOK_ID_MAP_KEY, 'notebook_configs', 'config', 'notebook_results', 'pending_confirms', 'conn_states', 'pending_notices'];
+        const order = [
+          'sync_meta',
+          NOTEBOOK_ID_MAP_KEY,
+          'notebook_configs',
+          'config',
+          'notebook_results',
+          'pending_confirms',
+          'conn_states',
+          'pending_notices',
+        ];
         const written = new Set();
         try {
           for (const k of order) {
@@ -1774,7 +1494,6 @@ export function createConfigStore({
           commitInMemory(written);
         } catch (_err) {
           commitInMemory(written);
-          recordPending();
           return false;
         }
       }
@@ -1911,11 +1630,13 @@ export function createConfigStore({
 
     let hostListed = false;
     let hostProvidedIDs = false;
+    let hostProvidedLiveIDs = false;
     try {
       const res = getRpc()('host.notebooks.list', {});
       if (res && Array.isArray(res.notebooks)) {
         hostListed = true;
         hostProvidedIDs = res.notebooks.some((item) => item && typeof item === 'object' && String(item.id || '').trim() !== '');
+        if (hostProvidedIDs) hostProvidedLiveIDs = true;
         for (const item of res.notebooks) {
           if (item && typeof item === 'object') {
             const p = item.path;
@@ -1969,6 +1690,9 @@ export function createConfigStore({
       const live = queryLiveNotebookIdentity(getRpc(), entry.path, state.homeDir);
       if (!entry.id && live.id) {
         entry.id = live.id;
+        hostProvidedLiveIDs = true;
+      } else if (live.id) {
+        hostProvidedLiveIDs = true;
       }
       if ((!Array.isArray(entry.previous_paths) || entry.previous_paths.length === 0) && live.previousPaths.length > 0) {
         entry.previous_paths = live.previousPaths;
@@ -1984,7 +1708,7 @@ export function createConfigStore({
       }
     }
 
-    state.hostSupportsNotebookIds = hostProvidedIDs || entries.some((e) => Boolean(e && e.id));
+    state.hostSupportsNotebookIds = hostProvidedLiveIDs;
     state.knownNotebooks = entries;
     return entries;
   };
@@ -2011,127 +1735,19 @@ export function createConfigStore({
     return out;
   };
 
-  const evaluateSourcePathMigration = (
-    srcPath,
-    targetId,
-    liveRootId,
-    {
-      isOldPath = false,
-      prevIdMap = { by_id: {}, by_path: {}, identities: {}, path_identities: {} },
-      prevKnown = [],
-      combinedKnown = [],
-      rawRootIds = {},
-      requirePreOwnership = false,
-    } = {}
-  ) => {
-    if (!srcPath || !targetId || !liveRootId) {
-      return { allowUI: false, allowPathMeta: false, allowedMetaKeys: new Map(), mismatched: false, hasUnverifiedMk: false };
-    }
-    const mapOwner = prevIdMap.by_path ? prevIdMap.by_path[srcPath] : '';
-    if (mapOwner && mapOwner !== targetId) {
-      return { allowUI: false, allowPathMeta: false, allowedMetaKeys: new Map(), mismatched: true, hasUnverifiedMk: false };
-    }
-    const foreignKn = combinedKnown.some(
-      (kn) =>
-        kn &&
-        kn.id &&
-        kn.id !== targetId &&
-        (kn.path === srcPath || (Array.isArray(kn.previous_paths) && kn.previous_paths.includes(srcPath)))
-    );
-    if (foreignKn) {
-      return { allowUI: false, allowPathMeta: false, allowedMetaKeys: new Map(), mismatched: true, hasUnverifiedMk: false };
-    }
-    const preOwned = Boolean(
-      (prevIdMap.by_path && prevIdMap.by_path[srcPath] === targetId) ||
-        (prevIdMap.by_id && prevIdMap.by_id[targetId] === srcPath) ||
-        prevKnown.some(
-          (kn) =>
-            kn &&
-            kn.id === targetId &&
-            (kn.path === srcPath || (Array.isArray(kn.previous_paths) && kn.previous_paths.includes(srcPath)))
-        )
-    );
-    if (requirePreOwnership && !preOwned) {
-      return { allowUI: false, allowPathMeta: false, allowedMetaKeys: new Map(), mismatched: false, hasUnverifiedMk: false };
-    }
-
-    // Check only records belonging to srcPath / each individual metaKey itself,
-    // never falling back to identities[targetId] or liveRootId.
-    const pathRecs = [];
-    const addPathRec = (v) => {
-      const s = String(v || '').trim();
-      if (s && !pathRecs.includes(s)) pathRecs.push(s);
-    };
-    if (prevIdMap.path_identities) addPathRec(prevIdMap.path_identities[srcPath]);
-    addPathRec(rawRootIds[srcPath]);
-    const pathMismatched = pathRecs.some((v) => v !== liveRootId);
-
-    const sourceMetaKeys = new Set();
-    const collectKeysFrom = (obj) => {
-      if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return;
-      for (const k of Object.keys(obj)) {
-        const parsed = parseNbMetaKey(k);
-        if (parsed && parsed.nb === srcPath) sourceMetaKeys.add(k);
-      }
-    };
-    collectKeysFrom(state.syncMeta);
-    collectKeysFrom(state.syncMeta && state.syncMeta[BASE_TIMESTAMPS_META_KEY]);
-    collectKeysFrom(state.syncMeta && state.syncMeta[INITIALIZED_META_KEY]);
-    collectKeysFrom(rawRootIds);
-
-    const pathAllMatch = pathRecs.length > 0 && pathRecs.every((v) => v === liveRootId);
-
-    const allowedMetaKeys = new Map();
-    const unpinnedMetaKeys = [];
-    let mkMismatched = false;
-    let hasUnverifiedMk = false;
-    for (const mk of sourceMetaKeys) {
-      const mkRec = String(rawRootIds[mk] || '').trim();
-      if (!mkRec) {
-        unpinnedMetaKeys.push(mk);
-        continue;
-      }
-      if (mkRec !== liveRootId) {
-        mkMismatched = true;
-        continue;
-      }
-      if (!pathMismatched) {
-        const parsed = parseNbMetaKey(mk);
-        if (parsed) allowedMetaKeys.set(mk, `nb:${targetId}${parsed.rest}`);
-      }
-    }
-    for (const mk of unpinnedMetaKeys) {
-      if (!pathMismatched && !mkMismatched && pathAllMatch) {
-        const parsed = parseNbMetaKey(mk);
-        if (parsed) allowedMetaKeys.set(mk, `nb:${targetId}${parsed.rest}`);
-      } else {
-        hasUnverifiedMk = true;
-      }
-    }
-
-    const mismatched = pathMismatched || mkMismatched;
-    const allowUI = !mismatched;
-    const allowPathMeta =
-      !mismatched &&
-      pathAllMatch &&
-      (!isOldPath || sourceMetaKeys.size === 0 || allowedMetaKeys.size > 0 || !hasUnverifiedMk);
-    return { allowUI, allowPathMeta, allowedMetaKeys, mismatched, hasUnverifiedMk };
-  };
-
   const hasVerifiedBaseline = (
     nbRoot,
-    { metaKey: targetMetaKey = '', aliases = [], legacyKeys = [], nbKeyVal = '', protocol = '' } = {}
+    { metaKey: targetMetaKey = '', aliases = [], legacyKeys = [], nbKeyVal = '' } = {}
   ) => {
     const cleanRoot = normAbsPath(nbRoot, state.homeDir);
     const effectiveNbKey = String(nbKeyVal || (cleanRoot ? nbKey(cleanRoot) : '') || '').trim();
-    const candLegacy = Array.isArray(legacyKeys) ? legacyKeys.filter(Boolean) : [];
     const allowLegacy =
-      candLegacy.length > 0 &&
-      (!protocol || allowLegacyFallback(effectiveNbKey, protocol, candLegacy));
-    const effectiveLegacy = allowLegacy ? candLegacy : [];
-    const rawBase = getBaseMap(targetMetaKey, ...(Array.isArray(aliases) ? aliases : []), ...effectiveLegacy);
+      !state.hostSupportsNotebookIds &&
+      (!effectiveNbKey || effectiveNbKey === 'default' || effectiveNbKey === cleanRoot);
+    const candLegacy = allowLegacy && Array.isArray(legacyKeys) ? legacyKeys.filter(Boolean) : [];
+    const rawBase = getBaseMap(targetMetaKey, ...(Array.isArray(aliases) ? aliases : []), ...candLegacy);
     const initMap = state.syncMeta && state.syncMeta[INITIALIZED_META_KEY];
-    const primaryKeys = [targetMetaKey, ...(Array.isArray(aliases) ? aliases : []), ...effectiveLegacy]
+    const primaryKeys = [targetMetaKey, ...(Array.isArray(aliases) ? aliases : []), ...candLegacy]
       .map((k) => String(k || '').trim())
       .filter(Boolean);
     const hasMeta = Boolean(
@@ -2142,7 +1758,7 @@ export function createConfigStore({
     const chk = verifyNotebookIdentity(cleanRoot || nbRoot, {
       metaKey: targetMetaKey,
       aliases,
-      legacyKeys: effectiveLegacy,
+      legacyKeys: candLegacy,
       nbKeyVal: effectiveNbKey,
       hasExistingBaseline: true,
     });
@@ -2155,23 +1771,10 @@ export function createConfigStore({
     const rawMap = idMapRes.found && idMapRes.value && typeof idMapRes.value === 'object' && !Array.isArray(idMapRes.value)
       ? idMapRes.value
       : null;
-    const prevIdMap = {
+    state.notebookIdMap = {
       by_id: rawMap && rawMap.by_id && typeof rawMap.by_id === 'object' ? { ...rawMap.by_id } : {},
       by_path: rawMap && rawMap.by_path && typeof rawMap.by_path === 'object' ? { ...rawMap.by_path } : {},
-      identities: rawMap && rawMap.identities && typeof rawMap.identities === 'object' ? { ...rawMap.identities } : {},
-      path_identities: rawMap && rawMap.path_identities && typeof rawMap.path_identities === 'object' ? { ...rawMap.path_identities } : {},
     };
-    state.notebookIdMap = {
-      by_id: { ...prevIdMap.by_id },
-      by_path: { ...prevIdMap.by_path },
-      identities: { ...prevIdMap.identities },
-      path_identities: { ...prevIdMap.path_identities },
-    };
-    state.blockedLegacyIds = new Set(
-      rawMap && Array.isArray(rawMap.blocked_legacy_ids)
-        ? rawMap.blocked_legacy_ids.map((x) => String(x || '').trim()).filter(Boolean)
-        : []
-    );
 
     refreshKnownNotebooks();
 
@@ -2260,213 +1863,229 @@ export function createConfigStore({
       }
     }
 
-    const activePathToId = new Map();
-    for (const kn of state.knownNotebooks) {
-      if (kn && kn.path && kn.id) activePathToId.set(kn.path, kn.id);
-    }
-
-    const rawRootIdsInit =
-      state.syncMeta && state.syncMeta[ROOT_IDENTITIES_META_KEY] && typeof state.syncMeta[ROOT_IDENTITIES_META_KEY] === 'object' && !Array.isArray(state.syncMeta[ROOT_IDENTITIES_META_KEY])
-        ? state.syncMeta[ROOT_IDENTITIES_META_KEY]
-        : {};
-    const rawInitMap =
-      state.syncMeta && state.syncMeta[INITIALIZED_META_KEY] && typeof state.syncMeta[INITIALIZED_META_KEY] === 'object' && !Array.isArray(state.syncMeta[INITIALIZED_META_KEY])
-        ? state.syncMeta[INITIALIZED_META_KEY]
-        : {};
-
-    let hasAnyUnnamespacedLegacy = false;
-    for (const [mk, mv] of Object.entries(state.syncMeta || {})) {
-      if (isReservedSyncMetaKey(mk)) continue;
-      if (!mv || typeof mv !== 'object' || Array.isArray(mv) || Object.keys(mv).length === 0) continue;
-      if (!parseNbMetaKey(mk)) {
-        hasAnyUnnamespacedLegacy = true;
-        break;
-      }
-    }
-    if (!hasAnyUnnamespacedLegacy) {
-      for (const [ik, iv] of Object.entries(rawInitMap)) {
-        if (iv && !parseNbMetaKey(ik)) {
-          hasAnyUnnamespacedLegacy = true;
-          break;
+    const idPairs = [];
+    if (state.hostSupportsNotebookIds) {
+      for (const kn of state.knownNotebooks) {
+        if (kn && kn.id && kn.path && kn.path !== kn.id) {
+          idPairs.push([kn.id, kn.path]);
         }
       }
     }
+    const { next: nextIdMap, changed: idMapChanged } = buildUpdatedIdMap(state.notebookIdMap, idPairs);
 
-    const hasPathBaseline = (p) => {
-      if (!p) return false;
-      for (const [mk, mv] of Object.entries(state.syncMeta || {})) {
+    if (state.hostSupportsNotebookIds && !state.syncMeta[LEGACY_PATH_MIGRATED_KEY]) {
+      const rawMeta = state.syncMeta || {};
+      const rawRootIds =
+        rawMeta[ROOT_IDENTITIES_META_KEY] &&
+        typeof rawMeta[ROOT_IDENTITIES_META_KEY] === 'object' &&
+        !Array.isArray(rawMeta[ROOT_IDENTITIES_META_KEY])
+          ? rawMeta[ROOT_IDENTITIES_META_KEY]
+          : {};
+      const pathAlias = new Map();
+      const verifiedByNbId = new Map();
+      for (const kn of state.knownNotebooks) {
+        if (!kn || !kn.id || !kn.path || kn.path === kn.id) continue;
+        if (kn.identity_verified !== true || !kn.root_identity) continue;
+        let conflict = Boolean(rawRootIds[kn.path] && String(rawRootIds[kn.path]).trim() !== kn.root_identity);
+        if (!conflict) {
+          for (const [rk, rv] of Object.entries(rawRootIds)) {
+            const parsed = parseNbMetaKey(rk);
+            if (parsed && parsed.nb === kn.path && rv && String(rv).trim() !== kn.root_identity) {
+              conflict = true;
+              break;
+            }
+          }
+        }
+        if (conflict) continue;
+        pathAlias.set(kn.path, kn.id);
+        verifiedByNbId.set(kn.id, kn);
+      }
+
+      const rawTsAll =
+        rawMeta[BASE_TIMESTAMPS_META_KEY] &&
+        typeof rawMeta[BASE_TIMESTAMPS_META_KEY] === 'object' &&
+        !Array.isArray(rawMeta[BASE_TIMESTAMPS_META_KEY])
+          ? rawMeta[BASE_TIMESTAMPS_META_KEY]
+          : {};
+      const nextMeta = {};
+      const nextTsAll = {};
+      const migratedTargetNbIds = new Set();
+      const migratedMkInfo = [];
+
+      const aliasedEntries = [];
+      for (const [mk, mv] of Object.entries(rawMeta)) {
         if (isReservedSyncMetaKey(mk)) continue;
-        if (!mv || typeof mv !== 'object' || Array.isArray(mv) || Object.keys(mv).length === 0) continue;
+        if (!mv || typeof mv !== 'object' || Array.isArray(mv)) {
+          nextMeta[mk] = mv;
+          continue;
+        }
         const parsed = parseNbMetaKey(mk);
-        if (parsed && parsed.nb === p) return true;
+        const newNb = parsed ? pathAlias.get(parsed.nb) : '';
+        if (newNb && newNb !== parsed.nb) {
+          const newMk = `nb:${newNb}${parsed.rest}`;
+          aliasedEntries.push([mk, newMk, newNb, mv]);
+        } else {
+          nextMeta[mk] = { ...mv };
+          if (rawTsAll[mk] && typeof rawTsAll[mk] === 'object' && !Array.isArray(rawTsAll[mk])) {
+            nextTsAll[mk] = { ...rawTsAll[mk] };
+          }
+        }
       }
-      for (const [ik, iv] of Object.entries(rawInitMap)) {
-        if (!iv) continue;
-        const parsed = parseNbMetaKey(ik);
-        if (parsed && parsed.nb === p) return true;
+      for (const [mk, newMk, newNb, mv] of aliasedEntries) {
+        migratedTargetNbIds.add(newNb);
+        migratedMkInfo.push([mk, newMk, newNb]);
+        const incTs = rawTsAll[mk] && typeof rawTsAll[mk] === 'object' && !Array.isArray(rawTsAll[mk]) ? rawTsAll[mk] : null;
+        if (!Object.hasOwn(nextMeta, newMk)) {
+          nextMeta[newMk] = { ...mv };
+          if (incTs) nextTsAll[newMk] = { ...incTs };
+        } else {
+          const { merged, mergedTs } = mergeBaselineMaps(nextMeta[newMk], mv, nextTsAll[newMk], incTs);
+          nextMeta[newMk] = merged;
+          if (Object.keys(mergedTs).length > 0) nextTsAll[newMk] = mergedTs;
+          else delete nextTsAll[newMk];
+        }
       }
-      return false;
-    };
+      if (Object.keys(nextTsAll).length > 0) {
+        nextMeta[BASE_TIMESTAMPS_META_KEY] = nextTsAll;
+      }
 
-    const configPreMigrates = (uiMap) => {
-      if (!uiMap || uiMap.size === 0) return { preNb: false, preGl: false };
+      if (rawMeta[INITIALIZED_META_KEY] && typeof rawMeta[INITIALIZED_META_KEY] === 'object' && !Array.isArray(rawMeta[INITIALIZED_META_KEY])) {
+        const initOut = {};
+        const pendingInit = [];
+        for (const [ik, iv] of Object.entries(rawMeta[INITIALIZED_META_KEY])) {
+          const parsed = parseNbMetaKey(ik);
+          const newNb = parsed ? pathAlias.get(parsed.nb) : '';
+          if (newNb && newNb !== parsed.nb) {
+            pendingInit.push([ik, `nb:${newNb}${parsed.rest}`, newNb, iv]);
+          } else {
+            initOut[ik] = iv;
+          }
+        }
+        for (const [ik, newIk, newNb, iv] of pendingInit) {
+          migratedTargetNbIds.add(newNb);
+          migratedMkInfo.push([ik, newIk, newNb]);
+          if (initOut[newIk] || iv) initOut[newIk] = Boolean(initOut[newIk] || iv);
+        }
+        nextMeta[INITIALIZED_META_KEY] = initOut;
+      }
+
+      if (rawMeta[TOMBSTONES_META_KEY] && typeof rawMeta[TOMBSTONES_META_KEY] === 'object' && !Array.isArray(rawMeta[TOMBSTONES_META_KEY])) {
+        const tombsOut = {};
+        const pendingTombs = [];
+        for (const [tk, tv] of Object.entries(rawMeta[TOMBSTONES_META_KEY])) {
+          const newTk = pathAlias.get(tk);
+          if (newTk && newTk !== tk) {
+            pendingTombs.push([newTk, tv]);
+          } else {
+            tombsOut[tk] = mergeTombstoneBuckets(tombsOut[tk], tv);
+          }
+        }
+        for (const [newTk, tv] of pendingTombs) {
+          tombsOut[newTk] = mergeTombstoneBuckets(tombsOut[newTk], tv);
+        }
+        nextMeta[TOMBSTONES_META_KEY] = tombsOut;
+      }
+
+      if (rawMeta[LAYOUTS_META_KEY] && typeof rawMeta[LAYOUTS_META_KEY] === 'object' && !Array.isArray(rawMeta[LAYOUTS_META_KEY])) {
+        const layoutsOut = {};
+        for (const [lk, lv] of Object.entries(rawMeta[LAYOUTS_META_KEY])) {
+          if (!lv || typeof lv !== 'object' || Array.isArray(lv)) {
+            layoutsOut[lk] = lv;
+            continue;
+          }
+          const bOut = {};
+          const pendingBindings = [];
+          for (const [bk, bVal] of Object.entries(lv)) {
+            const newBk = pathAlias.get(bk);
+            if (newBk && newBk !== bk) {
+              pendingBindings.push([newBk, bVal]);
+            } else {
+              bOut[bk] = bVal;
+            }
+          }
+          for (const [newBk, bVal] of pendingBindings) {
+            if (!Object.hasOwn(bOut, newBk)) bOut[newBk] = bVal;
+          }
+          layoutsOut[lk] = bOut;
+        }
+        nextMeta[LAYOUTS_META_KEY] = layoutsOut;
+      }
+
+      const idOut = {};
+      const pendingIdKeys = [];
+      for (const [rk, rv] of Object.entries(rawRootIds)) {
+        const parsed = parseNbMetaKey(rk);
+        if (parsed) {
+          const newNb = pathAlias.get(parsed.nb);
+          if (newNb && newNb !== parsed.nb) {
+            pendingIdKeys.push([`nb:${newNb}${parsed.rest}`, rv]);
+          } else {
+            idOut[rk] = rv;
+          }
+        } else {
+          const newRk = pathAlias.get(rk);
+          if (newRk && newRk !== rk) {
+            pendingIdKeys.push([newRk, rv]);
+          } else {
+            idOut[rk] = rv;
+          }
+        }
+      }
+      for (const [newRk, rv] of pendingIdKeys) {
+        if (!Object.hasOwn(idOut, newRk) && rv) idOut[newRk] = rv;
+      }
+      for (const [, newMk, newNb] of migratedMkInfo) {
+        const kn = verifiedByNbId.get(newNb);
+        if (kn && kn.root_identity && !idOut[newMk]) {
+          idOut[newMk] = kn.root_identity;
+        }
+      }
+      for (const newNb of migratedTargetNbIds) {
+        const kn = verifiedByNbId.get(newNb);
+        if (kn && kn.root_identity) {
+          if (!idOut[kn.id]) idOut[kn.id] = kn.root_identity;
+          if (!idOut[kn.path]) idOut[kn.path] = kn.root_identity;
+        }
+      }
+      if (Object.keys(idOut).length > 0) {
+        nextMeta[ROOT_IDENTITIES_META_KEY] = idOut;
+      }
+      nextMeta[LEGACY_PATH_MIGRATED_KEY] = true;
+
       let preNb = false;
       for (const [k, v] of Object.entries(state.notebookConfigs)) {
-        if (uiMap.has(k)) {
-          preNb = true;
-          break;
-        }
-        if (v && Array.isArray(v.selected_notebooks) && v.selected_notebooks.some((x) => uiMap.has(normAbsPath(x, state.homeDir)))) {
+        if (pathAlias.has(k) || (v && Array.isArray(v.selected_notebooks) && v.selected_notebooks.some((x) => pathAlias.has(normAbsPath(x, state.homeDir))))) {
           preNb = true;
           break;
         }
       }
       const preGl = Boolean(
-        rawCfg && Array.isArray(rawCfg.selected_notebooks) && rawCfg.selected_notebooks.some((x) => uiMap.has(normAbsPath(x, state.homeDir)))
+        rawCfg && Array.isArray(rawCfg.selected_notebooks) && rawCfg.selected_notebooks.some((x) => pathAlias.has(normAbsPath(x, state.homeDir)))
       );
-      return { preNb, preGl };
-    };
-
-    const knownSnapshot = [...state.knownNotebooks];
-    for (const kn of knownSnapshot) {
-      if (!kn || !kn.id || !kn.path || kn.path === kn.id) continue;
-      if (kn.identity_verified !== true || !kn.root_identity) {
-        if (!state.blockedLegacyIds.has(kn.id)) {
-          const ok = applyAliasMigrations(new Map(), {
-            baselineAliasMap: new Map(),
-            baselineKeyMap: new Map(),
-            persist: true,
-            blockedIdsToAdd: [kn.id],
-            migrationKey: kn.id,
-          });
-          if (ok) clearPendingMigrationsFor(kn.id);
-        }
-        continue;
-      }
-
-      const rawRootIds =
-        state.syncMeta && state.syncMeta[ROOT_IDENTITIES_META_KEY] && typeof state.syncMeta[ROOT_IDENTITIES_META_KEY] === 'object' && !Array.isArray(state.syncMeta[ROOT_IDENTITIES_META_KEY])
-          ? state.syncMeta[ROOT_IDENTITIES_META_KEY]
-          : rawRootIdsInit;
-      const liveIdMapSnap = {
-        by_id: { ...(state.notebookIdMap.by_id || {}) },
-        by_path: { ...(state.notebookIdMap.by_path || {}) },
-        identities: { ...(state.notebookIdMap.identities || {}) },
-        path_identities: { ...(state.notebookIdMap.path_identities || {}) },
-      };
-
-      const uiAlias = new Map();
-      const baseAlias = new Map();
-      const baselineKeyMap = new Map();
-      const blockedToAdd = [];
-      const idPatches = [];
-
-      const liveRootId = kn.root_identity;
-      const recordedOwner = liveIdMapSnap.by_path[kn.path];
-      const replacedPriorOwner = Boolean(state.hostSupportsNotebookIds && recordedOwner && recordedOwner !== kn.id);
-      const ownershipProven =
-        recordedOwner === kn.id ||
-        liveIdMapSnap.by_id[kn.id] === kn.path ||
-        (Array.isArray(kn.previous_paths) && kn.previous_paths.includes(kn.path));
-
-      if (replacedPriorOwner) {
-        blockedToAdd.push(kn.id);
-      } else {
-        const uiEval = evaluateSourcePathMigration(kn.path, kn.id, liveRootId, {
-          isOldPath: false,
-          prevIdMap: liveIdMapSnap,
-          prevKnown: knownSnapshot,
-          combinedKnown: knownSnapshot,
-          rawRootIds,
-          requirePreOwnership: false,
-        });
-        if (uiEval.allowUI) {
-          uiAlias.set(kn.path, kn.id);
-        }
-        const baseEval = evaluateSourcePathMigration(kn.path, kn.id, liveRootId, {
-          isOldPath: false,
-          prevIdMap: liveIdMapSnap,
-          prevKnown: knownSnapshot,
-          combinedKnown: knownSnapshot,
-          rawRootIds,
-          requirePreOwnership: true,
-        });
-        if (ownershipProven && baseEval.allowPathMeta && !state.blockedLegacyIds.has(kn.id)) {
-          baseAlias.set(kn.path, kn.id);
-        }
-        if (ownershipProven && !state.blockedLegacyIds.has(kn.id)) {
-          for (const [srcMk, dstMk] of baseEval.allowedMetaKeys.entries()) {
-            baselineKeyMap.set(srcMk, dstMk);
-          }
-        }
-        if (
-          hasAnyUnnamespacedLegacy ||
-          hasPathBaseline(kn.path) ||
-          !ownershipProven ||
-          baseEval.mismatched ||
-          baseEval.hasUnverifiedMk
-        ) {
-          blockedToAdd.push(kn.id);
-        }
-      }
-
-      if (Array.isArray(kn.previous_paths)) {
-        for (const prevPath of kn.previous_paths) {
-          if (!prevPath || prevPath === kn.path || prevPath === kn.id) continue;
-          const activeOwner = activePathToId.get(prevPath);
-          if (activeOwner && activeOwner !== kn.id) continue;
-          const prevEval = evaluateSourcePathMigration(prevPath, kn.id, liveRootId, {
-            isOldPath: true,
-            prevIdMap: liveIdMapSnap,
-            prevKnown: knownSnapshot,
-            combinedKnown: knownSnapshot,
-            rawRootIds,
-            requirePreOwnership: false,
-          });
-          if (prevEval.allowUI) uiAlias.set(prevPath, kn.id);
-          if (prevEval.allowPathMeta) baseAlias.set(prevPath, kn.id);
-          for (const [srcMk, dstMk] of prevEval.allowedMetaKeys.entries()) {
-            baselineKeyMap.set(srcMk, dstMk);
-          }
-        }
-      }
-
-      if (state.hostSupportsNotebookIds) {
-        idPatches.push({
-          id: kn.id,
-          newPath: kn.path,
-          oldPaths: Array.isArray(kn.previous_paths) ? kn.previous_paths : [],
-          rootIdentity: liveRootId,
-        });
-      }
-
-      if (
-        uiAlias.size > 0 ||
-        baseAlias.size > 0 ||
-        baselineKeyMap.size > 0 ||
-        idPatches.length > 0 ||
-        blockedToAdd.some((bid) => !state.blockedLegacyIds.has(bid))
-      ) {
-        const { preNb, preGl } = configPreMigrates(uiAlias);
-        const ok = applyAliasMigrations(uiAlias, {
-          baselineAliasMap: baseAlias,
-          baselineKeyMap,
-          persist: true,
-          preMigratedNbConfigs: preNb,
-          preMigratedGlobal: preGl,
-          idMapPatches: idPatches,
-          blockedIdsToAdd: blockedToAdd,
-          migrationKey: kn.id,
-        });
-        if (ok) clearPendingMigrationsFor(kn.id);
-      }
+      const extraDirty = { sync_meta: nextMeta };
+      if (idMapChanged) extraDirty[NOTEBOOK_ID_MAP_KEY] = nextIdMap;
+      applyUiScopeAliases(pathAlias, {
+        persist: true,
+        preMigratedNbConfigs: preNb,
+        preMigratedGlobal: preGl,
+        extraDirty,
+      });
+    } else if (idMapChanged) {
+      applyUiScopeAliases(new Map(), {
+        persist: true,
+        extraDirty: { [NOTEBOOK_ID_MAP_KEY]: nextIdMap },
+      });
     }
 
     const key = nbKey();
     const activeNorm = normAbsPath(state.notebookRoot, state.homeDir);
     const activeNbRecord =
       (Object.hasOwn(state.notebookConfigs, key) && state.notebookConfigs[key]) ||
-      (activeNorm && !state.blockedLegacyIds.has(key) && Object.hasOwn(state.notebookConfigs, activeNorm) && state.notebookConfigs[activeNorm]) ||
+      (!state.hostSupportsNotebookIds &&
+        key === activeNorm &&
+        activeNorm &&
+        Object.hasOwn(state.notebookConfigs, activeNorm) &&
+        state.notebookConfigs[activeNorm]) ||
       null;
 
     if (!state.supportsMultiNotebook) {
@@ -2602,16 +2221,12 @@ export function createConfigStore({
     };
     if (nb) {
       addSec(rawRootIds[nb]);
-      addSec(state.notebookIdMap && state.notebookIdMap.identities && state.notebookIdMap.identities[nb]);
     }
     if (live.id) {
       addSec(rawRootIds[live.id]);
-      addSec(state.notebookIdMap && state.notebookIdMap.identities && state.notebookIdMap.identities[live.id]);
     }
     if (!nb || nb === cleanRoot) {
       addSec(rawRootIds[cleanRoot]);
-    } else if (state.notebookIdMap && state.notebookIdMap.by_path && state.notebookIdMap.by_path[cleanRoot] === (live.id || nb)) {
-      addSec(state.notebookIdMap.path_identities && state.notebookIdMap.path_identities[cleanRoot]);
     }
     if (secondaryVals.some((val) => val !== live.rootIdentity)) {
       return {
@@ -2735,66 +2350,19 @@ export function createConfigStore({
     }
 
     if (!state.notebookIdMap || typeof state.notebookIdMap !== 'object') {
-      state.notebookIdMap = { by_id: {}, by_path: {}, identities: {}, path_identities: {} };
+      state.notebookIdMap = { by_id: {}, by_path: {} };
     }
-    if (!state.notebookIdMap.identities) state.notebookIdMap.identities = {};
-    if (!state.notebookIdMap.path_identities) state.notebookIdMap.path_identities = {};
-    if (nb && nb !== 'default') {
-      state.notebookIdMap.identities[nb] = rootIdent;
-    }
-    if (cleanRoot) {
-      state.notebookIdMap.path_identities[cleanRoot] = rootIdent;
-      if (nb && nb !== cleanRoot && nb !== 'default') {
-        if (!state.notebookIdMap.by_id) state.notebookIdMap.by_id = {};
-        if (!state.notebookIdMap.by_path) state.notebookIdMap.by_path = {};
-        state.notebookIdMap.by_id[nb] = cleanRoot;
-        state.notebookIdMap.by_path[cleanRoot] = nb;
+    if (!state.notebookIdMap.by_id) state.notebookIdMap.by_id = {};
+    if (!state.notebookIdMap.by_path) state.notebookIdMap.by_path = {};
+    if (cleanRoot && nb && nb !== cleanRoot && nb !== 'default') {
+      const prevPath = state.notebookIdMap.by_id[nb];
+      if (prevPath && prevPath !== cleanRoot && state.notebookIdMap.by_path[prevPath] === nb) {
+        delete state.notebookIdMap.by_path[prevPath];
       }
+      state.notebookIdMap.by_id[nb] = cleanRoot;
+      state.notebookIdMap.by_path[cleanRoot] = nb;
     }
     return true;
-  };
-
-  const hasPendingMigration = (nbRootOrKey = null) => {
-    if (!(state.pendingMigrations instanceof Map) || state.pendingMigrations.size === 0) return false;
-    if (nbRootOrKey === null || nbRootOrKey === undefined || nbRootOrKey === '') return true;
-    const clean = String(nbRootOrKey || '').trim();
-    if (clean === '__multi__' || clean === 'default') return true;
-    const norm = normAbsPath(clean, state.homeDir);
-    const idVal = norm ? idForPath(norm) : '';
-    for (const pm of state.pendingMigrations.values()) {
-      const affected = pm && pm.affectedNbKeys;
-      if (!(affected instanceof Set) || affected.size === 0) return true;
-      if (affected.has(clean) || (norm && affected.has(norm)) || (idVal && affected.has(idVal))) {
-        return true;
-      }
-    }
-    return false;
-  };
-
-  const retryPendingMigrations = () => {
-    if (!(state.pendingMigrations instanceof Map) || state.pendingMigrations.size === 0) return true;
-    refreshKnownNotebooks();
-    let allOk = true;
-    for (const [mKey, pm] of [...state.pendingMigrations.entries()]) {
-      const ok = applyAliasMigrations(pm.aliasMap, {
-        baselineAliasMap: pm.baselineAliasMap,
-        baselineKeyMap: pm.baselineKeyMap,
-        oldPath: pm.oldPath,
-        newPath: pm.newPath,
-        persist: true,
-        preMigratedNbConfigs: pm.preMigratedNbConfigs,
-        preMigratedGlobal: pm.preMigratedGlobal,
-        idMapPatches: pm.idMapPatches,
-        blockedIdsToAdd: pm.blockedIdsToAdd,
-        migrationKey: mKey,
-      });
-      if (ok) {
-        clearPendingMigrationsFor(mKey);
-      } else {
-        allOk = false;
-      }
-    }
-    return allOk && state.pendingMigrations.size === 0;
   };
 
   const commitSystemConfig = (notebooks, shared, current, { migrate = null, clearPending = false } = {}) => {
@@ -3066,14 +2634,11 @@ export function createConfigStore({
     if (
       state.hostSupportsNotebookIds ||
       Object.keys(idMapData.by_id || {}).length > 0 ||
-      Object.keys(idMapData.identities || {}).length > 0
+      Object.keys(idMapData.by_path || {}).length > 0
     ) {
       values[NOTEBOOK_ID_MAP_KEY] = {
         by_id: { ...(idMapData.by_id || {}) },
         by_path: { ...(idMapData.by_path || {}) },
-        identities: { ...(idMapData.identities || {}) },
-        path_identities: { ...(idMapData.path_identities || {}) },
-        blocked_legacy_ids: [...(state.blockedLegacyIds || [])].sort(),
       };
     }
     if (state.supportsSystem) {
@@ -3148,92 +2713,12 @@ export function createConfigStore({
     return null;
   };
 
-  const allowLegacyFallback = (targetNbKey, protocol = '', legacyCandidates = []) => {
-    const nb = String(targetNbKey || '').trim();
-    if (!nb) return false;
-    if (state.blockedLegacyIds.has(nb)) return false;
-    const kn = state.knownNotebooks.find((item) => item && (item.id === nb || item.path === nb));
-    const knPath = kn ? kn.path : '';
-    if (knPath && state.notebookIdMap && state.notebookIdMap.by_path) {
-      const prevOwner = state.notebookIdMap.by_path[knPath];
-      if (prevOwner && prevOwner !== nb) return false;
-    }
-    const candidates = Array.isArray(legacyCandidates) ? legacyCandidates.filter(Boolean) : [];
-    const rawRootIds =
-      state.syncMeta &&
-      state.syncMeta[ROOT_IDENTITIES_META_KEY] &&
-      typeof state.syncMeta[ROOT_IDENTITIES_META_KEY] === 'object' &&
-      !Array.isArray(state.syncMeta[ROOT_IDENTITIES_META_KEY])
-        ? state.syncMeta[ROOT_IDENTITIES_META_KEY]
-        : {};
-    if (state.hostSupportsNotebookIds) {
-      if (!kn || kn.id !== nb || !kn.path || kn.identity_verified !== true || !kn.root_identity) {
-        return false;
-      }
-      if (
-        !state.notebookIdMap ||
-        !state.notebookIdMap.by_path ||
-        !state.notebookIdMap.by_id ||
-        state.notebookIdMap.by_path[kn.path] !== nb ||
-        state.notebookIdMap.by_id[nb] !== kn.path
-      ) {
-        return false;
-      }
-      const liveRoot = kn.root_identity;
-      const recordedIds = [
-        state.notebookIdMap.identities && state.notebookIdMap.identities[nb],
-        state.notebookIdMap.path_identities && state.notebookIdMap.path_identities[kn.path],
-        rawRootIds[nb],
-        rawRootIds[kn.path],
-      ]
-        .map((v) => String(v || '').trim())
-        .filter(Boolean);
-      if (recordedIds.length === 0 || recordedIds.some((v) => v !== liveRoot)) {
-        return false;
-      }
-      if (candidates.length > 0) {
-        const candIds = candidates.map((lk) => String(rawRootIds[lk] || '').trim()).filter(Boolean);
-        if (candIds.some((v) => v !== liveRoot)) return false;
-        const initMap = (state.syncMeta && state.syncMeta[INITIALIZED_META_KEY]) || {};
-        const hasExistingUnowned = candidates.some((lk) => {
-          const entry = state.syncMeta && state.syncMeta[lk];
-          const existsInMeta = Boolean(entry && typeof entry === 'object' && !Array.isArray(entry) && Object.keys(entry).length > 0);
-          const existsInInit = Boolean(initMap && initMap[lk]);
-          return (existsInMeta || existsInInit) && String(rawRootIds[lk] || '').trim() !== liveRoot;
-        });
-        if (hasExistingUnowned) return false;
-      }
-    }
-    const targetMatch = (parsed) => {
-      if (!parsed || !parsed.protocol || !parsed.target) return true;
-      if (candidates.length === 0) return !protocol || parsed.protocol === protocol;
-      const full = `${parsed.protocol}:${parsed.target}`;
-      return candidates.some((lk) => full === lk || full.startsWith(`${lk}::`));
-    };
-    for (const [mk, entry] of Object.entries(state.syncMeta || {})) {
-      if (isReservedSyncMetaKey(mk)) continue;
-      if (!entry || typeof entry !== 'object' || Array.isArray(entry) || Object.keys(entry).length === 0) continue;
-      const parsed = parseNbMetaKey(mk);
-      if (parsed && parsed.nb && parsed.nb !== nb && (!protocol || parsed.protocol === protocol) && targetMatch(parsed)) {
-        return false;
-      }
-    }
-    const initMap = state.syncMeta && state.syncMeta[INITIALIZED_META_KEY];
-    if (initMap && typeof initMap === 'object' && !Array.isArray(initMap)) {
-      for (const [ik, iv] of Object.entries(initMap)) {
-        if (!iv) continue;
-        const parsed = parseNbMetaKey(ik);
-        if (parsed && parsed.nb && parsed.nb !== nb && (!protocol || parsed.protocol === protocol) && targetMatch(parsed)) {
-          return false;
-        }
-      }
-    }
-    return true;
-  };
-
   const lookupOtherProtocolHash = (targetNbKey, itemKey, targetHash, excludeMetaKey = null) => {
     if (!targetNbKey || !itemKey || !targetHash) return null;
-    const isDefaultNb = targetNbKey === normAbsPath(state.notebookRoot, state.homeDir) || targetNbKey === 'default';
+    const cleanActive = normAbsPath(state.notebookRoot, state.homeDir);
+    const allowUnnamespacedDefault =
+      !state.hostSupportsNotebookIds &&
+      (targetNbKey === 'default' || targetNbKey === cleanActive);
     for (const [mk, entry] of Object.entries(state.syncMeta)) {
       if (isReservedSyncMetaKey(mk) || mk === excludeMetaKey) {
         continue;
@@ -3242,7 +2727,7 @@ export function createConfigStore({
       const parsed = parseNbMetaKey(mk);
       if (parsed) {
         if (parsed.nb !== targetNbKey) continue;
-      } else if (!(isDefaultNb && allowLegacyFallback(targetNbKey, '', [mk]))) {
+      } else if (!allowUnnamespacedDefault) {
         continue;
       }
       const val = entry[itemKey];
@@ -3263,64 +2748,22 @@ export function createConfigStore({
     notebookKey: nbKey,
     notebookLabel: (root = null) => notebookLabel(pathForKeyOrPath(root !== undefined && root !== null ? root : state.notebookRoot), state.locale, state.notebookRoot, state.homeDir),
     notebookSlug: (root = null) => notebookSlug(pathForKeyOrPath(root !== undefined && root !== null ? root : state.notebookRoot), getRpc(), state.notebookRoot, state.homeDir),
-    allowLegacyFallback,
     verifyNotebookIdentity,
     hasVerifiedBaseline,
     commitNotebookBaseline,
-    hasPendingMigration,
-    retryPendingMigrations,
     onNotebookRenamed: (params = {}) => {
       const id = String((params && params.id) || '').trim();
       const oldPath = normAbsPath((params && params.old_path) || '', state.homeDir);
       const newPath = normAbsPath((params && params.new_path) || '', state.homeDir);
-      const prevKnownSnapshot = Array.isArray(state.knownNotebooks) ? [...state.knownNotebooks] : [];
-      const prevIdMapSnapshot = {
-        by_id: { ...((state.notebookIdMap && state.notebookIdMap.by_id) || {}) },
-        by_path: { ...((state.notebookIdMap && state.notebookIdMap.by_path) || {}) },
-        identities: { ...((state.notebookIdMap && state.notebookIdMap.identities) || {}) },
-        path_identities: { ...((state.notebookIdMap && state.notebookIdMap.path_identities) || {}) },
-      };
       const activeRenamed = Boolean(oldPath && state.notebookRoot === oldPath);
       if (activeRenamed && newPath) {
         state.notebookRoot = newPath;
       }
       const live = newPath ? queryLiveNotebookIdentity(getRpc(), newPath, state.homeDir) : { verified: false, rootIdentity: '', id: '' };
       const resolvedId = id || live.id || '';
-      const rawRootIds =
-        state.syncMeta &&
-        state.syncMeta[ROOT_IDENTITIES_META_KEY] &&
-        typeof state.syncMeta[ROOT_IDENTITIES_META_KEY] === 'object' &&
-        !Array.isArray(state.syncMeta[ROOT_IDENTITIES_META_KEY])
-          ? state.syncMeta[ROOT_IDENTITIES_META_KEY]
-          : {};
       const liveVerified = Boolean(live.verified && live.rootIdentity && (!resolvedId || !live.id || live.id === resolvedId));
 
       refreshKnownNotebooks();
-      const hostKnownSnapshot = Array.isArray(state.knownNotebooks) ? [...state.knownNotebooks] : [];
-      const combinedKnown = [...prevKnownSnapshot, ...hostKnownSnapshot];
-
-      // Check pre-rename ownership and per-baseline dev:ino individually before updating
-      // knownNotebooks/notebookIdMap; never use current directory identity to wave old keys through.
-      const oldKeyEval = liveVerified
-        ? evaluateSourcePathMigration(oldPath, resolvedId, live.rootIdentity, {
-            isOldPath: true,
-            prevIdMap: prevIdMapSnapshot,
-            prevKnown: prevKnownSnapshot,
-            combinedKnown,
-            rawRootIds,
-            requirePreOwnership: false,
-          })
-        : { allowUI: false, allowPathMeta: false, allowedMetaKeys: new Map(), mismatched: false, hasUnverifiedMk: false };
-      const newKeyEval = liveVerified
-        ? evaluateSourcePathMigration(newPath, resolvedId, live.rootIdentity, {
-            isOldPath: false,
-            prevIdMap: prevIdMapSnapshot,
-            prevKnown: prevKnownSnapshot,
-            combinedKnown,
-            rawRootIds,
-            requirePreOwnership: true,
-          })
-        : { allowUI: false, allowPathMeta: false, allowedMetaKeys: new Map(), mismatched: false, hasUnverifiedMk: false };
 
       if (newPath && !state.knownNotebooks.some((kn) => kn && kn.path === newPath)) {
         const nextList = state.knownNotebooks.filter((kn) => !(kn && ((resolvedId && kn.id === resolvedId) || (oldPath && kn.path === oldPath))));
@@ -3338,59 +2781,22 @@ export function createConfigStore({
         state.knownNotebooks = nextList;
       }
 
-      const idMapPatches = [];
-      const blockedToAdd = [];
-      if (resolvedId && newPath && liveVerified) {
-        idMapPatches.push({
-          id: resolvedId,
-          newPath,
-          oldPaths: oldPath ? [oldPath] : [],
-          rootIdentity: live.rootIdentity,
-        });
-      }
-      if (resolvedId && (!liveVerified || oldKeyEval.mismatched || newKeyEval.mismatched || oldKeyEval.hasUnverifiedMk || newKeyEval.hasUnverifiedMk)) {
-        blockedToAdd.push(resolvedId);
-      }
+      const idPairs = resolvedId && newPath && resolvedId !== newPath ? [[resolvedId, newPath]] : [];
+      const { next: nextIdMap, changed: idMapChanged } = buildUpdatedIdMap(state.notebookIdMap, idPairs, { oldPath });
+      const extraDirty = idMapChanged ? { [NOTEBOOK_ID_MAP_KEY]: nextIdMap } : {};
 
-      const renameAliases = new Map();
-      const baselineRenameAliases = new Map();
-      const baselineKeyMap = new Map();
+      const uiAlias = new Map();
       const targetKey = resolvedId || newPath;
-      if (oldPath && targetKey && oldPath !== targetKey && oldKeyEval.allowUI) {
-        renameAliases.set(oldPath, targetKey);
-        if (oldKeyEval.allowPathMeta) baselineRenameAliases.set(oldPath, targetKey);
-        for (const [srcMk, dstMk] of oldKeyEval.allowedMetaKeys.entries()) {
-          if (srcMk !== dstMk) baselineKeyMap.set(srcMk, dstMk);
-        }
+      if (oldPath && targetKey && oldPath !== targetKey) {
+        uiAlias.set(oldPath, targetKey);
       }
-      if (newPath && resolvedId && newPath !== resolvedId && newKeyEval.allowUI) {
-        renameAliases.set(newPath, resolvedId);
-        if (newKeyEval.allowPathMeta) baselineRenameAliases.set(newPath, resolvedId);
-        for (const [srcMk, dstMk] of newKeyEval.allowedMetaKeys.entries()) {
-          if (srcMk !== dstMk) baselineKeyMap.set(srcMk, dstMk);
-        }
-      }
-      const migKey = resolvedId || newPath || oldPath;
-      if (
-        renameAliases.size > 0 ||
-        baselineRenameAliases.size > 0 ||
-        baselineKeyMap.size > 0 ||
-        idMapPatches.length > 0 ||
-        blockedToAdd.length > 0
-      ) {
-        const ok = applyAliasMigrations(renameAliases, {
-          baselineAliasMap: baselineRenameAliases,
-          baselineKeyMap,
+      if (uiAlias.size > 0 || (oldPath && newPath) || idMapChanged) {
+        applyUiScopeAliases(uiAlias, {
           oldPath,
           newPath,
           persist: true,
-          idMapPatches,
-          blockedIdsToAdd: blockedToAdd,
-          migrationKey: migKey,
+          extraDirty,
         });
-        if (ok) {
-          clearPendingMigrationsFor(migKey);
-        }
       }
       return { id: resolvedId, oldPath, newPath, activeRenamed, verified: liveVerified };
     },

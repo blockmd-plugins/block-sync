@@ -2497,8 +2497,14 @@ export function createWebDAVSyncEngine({
     remoteNotes = Object.fromEntries(Object.entries(remoteNotes).filter(([path]) => skips.check(path)));
     const allowLegacy =
       Boolean(legacyKey) &&
-      (!(configStore && typeof configStore.allowLegacyFallback === 'function') ||
-        configStore.allowLegacyFallback(nbKeyVal, 'webdav', [legacyKey]));
+      !(
+        configStore &&
+        configStore.state &&
+        (configStore.state.hostSupportsNotebookIds ||
+          (configStore.state.notebookIdMap &&
+            configStore.state.notebookIdMap.by_id &&
+            Object.hasOwn(configStore.state.notebookIdMap.by_id, nbKeyVal)))
+      );
     const effectiveLegacyKey = allowLegacy ? legacyKey : null;
     const rawBaseMap = configStore ? configStore.getBaseMap(metaKey, effectiveLegacyKey) : {};
     const initMap = (configStore && configStore.state.syncMeta[INITIALIZED_META_KEY]) || {};

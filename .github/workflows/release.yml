@@ -664,6 +664,7 @@ jobs:
           `;
 
             const runnerSrc = `
+          import { spawnSync } from 'node:child_process';
           import crypto from 'node:crypto';
           import fs from 'node:fs';
           import { register } from 'node:module';
@@ -1013,8 +1014,7 @@ jobs:
             const nbLstat = fs.lstatSync(notebook);
             const liveRootId = nbLstat.dev + ':' + nbLstat.ino;
             const fakeSwappedStore = {
-              state: { homeDir: '', syncMeta: { [configMod.INITIALIZED_META_KEY]: { 'nb:id-test|local_mirror:m': true }, 'nb:id-test|local_mirror:m': { 'gone.md': 'h1' }, [configMod.ROOT_IDENTITIES_META_KEY]: { 'nb:id-test|local_mirror:m': '999:999' } }, notebookIdMap: { by_id: {}, by_path: {}, identities: {}, path_identities: {} }, logs: [] },
-              allowLegacyFallback: () => false,
+              state: { homeDir: '', hostSupportsNotebookIds: true, syncMeta: { [configMod.INITIALIZED_META_KEY]: { 'nb:id-test|local_mirror:m': true }, 'nb:id-test|local_mirror:m': { 'gone.md': 'h1' }, [configMod.ROOT_IDENTITIES_META_KEY]: { 'nb:id-test|local_mirror:m': '999:999' } }, notebookIdMap: { by_id: {}, by_path: {} }, logs: [] },
               getBaseMap: (mk) => ({ ...(fakeSwappedStore.state.syncMeta[mk] || {}) }),
               verifyNotebookIdentity: () => ({ identity_ok: false, verified: true, root_identity: liveRootId, recorded_root_identity: '999:999', live_id: 'id-test', reason: 'baseline_identity_mismatch' }),
               lookupTombstoneHash: () => null,
@@ -1131,8 +1131,8 @@ jobs:
             requireCond(davOkPlan._deletions_aborted === true && !davTrashCalled, 'Issue 1 (WebDAV): Step 4 must abort remote deletion when live identity turns unverified');
             sdk.state.identityVerified = true;
 
-            // Issue 3: New ID must NOT inherit unowned path-keyed or unnamespaced legacy baseline on first migration.
-            const makeIsoStore = (isoStorage, { prevPaths = [], failWrite = false } = {}) => {
+            // Item 2: Startup-only legacy path migration for current verified notebook + rename without baseline migration + downgrade ID reverse lookup.
+            const makeIsoStore = (isoStorage, { identityVerified = true, omitHostId = false } = {}) => {
               const isoRpc = (method, params = {}) => {
                 if (method === 'host.storage.get') {
                   const k = params.key;
@@ -1141,20 +1141,34 @@ jobs:
                   return { found: f, value: f ? isoStorage[k] : undefined };
                 }
                 if (method === 'host.storage.set') {
-                  if (failWrite.value) throw new Error('simulated storage write failure');
                   isoStorage[params.key] = params.value;
                   return { ok: true };
                 }
                 if (method === 'host.storage.set_many') {
-                  if (failWrite.value) throw new Error('simulated storage write failure');
                   Object.assign(isoStorage, params.values || {});
                   return { ok: true };
                 }
                 if (method === 'host.notebooks.list') {
-                  return { notebooks: [{ id: isoStorage.__nbId || 'nb-iso-new', path: isoStorage.__nbPath || '/iso/nbA', name: 'nbA', active: true, previous_paths: prevPaths, identity_verified: true, root_identity: isoStorage.__rootId || '11:22' }] };
+                  return {
+                    notebooks: [{
+                      ...(omitHostId ? {} : { id: isoStorage.__nbId || 'nb-iso-new' }),
+                      path: isoStorage.__nbPath || '/iso/nbA',
+                      name: 'nbA',
+                      active: true,
+                      identity_verified: Boolean(identityVerified),
+                      root_identity: isoStorage.__rootId || '11:22',
+                    }],
+                  };
                 }
                 if (method === 'host.notebooks.data_dir') {
-                  return { id: isoStorage.__nbId || 'nb-iso-new', path: isoStorage.__nbPath || '/iso/nbA', name: 'nbA', active: true, previous_paths: prevPaths, identity_verified: true, root_identity: isoStorage.__rootId || '11:22' };
+                  return {
+                    ...(omitHostId ? {} : { id: isoStorage.__nbId || 'nb-iso-new' }),
+                    path: isoStorage.__nbPath || '/iso/nbA',
+                    name: 'nbA',
+                    active: true,
+                    identity_verified: Boolean(identityVerified),
+                    root_identity: isoStorage.__rootId || '11:22',
+                  };
                 }
                 return { ok: true };
               };
@@ -1162,108 +1176,444 @@ jobs:
               st.loadState();
               return st;
             };
-            const unownedStorage = {
+
+            const startupPathStorage = {
               __nbId: 'nb-iso-new',
               __nbPath: '/iso/nbA',
               __rootId: '11:22',
               config: { mirror_dir: '/iso/M', selected_notebooks: ['/iso/nbA'] },
               notebook_configs: { '/iso/nbA': { mirror_dir: '/iso/M', selected_notebooks: ['/iso/nbA'] } },
               sync_meta: {
-                'nb:/iso/nbA|local_mirror:/iso/M': { 'old.md': 'h-old' },
+                'nb:/iso/nbA|local_mirror:/iso/M': { 'kept.md': 'h-kept' },
+                'nb:/iso/other|local_mirror:/iso/M': { 'stale.md': 'h-stale' },
                 'local_mirror:/iso/M': { 'unns.md': 'h-unns' },
                 [configMod.INITIALIZED_META_KEY]: { 'nb:/iso/nbA|local_mirror:/iso/M': true, 'local_mirror:/iso/M': true },
               },
               notebook_results: {},
             };
-            const isoStore1 = makeIsoStore(unownedStorage);
-            requireCond(isoStore1.state.syncMeta['nb:nb-iso-new|local_mirror:/iso/M'] === undefined, 'Issue 3: first migration without map/previous_paths must NOT inherit path baseline');
-            requireCond(isoStore1.state.syncMeta['nb:/iso/nbA|local_mirror:/iso/M']['old.md'] === 'h-old', 'Issue 3: unowned old path baseline must remain preserved');
-            requireCond(isoStore1.allowLegacyFallback('nb-iso-new', 'local_mirror', ['local_mirror:/iso/M']) === false, 'Issue 3: allowLegacyFallback must block unowned legacy key');
-            isoStore1.loadState();
-            requireCond(isoStore1.state.syncMeta['nb:nb-iso-new|local_mirror:/iso/M'] === undefined, 'Issue 3: subsequent restart must NOT inherit unowned baseline');
-            requireCond(isoStore1.allowLegacyFallback('nb-iso-new', 'local_mirror', ['local_mirror:/iso/M']) === false, 'Issue 3: subsequent restart must keep blocking unowned fallback');
-
-            const ownedStorage = {
-              __nbId: 'nb-owned',
-              __nbPath: '/iso/nbMoved',
-              __rootId: '33:44',
-              config: {},
-              notebook_configs: {},
-              notebook_id_map: {
-                by_id: { 'nb-owned': '/iso/nbOld' },
-                by_path: { '/iso/nbOld': 'nb-owned' },
-                identities: { 'nb-owned': '33:44' },
-                path_identities: { '/iso/nbOld': '33:44' },
-              },
-              sync_meta: {
-                'nb:/iso/nbOld|local_mirror:/iso/M': { 'kept.md': 'h-kept' },
-                [configMod.INITIALIZED_META_KEY]: { 'nb:/iso/nbOld|local_mirror:/iso/M': true },
-                [configMod.ROOT_IDENTITIES_META_KEY]: { '/iso/nbOld': '33:44' },
-              },
-              notebook_results: {},
-            };
-            const ownedStore = makeIsoStore(ownedStorage, { prevPaths: ['/iso/nbOld'] });
+            const startupStore = makeIsoStore(startupPathStorage, { identityVerified: true });
             requireCond(
-              ownedStore.state.syncMeta['nb:nb-owned|local_mirror:/iso/M'] && ownedStore.state.syncMeta['nb:nb-owned|local_mirror:/iso/M']['kept.md'] === 'h-kept',
-              'Issue 3: proven ownership with matching dev+inode should migrate baseline cleanly'
+              startupStore.state.syncMeta['nb:nb-iso-new|local_mirror:/iso/M'] &&
+                startupStore.state.syncMeta['nb:nb-iso-new|local_mirror:/iso/M']['kept.md'] === 'h-kept',
+              'Item 2: first startup must migrate verified current path key nb:<path>|... to ID key'
+            );
+            requireCond(
+              startupStore.state.syncMeta['nb:/iso/nbA|local_mirror:/iso/M'] === undefined,
+              'Item 2: migrated old path key nb:<path>|... must be deleted'
+            );
+            requireCond(
+              startupStore.state.syncMeta[configMod.LEGACY_PATH_MIGRATED_KEY] === true,
+              'Item 2: startup migration must record __legacy_path_migrated__'
+            );
+            requireCond(
+              startupStore.state.syncMeta[configMod.ROOT_IDENTITIES_META_KEY]['nb:nb-iso-new|local_mirror:/iso/M'] === '11:22',
+              'Item 2: migrated baseline must pin root_identity'
+            );
+            requireCond(
+              startupStore.notebookKey('/iso/nbA') === 'nb-iso-new',
+              'Item 2: notebookKey must resolve to notebook ID'
             );
 
-            // Issue 6: Pending migration preserves baselines, blocks sync until retry succeeds, and merges colliding keys item-by-item.
-            const failFlag = { value: true };
-            const mergeStorage = {
-              __nbId: 'nb-m6',
-              __nbPath: '/iso/m6-new',
-              __rootId: '77:88',
+            // Unverified startup must NOT migrate path baseline, and after __legacy_path_migrated__=true later restarts must NOT migrate it either.
+            const unverifiedStorage = {
+              __nbId: 'nb-unv',
+              __nbPath: '/iso/nbU',
+              __rootId: '55:66',
               config: {},
               notebook_configs: {},
-              notebook_id_map: {
-                by_id: { 'nb-m6': '/iso/m6-old' },
-                by_path: { '/iso/m6-old': 'nb-m6' },
-                identities: { 'nb-m6': '77:88' },
-                path_identities: { '/iso/m6-old': '77:88' },
-              },
               sync_meta: {
-                [configMod.ROOT_IDENTITIES_META_KEY]: { '/iso/m6-old': '77:88', 'nb-m6': '77:88' },
-                'nb:/iso/m6-old|local_mirror:/iso/M': { 'shared.md': 'h-newer', 'old-only.md': 'h-old', 'conflict.md': 'h-a' },
-                'nb:nb-m6|local_mirror:/iso/M': { 'shared.md': 'h-older', 'new-only.md': 'h-new', 'conflict.md': 'h-b' },
-                [configMod.BASE_TIMESTAMPS_META_KEY]: {
-                  'nb:/iso/m6-old|local_mirror:/iso/M': { 'shared.md': 2000 },
-                  'nb:nb-m6|local_mirror:/iso/M': { 'shared.md': 1000 },
-                },
-                [configMod.TOMBSTONES_META_KEY]: {
-                  '/iso/m6-old': { 'del1.md': { hash: 'hd1', ts: 500 } },
-                  'nb-m6': { 'del2.md': { hash: 'hd2', ts: 600 } },
-                },
+                'nb:/iso/nbU|local_mirror:/iso/M': { 'old.md': 'h-old' },
+                [configMod.INITIALIZED_META_KEY]: { 'nb:/iso/nbU|local_mirror:/iso/M': true },
               },
               notebook_results: {},
             };
-            const store6 = makeIsoStore(mergeStorage, { prevPaths: ['/iso/m6-old'], failWrite: failFlag });
-            requireCond(store6.hasPendingMigration('/iso/m6-old') === true && store6.hasPendingMigration('nb-m6') === true, 'Issue 6: failed migration write must record pendingMigration');
-            requireCond(Boolean(mergeStorage.sync_meta['nb:/iso/m6-old|local_mirror:/iso/M']['old-only.md']), 'Issue 6: failed write must NOT discard old baseline');
-            failFlag.value = false;
-            requireCond(store6.retryPendingMigrations() === true && !store6.hasPendingMigration(), 'Issue 6: retryPendingMigrations should complete once storage succeeds');
-            const mergedNew = store6.state.syncMeta['nb:nb-m6|local_mirror:/iso/M'] || {};
-            requireCond(mergedNew['shared.md'] === 'h-newer', 'Issue 6: item-by-item merge must pick newer timestamp');
-            requireCond(mergedNew['old-only.md'] === 'h-old' && mergedNew['new-only.md'] === 'h-new', 'Issue 6: non-conflicting items from both keys must be preserved');
-            requireCond(!Object.hasOwn(mergedNew, 'conflict.md'), 'Issue 6: ambiguous conflict item must be cleared from baseline so both copies are kept');
-            const mergedTomb = (store6.state.syncMeta[configMod.TOMBSTONES_META_KEY] || {})['nb-m6'] || {};
-            requireCond(Boolean(mergedTomb['del1.md']) && Boolean(mergedTomb['del2.md']), 'Issue 6: tombstones must merge item-by-item');
+            const unvStore1 = makeIsoStore(unverifiedStorage, { identityVerified: false });
+            requireCond(
+              unvStore1.state.syncMeta['nb:nb-unv|local_mirror:/iso/M'] === undefined &&
+                unvStore1.state.syncMeta[configMod.LEGACY_PATH_MIGRATED_KEY] === true,
+              'Item 2: unverified notebook must not inherit path baseline on first startup'
+            );
+            const unvStore2 = makeIsoStore(unverifiedStorage, { identityVerified: true });
+            requireCond(
+              unvStore2.state.syncMeta['nb:nb-unv|local_mirror:/iso/M'] === undefined,
+              'Item 2: once __legacy_path_migrated__ is set, subsequent startups must never migrate old path keys'
+            );
 
-            // Verify live plugin pauses manual sync and single-note auto-sync while migration is pending, then resumes.
-            sdk.state.storageWriteError = 'simulated pending migration write error';
-            rpc('plugin.event', {
-              event: 'notebook.renamed',
-              id: sdk.state.notebookId,
-              old_path: notebook + '-prev',
-              new_path: notebook,
+            // Rename keeps ID-keyed baseline without migrating path keys and supports downgrade reverse lookup via notebook_id_map.
+            const renamedStorage = {
+              __nbId: 'nb-ren-1',
+              __nbPath: '/iso/renA',
+              __rootId: '77:88',
+              config: { mirror_dir: '/iso/M', selected_notebooks: ['/iso/renA'] },
+              notebook_configs: {},
+              sync_meta: {
+                [configMod.LEGACY_PATH_MIGRATED_KEY]: true,
+                'nb:nb-ren-1|local_mirror:/iso/M': { 'note.md': 'h-note' },
+                'nb:/iso/renB|local_mirror:/iso/M': { 'foreign.md': 'h-foreign' },
+                [configMod.INITIALIZED_META_KEY]: { 'nb:nb-ren-1|local_mirror:/iso/M': true },
+                [configMod.ROOT_IDENTITIES_META_KEY]: { 'nb:nb-ren-1|local_mirror:/iso/M': '77:88', 'nb-ren-1': '77:88' },
+              },
+              notebook_results: {},
+            };
+            const renStore = makeIsoStore(renamedStorage, { identityVerified: true });
+            renamedStorage.__nbPath = '/iso/renB';
+            renStore.onNotebookRenamed({ id: 'nb-ren-1', old_path: '/iso/renA', new_path: '/iso/renB' });
+            requireCond(
+              renStore.state.syncMeta['nb:nb-ren-1|local_mirror:/iso/M']['note.md'] === 'h-note' &&
+                !Object.prototype.hasOwnProperty.call(renStore.state.syncMeta['nb:nb-ren-1|local_mirror:/iso/M'], 'foreign.md') &&
+                renStore.state.syncMeta['nb:/iso/renB|local_mirror:/iso/M']['foreign.md'] === 'h-foreign',
+              'Item 2: notebook.renamed must keep ID baseline untouched and never migrate path-key baselines'
+            );
+            const downgradedStore = makeIsoStore(renamedStorage, { identityVerified: false, omitHostId: true });
+            requireCond(
+              downgradedStore.notebookKey('/iso/renB') === 'nb-ren-1',
+              'Item 2: downgraded host without host IDs must reverse-lookup ID from notebook_id_map'
+            );
+
+            // Item 1: Git commit-then-push flow keeps local commits on offline push failure, re-adds restored deleted note instead of deleting locally, and pushes batch on reconnect.
+            const gitMod = await import(pathToFileURL(path.join(realPkgDir, 'git_sync.js')).href);
+            const gitTmpRoot = path.join(tempRoot, 'git-offline-check');
+            const gitBareRemote = path.join(gitTmpRoot, 'remote.git');
+            const gitNbDir = path.join(gitTmpRoot, 'notebook');
+            const gitDataDir = path.join(gitTmpRoot, 'data');
+            fs.mkdirSync(gitBareRemote, { recursive: true });
+            fs.mkdirSync(gitNbDir, { recursive: true });
+            fs.mkdirSync(gitDataDir, { recursive: true });
+            const bareInit = spawnSync('git', ['init', '--bare', '-b', 'main', gitBareRemote], { encoding: 'utf8' });
+            if (bareInit.status !== 0) {
+              const fb = spawnSync('git', ['init', '--bare', gitBareRemote], { encoding: 'utf8' });
+              requireCond(fb.status === 0, 'Item 1: git init --bare failed');
+              spawnSync('git', ['--git-dir', gitBareRemote, 'symbolic-ref', 'HEAD', 'refs/heads/main'], { encoding: 'utf8' });
+            }
+            const gitNotes = {
+              'keep.md': 'Keep this note',
+              'restore-me.md': 'Original note body',
+            };
+            for (const [rel, txt] of Object.entries(gitNotes)) {
+              fs.writeFileSync(path.join(gitNbDir, rel), txt, 'utf8');
+            }
+            const gitStorage = {};
+            let failGitPush = false;
+            const gitRpc = (method, params = {}) => {
+              if (method === 'host.storage.get') {
+                const k = params.key;
+                if (!k) return { data: { ...gitStorage } };
+                const f = Object.prototype.hasOwnProperty.call(gitStorage, k);
+                return { found: f, value: f ? gitStorage[k] : undefined };
+              }
+              if (method === 'host.storage.set') {
+                gitStorage[params.key] = params.value;
+                return { ok: true };
+              }
+              if (method === 'host.storage.set_many') {
+                Object.assign(gitStorage, params.values || {});
+                return { ok: true };
+              }
+              if (method === 'host.notebooks.list') {
+                const st = fs.lstatSync(gitNbDir);
+                return {
+                  notebooks: [{
+                    id: 'nb-git-check',
+                    path: gitNbDir,
+                    name: 'gitnb',
+                    active: true,
+                    identity_verified: true,
+                    root_identity: st.dev + ':' + st.ino,
+                  }],
+                };
+              }
+              if (method === 'host.notebooks.data_dir') {
+                const st = fs.lstatSync(gitNbDir);
+                const nd = path.join(gitDataDir, 'notebooks', 'nb-git-check');
+                fs.mkdirSync(nd, { recursive: true });
+                return {
+                  id: 'nb-git-check',
+                  path: nd,
+                  notebook_path: gitNbDir,
+                  name: 'gitnb',
+                  active: true,
+                  identity_verified: true,
+                  root_identity: st.dev + ':' + st.ino,
+                };
+              }
+              if (method === 'host.notes.list') {
+                return { notes: Object.keys(gitNotes).sort().map((p) => ({ path: p })) };
+              }
+              if (method === 'host.notes.read') {
+                if (!Object.prototype.hasOwnProperty.call(gitNotes, params.path)) {
+                  throw new Error('Note not found: ' + params.path);
+                }
+                const c = gitNotes[params.path];
+                return { content: c, revision: crypto.createHash('sha256').update(c, 'utf8').digest('hex') };
+              }
+              if (method === 'host.notes.write') {
+                gitNotes[params.path] = params.content;
+                const full = path.join(gitNbDir, params.path);
+                fs.mkdirSync(path.dirname(full), { recursive: true });
+                fs.writeFileSync(full, params.content, 'utf8');
+                return { ok: true };
+              }
+              if (method === 'host.notes.trash') {
+                delete gitNotes[params.path];
+                fs.rmSync(path.join(gitNbDir, params.path), { force: true });
+                return { ok: true, trashed: true };
+              }
+              if (method === 'host.exec.run') {
+                const prog = String(params.program || '');
+                const args = Array.isArray(params.args) ? params.args.map(String) : [];
+                if (prog === 'git' && failGitPush && args.includes('push')) {
+                  return { exit_code: 128, stdout: '', stderr: 'fatal: simulated offline push failure', stdout_truncated: false, stderr_truncated: false, timed_out: false };
+                }
+                const proc = spawnSync(prog, args, {
+                  cwd: params.cwd || gitDataDir,
+                  env: { ...process.env, ...(params.env || {}), GIT_TERMINAL_PROMPT: '0' },
+                  input: params.stdin !== undefined ? String(params.stdin) : undefined,
+                  encoding: 'utf8',
+                });
+                return {
+                  exit_code: typeof proc.status === 'number' ? proc.status : 1,
+                  stdout: proc.stdout || '',
+                  stderr: proc.stderr || (proc.error ? proc.error.message : ''),
+                  stdout_truncated: false,
+                  stderr_truncated: false,
+                  timed_out: false,
+                };
+              }
+              if (method === 'host.fs.list_grants') {
+                return {
+                  grants: [{ path: gitDataDir, writable: true }],
+                  notebooks: [{ path: gitNbDir, writable: true }],
+                  data_dir: gitDataDir,
+                };
+              }
+              if (method === 'host.fs.stat') {
+                const t = String(params.path || '');
+                try {
+                  const st = params.lstat ? fs.lstatSync(t) : fs.statSync(t);
+                  return {
+                    exists: true,
+                    path: t,
+                    name: path.basename(t),
+                    is_dir: st.isDirectory(),
+                    is_file: st.isFile(),
+                    is_regular: st.isFile() && !st.isSymbolicLink(),
+                    is_symlink: st.isSymbolicLink(),
+                    size: st.size,
+                    mtime_ms: st.mtimeMs,
+                    mod_time_ms: st.mtimeMs,
+                    ...(st.isDirectory() && !st.isSymbolicLink() ? { root_identity: st.dev + ':' + st.ino } : {}),
+                  };
+                } catch (err) {
+                  if (err && err.code === 'ENOENT') return { exists: false, path: t };
+                  throw err;
+                }
+              }
+              return sdk.callHost(method, params);
+            };
+            const gitStore = configMod.createConfigStore({ callHost: gitRpc, supportsSystem: true, supportsMultiNotebook: true, notebookRoot: gitNbDir, downloadsDir: tempRoot, homeDir: tempRoot });
+            gitStore.loadState();
+            const gitEngine = gitMod.createGitSyncEngine({
+              callHost: gitRpc,
+              configStore: gitStore,
+              localAdapter: webdavMod.createHostLocalAdapter({ callHost: gitRpc }),
+              locale,
+              getDataDir: () => gitDataDir,
+              getNbRoot: () => gitNbDir,
+              getDownloadsDir: () => tempRoot,
+              getHomeDir: () => tempRoot,
             });
-            const pausedAction = rpc('plugin.action', { action_id: 'sync_now', values: {} });
-            requireCond(pausedAction.ok === false && pausedAction.tone === 'warning', 'Issue 6: manual sync_now must pause while migration is pending');
-            const pausedEvent = rpc('plugin.event', { event: 'note.saved', path: 'id-protected.md', notebook_root: notebook });
-            requireCond(pausedEvent && pausedEvent.handled === true && pausedEvent.outcome === 'skipped', 'Issue 6: single-note sync must pause/queue while migration is pending');
-            sdk.state.storageWriteError = null;
-            const resumedAction = rpc('plugin.action', { action_id: 'sync_now', values: {} });
-            requireCond(resumedAction.ok === true, 'Issue 6: sync must automatically retry migration and resume cleanly once storage recovers');
+            const gitCfg = configStorePlaceholder(gitNbDir, pathToFileURL(gitBareRemote).href);
+            function configStorePlaceholder(nb, remote) {
+              return {
+                protocol: 'git',
+                git_remote: remote,
+                git_branch: 'main',
+                git_auth_type: 'none',
+                sync_scope: 'all',
+                conflict_policy: 'keep_both',
+                delete_guard: false,
+                sync_assets: true,
+                selected_notebooks: [nb],
+              };
+            }
+            const g1 = gitEngine.syncGit({ cfg: gitCfg, notebooks: [gitNbDir], confirmed: true });
+            requireCond(g1.outcome === 'synced' && g1.pushed === 2, 'Item 1: initial Git sync should push 2 notes');
+
+            // Offline round: delete restore-me.md, fail git push -> local commit C1 and baseline update stay intact without rollback.
+            delete gitNotes['restore-me.md'];
+            fs.rmSync(path.join(gitNbDir, 'restore-me.md'), { force: true });
+            failGitPush = true;
+            let pushFailed = false;
+            try {
+              gitEngine.syncGit({ cfg: gitCfg, notebooks: [gitNbDir], confirmed: true });
+            } catch (_pushErr) {
+              pushFailed = true;
+            }
+            requireCond(pushFailed, 'Item 1: simulated offline git push must throw');
+            const repoCloneDir = gitMod.gitRepoDirs(gitRpc, gitCfg, { dataDir: gitDataDir, nbRoot: gitNbDir, homeDir: tempRoot, locale })[0];
+            const aheadAfterFail = spawnSync('git', ['-C', repoCloneDir, 'rev-list', '--count', 'origin/main..HEAD'], { encoding: 'utf8' });
+            requireCond(aheadAfterFail.stdout.trim() === '1', 'Item 1: failed push must keep local deletion commit C1 without resetting');
+
+            // User restores the deleted note offline; next sync online must treat it as local add and push C1..C2 together.
+            gitNotes['restore-me.md'] = 'Restored offline note';
+            fs.writeFileSync(path.join(gitNbDir, 'restore-me.md'), 'Restored offline note', 'utf8');
+            failGitPush = false;
+            const g3Plan = gitEngine.computeSyncPlan({ cfg: gitCfg, inspectRemote: true, nbRoot: gitNbDir });
+            requireCond(
+              g3Plan.to_push_new.includes('restore-me.md') && !g3Plan.to_delete_local.includes('restore-me.md'),
+              'Item 1: note present locally and absent from Git tree & baseline must plan as to_push_new, not to_delete_local'
+            );
+            const g3 = gitEngine.syncGit({ cfg: gitCfg, notebooks: [gitNbDir], confirmed: true });
+            requireCond(g3.outcome === 'synced' && g3.pushed === 1 && gitNotes['restore-me.md'] === 'Restored offline note', 'Item 1: reconnect sync must push C1+C2 without losing restored note');
+            const remoteShow = spawnSync('git', ['--git-dir', gitBareRemote, 'show', 'main:restore-me.md'], { encoding: 'utf8' });
+            requireCond(remoteShow.stdout === 'Restored offline note', 'Item 1: remote branch must contain restored note after pushing unpushed commits');
+            const remoteCount = spawnSync('git', ['--git-dir', gitBareRemote, 'rev-list', '--count', 'main'], { encoding: 'utf8' });
+            requireCond(remoteCount.stdout.trim() === '3', 'Item 1: remote main must have 3 sequential commits (seed, delete, restore) pushed without rewriting history');
+
+            // Item 3 & Item 4: Mirror root identity re-check before local deletion + -32008 downgrade without ReferenceError.
+            const m3Tmp = path.join(tempRoot, 'mirror-root-recheck');
+            const m3DirA = path.join(m3Tmp, 'mirror-active');
+            const m3DirB = path.join(m3Tmp, 'mirror-swap');
+            const m3Spare = path.join(m3Tmp, 'mirror-old');
+            fs.mkdirSync(m3DirA, { recursive: true });
+            fs.mkdirSync(m3DirB, { recursive: true });
+            const statRpc = (method, params = {}) => {
+              if (method === 'host.fs.list_grants') {
+                return {
+                  grants: [{ path: gitDataDir, writable: true }],
+                  notebooks: [{ path: gitNbDir, writable: true }],
+                  data_dir: gitDataDir,
+                };
+              }
+              if (method === 'host.fs.stat') {
+                const target = String(params.path || '');
+                try {
+                  const st = params.lstat ? fs.lstatSync(target) : fs.statSync(target);
+                  return {
+                    exists: true,
+                    path: target,
+                    name: path.basename(target),
+                    is_dir: st.isDirectory(),
+                    is_file: st.isFile(),
+                    is_regular: st.isFile() && !st.isSymbolicLink(),
+                    is_symlink: st.isSymbolicLink(),
+                    size: st.size,
+                    mtime_ms: st.mtimeMs,
+                    mod_time_ms: st.mtimeMs,
+                    ...(st.isDirectory() && !st.isSymbolicLink() ? { root_identity: st.dev + ':' + st.ino } : {}),
+                  };
+                } catch (err) {
+                  if (err && err.code === 'ENOENT') return { exists: false, path: target };
+                  throw err;
+                }
+              }
+              return sdk.callHost(method, params);
+            };
+            const statLocalAdapter = webdavMod.createHostLocalAdapter({ callHost: statRpc });
+            notes['mirror-del-guard.md'] = 'Must survive swapped mirror';
+            fs.writeFileSync(path.join(notebook, 'mirror-del-guard.md'), 'Must survive swapped mirror', 'utf8');
+            fs.writeFileSync(path.join(m3DirA, 'keep-m3.md'), 'Keep M3', 'utf8');
+            notes['keep-m3.md'] = 'Keep M3';
+            fs.writeFileSync(path.join(notebook, 'keep-m3.md'), 'Keep M3', 'utf8');
+            const m3Storage = {};
+            const m3Rpc = (method, params = {}) => {
+              if (method === 'host.storage.get') {
+                const k = params.key;
+                if (!k) return { data: { ...m3Storage } };
+                const f = Object.prototype.hasOwnProperty.call(m3Storage, k);
+                return { found: f, value: f ? m3Storage[k] : undefined };
+              }
+              if (method === 'host.storage.set') {
+                m3Storage[params.key] = params.value;
+                return { ok: true };
+              }
+              if (method === 'host.storage.set_many') {
+                Object.assign(m3Storage, params.values || {});
+                return { ok: true };
+              }
+              return statRpc(method, params);
+            };
+            const m3Store = configMod.createConfigStore({ callHost: m3Rpc, supportsSystem: true, supportsMultiNotebook: true, notebookRoot: notebook, downloadsDir: tempRoot, homeDir: tempRoot });
+            m3Store.loadState();
+            const m3Mk = m3Store.metaKey('local_mirror', m3DirA, sdk.state.notebookId);
+            m3Store.commitNotebookBaseline(
+              m3Mk,
+              {
+                'keep-m3.md': crypto.createHash('sha256').update('Keep M3', 'utf8').digest('hex'),
+                'mirror-del-guard.md': crypto.createHash('sha256').update('Must survive swapped mirror', 'utf8').digest('hex'),
+              },
+              { rootIdentity: liveRootId, verified: true, nbKeyVal: sdk.state.notebookId, nbRoot: notebook }
+            );
+            const m3ScanEngine = localMirror.createLocalMirrorSyncEngine({
+              callHost: statRpc,
+              configStore: m3Store,
+              localAdapter: statLocalAdapter,
+              locale,
+              getDataDir: () => dataDir,
+              getNbRoot: () => notebook,
+              getDownloadsDir: () => tempRoot,
+              getHomeDir: () => tempRoot,
+            });
+            const m3Plan = m3ScanEngine.computeSyncPlan({ cfg: { protocol: 'local_mirror', mirror_dir: m3DirA, sync_scope: 'all', delete_guard: false }, nbRoot: notebook });
+            requireCond(m3Plan.to_delete_local.includes('mirror-del-guard.md') && Boolean(m3Plan.target_root_identity), 'Item 3: scanned plan must carry target_root_identity and pending local deletion');
+            fs.renameSync(m3DirA, m3Spare);
+            fs.renameSync(m3DirB, m3DirA);
+            const m3Res = m3ScanEngine.executeBatchPlan({ protocol: 'local_mirror', target_display: m3DirA, plans: [m3Plan], fingerprint: m3Plan.fingerprint }, { reportProgress: false });
+            requireCond(
+              m3Plan._deletions_aborted === true &&
+                notes['mirror-del-guard.md'] === 'Must survive swapped mirror' &&
+                m3Res.status === '已跳过',
+              'Item 3: changed mirror root identity before local delete must skip all local deletions cleanly'
+            );
+
+            // Item 4: -32008 error caught during plan application must return initialized syncedRepoPaths without ReferenceError.
+            const throw32008Plan = localMirror.computeThreeWaySyncPlan({
+              callHost: statRpc,
+              localAdapter: statLocalAdapter,
+              protocol: 'git',
+              cfg: { sync_scope: 'all', conflict_policy: 'keep_both' },
+              nbRoot: notebook,
+              nbKeyVal: sdk.state.notebookId,
+              nbLabelVal: notebookName,
+              targetDisplay: m3DirA,
+              targetDir: m3DirA,
+              metaKey: 'nb:' + sdk.state.notebookId + '|git:' + m3DirA,
+              localNotes: {},
+              remoteNotes: {},
+              remoteInspected: true,
+              remoteError: null,
+              locale,
+            });
+            throw32008Plan.is_first_sync = false;
+            throw32008Plan.identity_verified = true;
+            throw32008Plan.to_delete_local = ['keep-m3.md'];
+            const thrAdapter = {
+              ...statLocalAdapter,
+              trashFile: () => {
+                throw Object.assign(new Error('root mismatch (-32008)'), { code: -32008 });
+              },
+            };
+            const res32008 = localMirror.applyMirrorOrGitNotebookPlan(throw32008Plan, {
+              callHost: statRpc,
+              configStore: {
+                state: { homeDir: tempRoot, hostSupportsNotebookIds: true, notebookIdMap: { by_id: {}, by_path: {} }, syncMeta: {}, logs: [] },
+                verifyNotebookIdentity: () => ({ identity_ok: true, verified: true, root_identity: liveRootId, recorded_root_identity: liveRootId, live_id: sdk.state.notebookId, reason: '' }),
+                lookupTombstoneHash: () => null,
+                recordTombstone: () => false,
+                clearTombstone: () => {},
+              },
+              localAdapter: thrAdapter,
+              locale,
+              dataDir,
+            });
+            requireCond(
+              Array.isArray(res32008.syncedRepoPaths) && throw32008Plan._deletions_aborted === true,
+              'Item 4: -32008 catch branch must return normally with initialized syncedRepoPaths'
+            );
+            delete notes['keep-m3.md'];
+            delete notes['mirror-del-guard.md'];
+            fs.rmSync(path.join(notebook, 'keep-m3.md'), { force: true });
+            fs.rmSync(path.join(notebook, 'mirror-del-guard.md'), { force: true });
 
             console.log(locale + ': safety invariants passed');
           }
