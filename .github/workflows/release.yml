@@ -74,7 +74,7 @@ jobs:
           }
 
           function sh(cmd, args, opts = {}) {
-            return execFileSync(cmd, args, { encoding: 'utf8', ...opts }).trim();
+            return execFileSync(cmd, args, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, ...opts }).trim();
           }
 
           function succeeds(cmd, args) {
@@ -469,6 +469,21 @@ jobs:
               }
               fs.renameSync(fromPath, toPath);
               return { ok: true };
+            }
+            if (method === 'host.fs.copy') {
+              const fromPath = String(params.from || '');
+              const toPath = String(params.to || '');
+              if (params.mkdir_parents) {
+                fs.mkdirSync(path.dirname(toPath), { recursive: true });
+              }
+              if (params.overwrite === false && fs.existsSync(toPath)) {
+                const err = new Error('File already exists: ' + toPath);
+                err.code = 'EEXIST';
+                throw err;
+              }
+              fs.copyFileSync(fromPath, toPath);
+              const st = fs.statSync(toPath);
+              return { ok: true, from: fromPath, to: toPath, size: st.size };
             }
             if (method === 'host.fs.atomic_swap') {
               const a = String(params.path_a || '');
@@ -1129,8 +1144,10 @@ jobs:
           const pkgDir = path.join('dist', pluginId);
           fs.rmSync('dist', { recursive: true, force: true });
           fs.mkdirSync(pkgDir, { recursive: true });
-          const tarBytes = execFileSync('git', ['archive', '--format=tar', headSha]);
-          execFileSync('tar', ['-xf', '-', '-C', pkgDir], { input: tarBytes });
+          const srcTar = path.join('dist', 'src.tar');
+          execFileSync('git', ['archive', '--format=tar', '-o', srcTar, headSha]);
+          execFileSync('tar', ['-xf', srcTar, '-C', pkgDir]);
+          fs.rmSync(srcTar, { force: true });
           fs.rmSync(path.join(pkgDir, '.github'), { recursive: true, force: true });
           for (const metaFile of ['.gitignore']) {
             const p = path.join(pkgDir, metaFile);
